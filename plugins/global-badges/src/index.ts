@@ -30,6 +30,9 @@ const settings = phoenix.settings.define({
 
 const FULL_NAMES: Record<string, string> = { hunter: "Bug Hunter", early: "Early User" };
 
+// vencord redesigned this in oct 2026; the clientmod api still serves the old art
+const VENCORD_CONTRIBUTOR = "https://cdn.discordapp.com/emojis/1562267648857997356.webp?size=128";
+
 const cache = new Map<string, { at: number; badges: ShownBadge[] }>();
 let donors: { at: number; byUser: Record<string, Donor[]> } | null = null;
 
@@ -50,7 +53,10 @@ function badgeOf(mod: string, badge: RawBadge): ShownBadge | null {
 
   const name = clean.charAt(0).toUpperCase() + clean.slice(1);
   return {
-    uri: `${API}/badges/${mod}/${slug}`,
+    uri:
+      mod === "Vencord" && slug.toLowerCase() === "contributor"
+        ? VENCORD_CONTRIBUTOR
+        : `${API}/badges/${mod}/${slug}`,
     label: settings.showPrefix ? `${mod} ${name}` : name,
     description:
       slug.toLowerCase() === "contributor"
