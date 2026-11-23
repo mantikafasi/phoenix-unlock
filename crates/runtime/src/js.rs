@@ -55,6 +55,7 @@ use crate::{
    fetch,
    patches::{
       self,
+      Badge,
       Command,
       Contribution,
       ContributionId,
@@ -1214,6 +1215,20 @@ fn context_object<'js>(ctx: &Ctx<'js>, context: &UiContext) -> rquickjs::Result<
 /// A `render` or `visible` result as the patches draw it.
 #[cfg(target_os = "android")]
 fn outcome_of(target: Target, value: Option<&Value<'_>>) -> Outcome {
+   if target == Target::ProfileBadges {
+      let badges = value
+         .and_then(|value| value.as_array())
+         .map(|array| {
+            array
+               .iter::<Value<'_>>()
+               .filter_map(Result::ok)
+               .filter_map(|item| badge_of(&item))
+               .take(MAX_BADGES)
+               .collect()
+         })
+         .unwrap_or_default();
+      return Outcome::Badges(badges);
+   }
    if target == Target::Action {
       return Outcome::Shown(value.is_some_and(|value| {
          value
@@ -1388,6 +1403,41 @@ fn block_of<'js>(object: &Object<'js>, handlers: &mut Vec<Function<'js>>) -> Opt
    Some(block)
 }
 
+/// At most this many badge images per profile, so a bad API cannot flood the row.
+const MAX_BADGES: usize = 32;
+
+/// One badge from a render result: `"uri"`, or
+/// `{uri, label, description, source}`.
+#[cfg(target_os = "android")]
+fn badge_of(value: &Value<'_>) -> Option<Badge> {
+   if let Some(uri) = value.as_string() {
+      let uri = uri.to_string().ok()?;
+      let uri = uri.trim();
+      return (!uri.is_empty()).then(|| Badge {
+         uri:         uri.to_owned(),
+         label:       String::new(),
+         description: String::new(),
+         source:      String::new(),
+      });
+   }
+   let object = value.as_object()?;
+   let text = |key: &str| {
+      object
+         .get::<_, Option<String>>(key)
+         .ok()
+         .flatten()
+         .unwrap_or_default()
+   };
+   let uri = object.get::<_, String>("uri").ok()?;
+   let uri = uri.trim();
+   (!uri.is_empty()).then(|| Badge {
+      uri:         uri.to_owned(),
+      label:       text("label"),
+      description: text("description"),
+      source:      text("source"),
+   })
+}
+
 /// A function that undoes a registration, with `update` to redraw it. For a
 /// message accessory or profile tab, `update(id)` redraws one message or
 /// profile.
@@ -1427,6 +1477,7 @@ fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>>
       ("addMessageAction", Target::Action),
       ("addProfileSection", Target::Profile),
       ("addProfileTab", Target::Tab),
+      ("addProfileBadges", Target::ProfileBadges),
    ] {
       let name = plugin.to_owned();
       ui.set(
@@ -1515,6 +1566,7 @@ fn add_contribution<'js>(
       Target::Profile | Target::Tab | Target::TabPage => {
          (label.is_some() && evaluate.is_some(), "title and render")
       },
+      Target::ProfileBadges | Target::BadgeDirectory => (evaluate.is_some(), "render"),
    };
    let missing_press =
       matches!(target, Target::Header | Target::Composer | Target::Action) && press.is_none();

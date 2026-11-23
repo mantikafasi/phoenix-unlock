@@ -10,11 +10,14 @@
 //!   main thread can be waited on with the UI lock held. Plugin callbacks run
 //!   on a worker, and their results reach the screen as follow-up batches.
 
+mod badges;
 mod commands;
 mod emoji;
 mod mirror;
 mod tabs;
 pub mod targets;
+
+pub use badges::Badge;
 
 use std::{
    collections::{
@@ -153,11 +156,12 @@ pub struct Rendered {
    pub tint:  Option<i64>,
 }
 
-/// A plugin's answer for one place: the text it renders, or whether its row
-/// shows.
+/// A plugin's answer for one place: the text it renders, the badges it draws,
+/// or whether its row shows.
 #[derive(Clone)]
 pub enum Outcome {
    Text(Option<Rendered>),
+   Badges(Vec<Badge>),
    Shown(bool),
    /// A profile tab's page.
    Page(Vec<Block>),
@@ -260,6 +264,8 @@ enum Handler {
    /// A row of a plugin menu sheet, or with `index` -1 the sheet itself,
    /// which says when it was swiped away.
    Choice { menu: u32, index: i32 },
+   /// One of a plugin's badges in the badge directory.
+   Detail { badge: Badge },
    /// An entry in a profile tab's page that takes long presses.
    Hold {
       contribution: ContributionId,
@@ -377,6 +383,8 @@ enum Job {
    },
    /// Close menu `menu`, answering `index`.
    CloseMenu { menu: u32, index: i32 },
+   /// Show one badge in the badge directory's detail sheet.
+   Detail { badge: Badge },
    /// A press on custom emoji `id` in the picker, held for the `onEmojiPick`
    /// handlers.
    Emoji {
@@ -398,6 +406,8 @@ struct Patches {
    pickers:       usize,
    slots:         Vec<Slot>,
    anchors:       HashMap<Target, HashSet<i32>>,
+   /// Badge directory titles still waiting for their grid, with the retries spent.
+   badge_retries: HashMap<i32, u8>,
    handlers:      HashMap<i32, Handler>,
    results:       HashMap<(ContributionId, Place), Outcome>,
    pending:       HashSet<(ContributionId, Place)>,
@@ -614,6 +624,7 @@ fn run(job: Job) -> Vec<Op> {
          answer,
       } => patches().open_menu(title.as_deref(), items, answer),
       Job::CloseMenu { menu, index } => patches().close_menu(menu, index),
+      Job::Detail { badge } => patches().open_badge_detail(&badge),
       Job::Block {
          contribution,
          place,
@@ -900,7 +911,9 @@ impl Patches {
       let mut extra_deletes;
       {
          let (created, deleted) = self.mirror.apply(&ops);
+         self.templates.learn_badge_tile(&self.mirror, &created);
          extra_deletes = self.drop_deleted(&deleted);
+         self.track_badge_user(&ops, &created);
          for id in &deleted {
             self.texts.remove(id);
          }
@@ -972,6 +985,7 @@ impl Patches {
                }
             }
          }
+         self.anchor_badges(&ops, &mut mine, &mut touched);
       }
 
       let composer_slash = self
@@ -1013,7 +1027,7 @@ impl Patches {
          return None;
       }
 
-      let mut out = mine;
+      let mut out = Vec::new();
       let mut left = Vec::new();
       let mut recolor = Vec::new();
       for op in ops {
@@ -1044,11 +1058,9 @@ impl Patches {
                out.push(Op::Update { id, props });
             },
             Op::Children { id, .. } | Op::ChildEdits { id, .. } if slot_parents.contains(&id) => {
-               out.push(Op::Children {
-                  id,
-                  ids: self.merged(id),
-               });
-               touched.remove(&id);
+               // Plugin nodes are created after the batch, so the merged list
+               // has to be written after them too.
+               touched.insert(id);
             },
             Op::Delete { mut ids } if !extra_deletes.is_empty() => {
                ids.append(&mut extra_deletes);
@@ -1070,6 +1082,9 @@ impl Patches {
             op => out.push(op),
          }
       }
+      // Plugin nodes go after the batch that creates the rows they sit in,
+      // or the host drops them as orphans.
+      out.extend(mine);
       for parent in touched {
          out.push(Op::Children {
             id:  parent,
@@ -1107,6 +1122,7 @@ impl Patches {
          for anchors in self.anchors.values_mut() {
             anchors.remove(id);
          }
+         self.badge_retries.remove(id);
          self.shown.remove(id);
          self.static_tabs.remove(id);
          self.rust_heights.remove(id);
@@ -1271,6 +1287,7 @@ impl Patches {
             }
          },
          Handler::Choice { menu, index } => queue(Job::CloseMenu { menu, index }),
+         Handler::Detail { badge } => queue(Job::Detail { badge }),
          Handler::Input { .. } | Handler::Page { .. } | Handler::Hold { .. } => {},
          Handler::Pick(name) => {
             if let Some((input, _)) = self.mirror.composer() {
@@ -1650,8 +1667,13 @@ impl Patches {
       {
          return None;
       }
-      let aid = self.mirror.accessibility_id(id)?.to_owned();
-      let placement = target.place(&self.mirror, id, &aid, &self.seen)?;
+      // The badge row's anchor is an image with no accessibility id.
+      let aid = self.mirror.accessibility_id(id).unwrap_or_default().to_owned();
+      let placement = target.place(&self.mirror, id, &aid, &self.seen);
+      if target == Target::BadgeDirectory {
+         self.retry_badge_placement(id, placement.is_some());
+      }
+      let placement = placement?;
       let before = placement.before.map_or(Before::End, Before::Node);
       if let Some(slot) = self
          .slots
@@ -1883,7 +1905,12 @@ impl Patches {
       if self.results.len() >= RESULTS_CAP {
          self.results.clear();
       }
-      let shows = |outcome: &Outcome| !matches!(outcome, Outcome::Text(None) | Outcome::Shown(false));
+      let shows = |outcome: &Outcome| match outcome {
+         Outcome::Text(rendered) => rendered.is_some(),
+         Outcome::Badges(badges) => !badges.is_empty(),
+         Outcome::Shown(shown) => *shown,
+         Outcome::Page(_) => true,
+      };
       let visible = shows(&outcome);
       let place = key.1.clone();
       let was = self.results.insert(key, outcome);

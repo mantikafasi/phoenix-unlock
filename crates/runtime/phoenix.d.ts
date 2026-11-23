@@ -1091,6 +1091,18 @@ declare namespace Phoenix {
   /// A drawable in Phoenix's resources, like `res://ic_mana_puzzle_piece_plus`.
   type Icon = string;
 
+  /// One badge image a plugin draws, `uri` being an image source.
+  interface BadgeSource {
+    uri: string;
+    /// Read out with the image.
+    label?: string;
+    /// A sentence shown under the badge's name in the badge directory.
+    description?: string;
+    /// What gave the badge, like `Vencord` or `BadgeVault`. Shown above the
+    /// badge's name.
+    source?: string;
+  }
+
   interface ButtonOptions {
     icon: Icon;
     label: string;
@@ -1134,6 +1146,11 @@ declare namespace Phoenix {
       title: string;
       priority?: number;
       render(ctx: ProfileContext): ProfileBlock[] | Promise<ProfileBlock[]>;
+    }): Remover;
+    /// Images in a profile's badge row, before Phoenix's own badges.
+    addProfileBadges(options: {
+      priority?: number;
+      render(ctx: ProfileContext): BadgeSource[] | Promise<BadgeSource[]>;
     }): Remover;
     /// Without `message`: a bottom sheet of `options` like Discord's message menu (a plain list
     /// dialog until that menu has been opened once). An option's `icon` is a drawable, or the

@@ -13,6 +13,7 @@ use crate::patches::{
    Outcome,
    Place,
    Rendered,
+   badges,
    mirror::{
       self,
       Created,
@@ -53,10 +54,14 @@ pub enum Target {
    Tab,
    /// The pages of profile tabs, after the profile's own pages.
    TabPage,
+   /// The badge row on a profile.
+   ProfileBadges,
+   /// The badge grid in the badge directory.
+   BadgeDirectory,
 }
 
 impl Target {
-   pub const ALL: [Self; 8] = [
+   pub const ALL: [Self; 10] = [
       Self::Header,
       Self::Composer,
       Self::Content,
@@ -65,12 +70,15 @@ impl Target {
       Self::Profile,
       Self::Tab,
       Self::TabPage,
+      Self::ProfileBadges,
+      Self::BadgeDirectory,
    ];
 
    /// The target whose contributions this one draws.
    pub const fn drawn_by(self) -> Self {
       match self {
          Self::TabPage => Self::Tab,
+         Self::BadgeDirectory => Self::ProfileBadges,
          other => other,
       }
    }
@@ -83,6 +91,8 @@ impl Target {
          Self::Timestamp => aid.starts_with("message.timestamp:"),
          Self::Action => aid == "message.actions.root",
          Self::Profile | Self::Tab | Self::TabPage => aid == "profile-tab-pages",
+         Self::ProfileBadges => false,
+         Self::BadgeDirectory => aid == "badge-directory-title",
       }
    }
 
@@ -153,12 +163,22 @@ impl Target {
                place:  Place::User(seen.profile_user.clone()),
             })
          },
+         Self::ProfileBadges => badges::place_row(mirror, id, seen.badge_user.clone()),
+         Self::BadgeDirectory => badges::place_directory(mirror, id, seen.badge_user.clone()),
       }
    }
 
    /// Whether drawing this target needs a plugin's `render` or `visible`.
    pub const fn evaluates(self) -> bool {
-      matches!(self, Self::Content | Self::Timestamp | Self::Profile | Self::TabPage)
+      matches!(
+         self,
+         Self::Content
+            | Self::Timestamp
+            | Self::Profile
+            | Self::TabPage
+            | Self::ProfileBadges
+            | Self::BadgeDirectory
+      )
    }
 }
 
@@ -187,6 +207,7 @@ pub fn tab_row(mirror: &Mirror, pager: i32) -> Option<(i32, i32)> {
 pub struct Seen {
    pub long_pressed: Option<String>,
    pub profile_user: Option<String>,
+   pub badge_user:   Option<String>,
 }
 
 pub struct Placement {
@@ -209,6 +230,8 @@ pub struct Templates {
    profile:   Option<Node>,
    /// A profile tab that is not selected, and the page width.
    tab:       Option<Node>,
+   /// A tile of the badge directory's grid.
+   badge_tile: Option<Node>,
    page_width: Option<Value>,
    /// The first text color on Phoenix's first page.
    page_text: Option<i64>,
@@ -234,10 +257,18 @@ pub(super) struct MenuRow {
 const BOUND: [&str; 5] = ["viewMotion", "worklet", "portalSlot", "accessibilityId", "accessibilityLabel"];
 
 impl Templates {
+   /// Learns the directory tile when its grid arrives after the title.
+   pub(super) fn learn_badge_tile(&mut self, mirror: &Mirror, created: &Created<'_>) {
+      badges::learn_tile(&mut self.badge_tile, mirror, None, created);
+   }
+
    pub fn learn(&mut self, mirror: &Mirror, id: i32, aid: &str, created: &Created<'_>) {
       match aid {
          "search.entry" => self.header = mirror.snapshot(id, created),
          "composer.expressions" => self.composer = mirror.snapshot(id, created),
+         "badge-directory-title" => {
+            badges::learn_tile(&mut self.badge_tile, mirror, Some(id), created);
+         },
          "profile-tab-pages" => {
             self.learn_profile(mirror, id, created);
             self.learn_tabs(mirror, id, created);
@@ -491,6 +522,11 @@ impl Templates {
                   Some(node)
                })
                .collect()
+         },
+         Target::ProfileBadges => badges::draw_row(contributions, outcome),
+         Target::BadgeDirectory => match &self.badge_tile {
+            Some(tile) => badges::draw_directory(tile, contributions, outcome),
+            None => Vec::new(),
          },
       }
    }

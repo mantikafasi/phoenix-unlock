@@ -22,6 +22,8 @@ pub struct Mirror {
    kids:     HashMap<i32, Vec<i32>>,
    parent:   HashMap<i32, i32>,
    ids:      HashMap<i32, String>,
+   kinds:    HashMap<i32, String>,
+   uris:     HashMap<i32, String>,
    sheets:   HashSet<i32>,
    /// The list index of each virtualized list's first mounted row.
    firsts:   HashMap<i32, i32>,
@@ -45,12 +47,16 @@ impl Mirror {
                if let Some(Value::I32(first)) = prop(props, FIRST) {
                   self.firsts.insert(*id, *first);
                }
+               if let Some(Value::Str(uri)) = prop(props, Prop::URI) {
+                  self.uris.insert(*id, uri.clone());
+               }
                if let Some(Value::Str(aid)) = prop(props, Prop::ACCESSIBILITY_ID) {
                   if aid == "composer" && !self.composer.iter().any(|(input, _)| input == id) {
                      self.composer.push((*id, String::new()));
                   }
                   self.ids.insert(*id, aid.clone());
                }
+               self.kinds.insert(*id, kind.as_str().to_owned());
                if kind.as_str() == "sheet" {
                   self.sheets.insert(*id);
                }
@@ -74,6 +80,8 @@ impl Mirror {
                   self.kids.remove(id);
                   self.parent.remove(id);
                   self.ids.remove(id);
+                  self.kinds.remove(id);
+                  self.uris.remove(id);
                   self.sheets.remove(id);
                   self.firsts.remove(id);
                   self.composer.retain(|(input, _)| input != id);
@@ -83,6 +91,9 @@ impl Mirror {
             Op::Update { id, props } => {
                if let Some(Value::I32(first)) = prop(props, FIRST) {
                   self.firsts.insert(*id, *first);
+               }
+               if let Some(Value::Str(uri)) = prop(props, Prop::URI) {
+                  self.uris.insert(*id, uri.clone());
                }
                if let Some(Value::Str(text)) = prop(props, Prop::VALUE) {
                   self.set_composer_text(*id, text.clone());
@@ -114,6 +125,29 @@ impl Mirror {
 
    pub fn accessibility_id(&self, id: i32) -> Option<&str> {
       self.ids.get(&id).map(String::as_str)
+   }
+
+   /// The kind of view `id` is, if it is still mounted.
+   pub fn kind(&self, id: i32) -> Option<&str> {
+      self.kinds.get(&id).map(String::as_str)
+   }
+
+   /// The node with accessibility id `aid`.
+   pub fn find_aid(&self, aid: &str) -> Option<i32> {
+      self
+         .ids
+         .iter()
+         .find_map(|(id, name)| (name == aid).then_some(*id))
+   }
+
+   /// Whether `id` is a sheet.
+   pub fn is_sheet(&self, id: i32) -> bool {
+      self.sheets.contains(&id)
+   }
+
+   /// The image URI of `id`, if it has one.
+   pub fn uri(&self, id: i32) -> Option<&str> {
+      self.uris.get(&id).map(String::as_str)
    }
 
    /// The first node at or under `id`, depth first, whose accessibility id
