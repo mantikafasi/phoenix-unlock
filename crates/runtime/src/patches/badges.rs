@@ -600,7 +600,6 @@ fn badge_body(badge: &Badge) -> Draft {
          (Prop::named("width"), Value::F64(120.0)),
          (Prop::HEIGHT, Value::F64(120.0)),
          (Prop::named("scale"), Value::Str("fit".to_owned())),
-         (Prop::named("animate"), Value::Bool(false)),
       ],
       kids:  Vec::new(),
       press: None,
