@@ -350,9 +350,15 @@ impl Templates {
       }
    }
 
-   /// A menu sheet like the message long-press one: `title` over `rows`.
-   /// `None` until that sheet was seen.
-   pub(super) fn menu(&self, title: Option<&str>, rows: Vec<MenuRow>, dismiss: Handler) -> Option<Draft> {
+   /// A menu sheet like the message long-press one: `title` over optional `body`
+   /// and `rows`. `None` until that sheet was seen.
+   pub(super) fn menu(
+      &self,
+      title: Option<&str>,
+      body: Option<&super::SheetBody>,
+      rows: Vec<MenuRow>,
+      dismiss: Handler,
+   ) -> Option<Draft> {
       let chain = self.sheet.as_ref()?;
       let mut kids = Vec::new();
       if let Some(title) = title
@@ -368,6 +374,67 @@ impl Templates {
          head.set(Prop::named("fontWeight"), Some(Value::I32(700)));
          kids.push(head);
       }
+      if let Some(body) = body {
+         let mut content = Draft {
+            kind:  ViewKind::Text,
+            props: vec![
+               (Prop::TEXT, Value::Str(body.text.clone())),
+               (Prop::COLOR, Value::I64(0xFFF6_F6F7)),
+               (Prop::FONT_SIZE, Value::F64(12.0)),
+               (Prop::LINE_HEIGHT, Value::F64(16.0)),
+               (Prop::named("fontWeight"), Value::I32(400)),
+               (Prop::SELECTABLE, Value::Bool(true)),
+            ],
+            kids:  Vec::new(),
+            press: None,
+            src:   None,
+         };
+         if body.monospace {
+            content.set(Prop::FONT_FAMILY, Some(Value::Str("monospace".to_owned())));
+         }
+         if body.highlight && body.text.len() <= 32 * 1024 {
+            let spans = crate::highlight::js(&body.text)
+               .into_iter()
+               .map(|(kind, run)| {
+                  let color = match kind {
+                     crate::highlight::Kind::Plain => 0xFFF6_F6F7,
+                     crate::highlight::Kind::Comment => 0xFF8B_949E,
+                     crate::highlight::Kind::String => 0xFF7E_E787,
+                     crate::highlight::Kind::Keyword => 0xFFFF_7B72,
+                     crate::highlight::Kind::Number => 0xFF79_C0FF,
+                  };
+                  Value::Obj(vec![
+                     (Prop::TEXT.key(), Value::Str(run.to_owned())),
+                     (Prop::COLOR.key(), Value::I64(color)),
+                  ])
+               })
+               .collect();
+            content.set(Prop::named("spans"), Some(Value::Arr(spans)));
+         }
+         let scroll = Draft {
+            kind:  ViewKind::Scroll,
+            props: vec![
+               (Prop::named("maxHeight"), Value::F64(420.0)),
+               (Prop::named("panYieldsToScroll"), Value::Bool(true)),
+            ],
+            kids:  vec![content],
+            press: None,
+            src:   None,
+         };
+         let box_view = Draft {
+            kind:  ViewKind::View,
+            props: vec![
+               (Prop::named("background"), Value::I64(0xFF14_1518)),
+               (Prop::RADIUS, Value::F64(12.0)),
+               (Prop::PADDING, Value::Rect([12.0, 10.0, 12.0, 10.0])),
+               (Prop::MARGIN, Value::Rect([0.0, 0.0, 0.0, 12.0])),
+            ],
+            kids:  vec![scroll],
+            press: None,
+            src:   None,
+         };
+         kids.push(box_view);
+      }
       kids.extend(self.group(rows));
       let mut node: Option<Draft> = None;
       for (kind, props) in chain.iter().rev() {
@@ -376,6 +443,7 @@ impl Templates {
             props: props.clone(),
             kids:  node.take().map_or_else(|| std::mem::take(&mut kids), |inner| vec![inner]),
             press: None,
+            src:   None,
          };
          if kind.as_str() == "sheet" {
             draft.press = Some(dismiss.clone());
@@ -554,8 +622,13 @@ impl Templates {
                Prop::ACCESSIBILITY_LABEL,
                Some(Value::Str(contribution.label.clone())),
             );
-            if let (Some(icon), Some(image)) = (&contribution.icon, button.kids.first_mut()) {
-               image.set(Prop::URI, Some(Value::Str(icon.clone())));
+            if let Some(image) = button.kids.first_mut() {
+               if let Some(icon) = &contribution.icon {
+                  image.set(Prop::URI, Some(Value::Str(icon.clone())));
+               }
+               if let Some(tint) = contribution.tint {
+                  image.set(Prop::TINT, Some(Value::I64(tint)));
+               }
             }
             button.press = Some(Handler::Press {
                contribution: contribution.id,
@@ -654,7 +727,20 @@ impl Templates {
          props: group_props.clone(),
          kids,
          press: None,
+         src: None,
       }]
+   }
+
+   /// Resolves a menu icon name: a URI with `://` passes through; an
+   /// accessibility id borrows the icon learned from the message action menu.
+   pub(super) fn resolve_icon<'a>(&'a self, icon: Option<&'a str>) -> &'a str {
+      match icon {
+         Some(icon) if !icon.contains("://") => {
+            self.icons.get(icon).map_or(DEFAULT_ICON, String::as_str)
+         },
+         Some(icon) => icon,
+         None => DEFAULT_ICON,
+      }
    }
 
    /// The colors of Phoenix's first profile page.
@@ -739,6 +825,7 @@ pub fn text(props: &Props, rendered: &Rendered) -> Draft {
       props: props.clone(),
       kids:  Vec::new(),
       press: None,
+      src:   None,
    };
    node.set(Prop::named("spans"), None);
    node.set(Prop::TEXT, Some(Value::Str(rendered.text.clone())));

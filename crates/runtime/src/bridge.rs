@@ -431,7 +431,18 @@ unsafe extern "system" fn call_object_method_a(
       let head = read_bytes(env, request, Some(6));
       if !head.starts_with(&[0; 4]) {
          if discord::wants(&head) {
-            discord::observe_call(&read_bytes(env, request, None));
+            let frame = read_bytes(env, request, None);
+            match discord::intercept_call(&frame) {
+               Action::Pass => {},
+               Action::Drop => return ptr::null_mut(),
+               Action::Replace(replaced) => {
+                  if let Some((array, _)) = new_bytes(env, &replaced) {
+                     let result = original(env, obj, method, [jvalue { l: array }].as_ptr());
+                     jni!(env, DeleteLocalRef, array);
+                     return result;
+                  }
+               },
+            }
          }
          return original(env, obj, method, args);
       }

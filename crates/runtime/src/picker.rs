@@ -131,6 +131,89 @@ pub fn toast(text: &str) -> Result<(), String> {
    })
 }
 
+/// Copies `text` to the Android clipboard.
+pub fn copy(text: &str) -> Result<(), String> {
+   call_static(c"copy", |env| {
+      // SAFETY: as in `choose`.
+      unsafe {
+         (c"(Ljava/lang/Object;Ljava/lang/String;)V", vec![
+            jvalue {
+               l: bridge::guest_host(),
+            },
+            jvalue {
+               l: jstring_of(env, text),
+            },
+         ])
+      }
+   })
+}
+
+/// Shows a scrollable selectable text/code dialog over Phoenix's activity and
+/// waits for a button press (0..options.len()) or dismiss (-1).
+pub fn view(
+   title: Option<&str>,
+   text: &str,
+   monospace: bool,
+   options: &[String],
+) -> Result<i32, String> {
+   static NEXT: AtomicI32 = AtomicI32::new(100_000);
+   let id = NEXT.fetch_add(1, Ordering::Relaxed);
+   let (sender, receiver) = mpsc::channel();
+   CHOICES
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .get_or_insert_default()
+      .insert(id, sender);
+   let shown = call_static(c"view", |env| {
+      // SAFETY: `env` is this thread's, inside the caller's local frame.
+      unsafe {
+         let string_class = jni!(env, FindClass, c"java/lang/String".as_ptr());
+         let array = jni!(
+            env,
+            NewObjectArray,
+            jni_sys::jsize::try_from(options.len()).unwrap_or_default(),
+            string_class,
+            ptr::null_mut()
+         );
+         for (index, option) in options.iter().enumerate() {
+            let option = jstring_of(env, option);
+            jni!(env, SetObjectArrayElement, array, jni_sys::jsize::try_from(index).unwrap_or_default(), option);
+         }
+         (
+            c"(Ljava/lang/Object;ILjava/lang/String;Ljava/lang/String;Z[Ljava/lang/String;)V",
+            vec![
+               jvalue {
+                  l: bridge::guest_host(),
+               },
+               jvalue { i: id },
+               jvalue {
+                  l: title.map_or(ptr::null_mut(), |title| jstring_of(env, title)),
+               },
+               jvalue {
+                  l: jstring_of(env, text),
+               },
+               jvalue {
+                  z: monospace,
+               },
+               jvalue { l: array },
+            ],
+         )
+      }
+   });
+   let forget = || {
+      if let Some(choices) = CHOICES.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+         choices.remove(&id);
+      }
+   };
+   if let Err(err) = shown {
+      forget();
+      return Err(err);
+   }
+   let chosen = receiver.recv().unwrap_or(-1);
+   forget();
+   Ok(chosen)
+}
+
 /// A Java string of `text`, with NULs dropped.
 unsafe fn jstring_of(env: *mut JNIEnv, text: &str) -> jni_sys::jobject {
    let text = CString::new(text.replace('\0', "")).unwrap_or_default();

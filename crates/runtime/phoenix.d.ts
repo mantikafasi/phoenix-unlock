@@ -896,17 +896,18 @@ declare namespace Phoenix {
   }
 
   type SettingSpec =
-    | (SpecBase & { type: "switch"; default?: boolean })
-    | (SpecBase & { type: "text"; default?: string })
+    | (SpecBase & { type: "switch"; default?: boolean; onChange?(value: boolean): void })
+    | (SpecBase & { type: "text"; default?: string; onChange?(value: string): void })
     /// Text shown masked, and replaced with `[redacted]` in the plugin's log lines.
-    | (SpecBase & { type: "secret"; default?: string })
+    | (SpecBase & { type: "secret"; default?: string; onChange?(value: string): void })
     /// One of a fixed list, shown as rows with a checkmark. Defaults to the first option.
     | (SpecBase & {
         type: "select";
         options: readonly { value: string; label?: string }[];
         default?: string;
+        onChange?(value: string): void;
       })
-    | (SpecBase & { type: "number"; default?: number })
+    | (SpecBase & { type: "number"; default?: number; onChange?(value: number): void })
     | (SpecBase & { type: "button"; onPress(): void });
 
   /// The value a setting reads as. Buttons have none.
@@ -970,6 +971,29 @@ declare namespace Phoenix {
     responseType?: string;
   }
 
+  interface RequestFilter {
+    /// Case-insensitive HTTP method filter (e.g. `"POST"`), checked in Rust.
+    method?: string;
+    /// Prefix match on the API-relative path (query stripped), checked in Rust.
+    pathPrefix?: string;
+    /// Suffix match on the API-relative path (query stripped), checked in Rust.
+    pathSuffix?: string;
+    /// Substring match on the full API-relative path, checked in Rust.
+    pathIncludes?: string;
+  }
+
+  interface InterceptedRequest {
+    readonly method: string;
+    /// Path relative to the API base (e.g. `"/channels/123/messages"`).
+    readonly path: string;
+    /// UTF-8 request body (empty string if none). Session headers are never exposed.
+    readonly body: string;
+    /// Parses `body` as JSON, or returns `null` if empty/invalid.
+    json<T = unknown>(): T | null;
+  }
+
+  type RequestHookResult = false | { body: string | object } | void;
+
   interface Discord {
     /// Opens Discord's own authorize screen for an OAuth2 application. Once the user taps
     /// Authorize, resolves to the redirect URL (`redirectUri?code=…`) for the plugin to fetch
@@ -977,6 +1001,13 @@ declare namespace Phoenix {
     /// browser is involved. Rejects when the user doesn't authorize within 10 minutes or another
     /// `authorize` starts. The URL holds a credential, so don't log it.
     authorize(options: AuthorizeOptions): Promise<string>;
+    /// Intercepts outgoing Discord API calls matching `filter` (evaluated in Rust so non-matching
+    /// calls never enter JS). Return `false` to drop the request, `{ body }` to replace its body,
+    /// or nothing to pass it through unchanged.
+    onRequest(
+      filter: RequestFilter,
+      handler: (req: InterceptedRequest) => RequestHookResult
+    ): Remover;
     request(path: string, init?: FetchInit): Promise<FetchResponse>;
     get(path: string, init?: FetchInit): Promise<FetchResponse>;
     delete(path: string, init?: FetchInit): Promise<FetchResponse>;
@@ -990,6 +1021,20 @@ declare namespace Phoenix {
     author?: string;
     guildId?: string;
     embeds?: Embed[];
+  }
+
+  interface SendAttachment {
+    id: string;
+    filename: string;
+    uploaded_filename?: string;
+    description?: string;
+    [key: string]: unknown;
+  }
+
+  interface SendPayload {
+    content?: string;
+    attachments?: SendAttachment[];
+    [key: string]: unknown;
   }
 
   /// Messages shown only on this device. Nothing reaches Discord, and they land just before the
@@ -1014,6 +1059,8 @@ declare namespace Phoenix {
   /// `channelId` is the open channel, `reply` posts a local message there.
   interface UiContext {
     channelId: string | null;
+    /// The signed-in user's snowflake id, when available from Phoenix's cache.
+    currentUserId: string | null;
     reply(text: string): string;
   }
 
@@ -1021,6 +1068,40 @@ declare namespace Phoenix {
     messageId: string;
     /// The message as Phoenix cached it, when it did.
     message?: Message;
+  }
+
+  type NodeMatch = string | { exact: string } | { prefix: string };
+
+  interface NodeInfo {
+    readonly id: number;
+    readonly accessibilityId: string | null;
+    readonly parent: number | null;
+    readonly children: number[];
+    readonly sheet: number | null;
+    readonly list: number | null;
+    readonly on: string[];
+  }
+
+  interface ViewEvent {
+    readonly node: number;
+    readonly event: string;
+    readonly payload: unknown;
+    readonly accessibilityId: string | null;
+    /// Resolved when the event carries a row `index` pointing at a message row.
+    readonly messageId?: string;
+    readonly channelId?: string | null;
+    readonly currentUserId?: string | null;
+    readonly message?: Message;
+  }
+
+  interface PropPatchOptions {
+    /// `"node"` (default) patches the matching node, `"sheet"` patches its enclosing sheet and
+    /// wrapper, `"list"` patches its enclosing virtualized list.
+    target?: "node" | "sheet" | "list";
+    /// Remove this rule automatically after its first match.
+    once?: boolean;
+    /// Auto-expire this rule after `timeoutMs` milliseconds.
+    timeoutMs?: number;
   }
 
   interface ProfileContext extends UiContext {
@@ -1106,8 +1187,52 @@ declare namespace Phoenix {
   interface ButtonOptions {
     icon: Icon;
     label: string;
+    /// Optional 32-bit ARGB icon tint.
+    tint?: number;
     priority?: number;
     onPress(ctx: UiContext): void;
+  }
+
+  interface ButtonPatch {
+    icon?: Icon;
+    label?: string;
+    /// 32-bit ARGB icon tint; pass `null` to reset to the default color.
+    tint?: number | null;
+  }
+
+  interface ButtonRemover {
+    (): void;
+    update(patch: ButtonPatch): void;
+  }
+
+  interface PageButton {
+    label: string;
+    /// A `res://` drawable URI, or a message action accessibility id to borrow its icon.
+    icon?: Icon;
+    danger?: boolean;
+    onPress(): void;
+  }
+
+  type PageSection =
+    | { type: "code"; title?: string; text: string; monospace?: boolean; highlight?: boolean }
+    | { type: "text"; title?: string; text: string }
+    | { type: "buttons"; title?: string; buttons: PageButton[] };
+
+  interface PageHandle {
+    close(): void;
+  }
+
+  interface NotifyOptions {
+    title: string;
+    body?: string;
+    /// A `res://` drawable URI (defaults to `res://ic_mana_puzzle_piece_plus`).
+    icon?: Icon;
+    /// 32-bit ARGB color for the leading icon badge (defaults to Discord Blurple).
+    accent?: number;
+    /// Auto-dismiss after this many milliseconds (defaults to 5000; pass 0 to stay until dismissed).
+    durationMs?: number;
+    /// Runs when the notification banner is tapped.
+    onPress?(): void;
   }
 
   /// Plugin UI next to Phoenix's own. Plugin callbacks run off the UI threads, so drawn results
@@ -1115,9 +1240,9 @@ declare namespace Phoenix {
   /// turned off.
   interface Ui {
     /// In the chat header, left of search.
-    addHeaderButton(options: ButtonOptions): Remover;
+    addHeaderButton(options: ButtonOptions): ButtonRemover;
     /// In the message box, left of the emoji button.
-    addComposerButton(options: ButtonOptions): Remover;
+    addComposerButton(options: ButtonOptions): ButtonRemover;
     /// A line under each message's content, or after its timestamp with `placement: "header"`.
     /// It runs once per message and place, and the result is kept until `update`.
     addMessageAccessory(options: {
@@ -1162,6 +1287,56 @@ declare namespace Phoenix {
       message?: string;
       options?: (string | { label: string; icon?: Icon; danger?: boolean })[];
     }): Promise<number>;
+    /// Shows a scrollable text/code viewer sheet (with optional syntax highlighting and action
+    /// rows such as Copy). Resolves to the chosen option index, or -1 when dismissed.
+    showSheet(options: {
+      title?: string;
+      text: string;
+      monospace?: boolean;
+      highlight?: boolean;
+      options?: (string | { label: string; icon?: Icon; danger?: boolean })[];
+    }): Promise<number>;
+    /// Pushes a full-screen native Phoenix page onto the active navigator with a header,
+    /// working Back button/gesture, scrollable syntax-highlighted code sections, and action buttons.
+    openPage(options: { title: string; sections: PageSection[] }): PageHandle;
+    /// Hides every Phoenix view matching `accessibilityId` (e.g. `"composer.gift"` or
+    /// `"Record Voice Message"`) by omitting it from its parent's child list. Call the returned
+    /// function to restore it.
+    hide(accessibilityId: string): Remover;
+    /// Observes or intercepts any Phoenix view event (e.g. `"rowDoubleTap"`, `"press"`),
+    /// filtered by event name in Rust. With `intercept: true`, return `false` to pass the event
+    /// back to Phoenix; any other return consumes it.
+    onEvent(
+      event: string,
+      handler: (ev: ViewEvent) => boolean | void,
+      options?: { intercept?: boolean }
+    ): Remover;
+    /// Injects a raw view event to Phoenix's Rust guest (e.g. `"press"`, `"dismiss"`,
+    /// `"rowLongPress"`).
+    dispatch(node: number, event: string, payload?: Record<string, unknown>): boolean;
+    /// Runs when a Phoenix node whose `accessibilityId` matches `match` is created.
+    onNode(match: NodeMatch, handler: (node: NodeInfo) => void): Remover;
+    /// Declaratively patches props synchronously inside Rust's UI batch rewriter (zero JS
+    /// overhead per frame). Use `addOn` to append event names to `on` without clobbering Phoenix's
+    /// existing listeners.
+    patchProps(
+      match: NodeMatch,
+      patch: { addOn?: string[]; [prop: string]: unknown },
+      options?: PropPatchOptions
+    ): Remover;
+    /// Sends a raw `Op::Update` with Phoenix props to `node`.
+    update(node: number, props: Record<string, unknown>): void;
+    /// Lists all live Phoenix node ids matching `match`.
+    find(match: NodeMatch): number[];
+    /// Finds the first live node at or under `root` matching `match`.
+    findDown(root: number, match: NodeMatch, maxDepth?: number): number | null;
+    /// Reads live tree metadata for `id` from Phoenix's mirrored view tree.
+    node(id: number): NodeInfo | null;
+    /// Shows a native Discord in-app notification banner at the top of the screen. Returns a
+    /// function that dismisses it early.
+    notify(options: NotifyOptions): () => void;
+    /// Copies `text` to the device clipboard.
+    copy(text: string): void;
     /// A short message at the bottom of the screen.
     toast(text: string): void;
   }

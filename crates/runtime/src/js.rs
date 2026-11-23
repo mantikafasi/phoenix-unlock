@@ -50,6 +50,9 @@ use crate::{
    local,
 };
 #[cfg(target_os = "android")]
+use std::str::FromStr;
+
+#[cfg(target_os = "android")]
 use crate::{
    discord,
    fetch,
@@ -59,7 +62,10 @@ use crate::{
       Command,
       Contribution,
       ContributionId,
+      NodeInfo,
+      NodeMatch,
       Outcome,
+      PatchTarget,
       Place,
       Rendered,
       Sent,
@@ -85,14 +91,33 @@ struct Loaded {
 
 type ChosenMap = BTreeMap<String, BTreeMap<String, Chosen>>;
 
+const fn default_true() -> bool {
+   true
+}
+
 /// Which plugins the user turned off and how they set each plugin's
 /// settings, kept in `home/plugins.json`.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Choices<'a> {
    #[serde(default)]
-   disabled: BTreeSet<String>,
+   disabled:     BTreeSet<String>,
    #[serde(default)]
-   settings: Cow<'a, ChosenMap>,
+   settings:     Cow<'a, ChosenMap>,
+   #[serde(default = "default_true")]
+   staff:        bool,
+   #[serde(default)]
+   remote_shell: bool,
+}
+
+impl Default for Choices<'_> {
+   fn default() -> Self {
+      Self {
+         disabled:     BTreeSet::new(),
+         settings:     Cow::Owned(BTreeMap::new()),
+         staff:        true,
+         remote_shell: false,
+      }
+   }
 }
 
 /// One setting a plugin defined with `phoenix.settings.define`.
@@ -101,6 +126,7 @@ struct Definition<'js> {
    title:       String,
    description: Option<String>,
    kind:        Kind<'js>,
+   on_change:   Option<Function<'js>>,
 }
 
 /// A setting's type with its default, or a button's handler.
@@ -175,10 +201,26 @@ struct Registry<'js> {
    commands:     RefCell<HashMap<String, (String, Function<'js>)>>,
    /// `phoenix.messages.onSend` interceptors in registration order, by id.
    #[cfg(target_os = "android")]
-   interceptors: RefCell<Vec<(u64, String, Function<'js>)>>,
+   interceptors:  RefCell<Vec<(u64, String, Function<'js>)>>,
+   /// `phoenix.discord.onRequest` interceptors, by id.
+   #[cfg(target_os = "android")]
+   request_hooks: RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.messages.onEmojiPick` handlers in registration order, by id.
    #[cfg(target_os = "android")]
-   pickers:      RefCell<Vec<(u64, String, Function<'js>)>>,
+   pickers:       RefCell<Vec<(u64, String, Function<'js>)>>,
+   /// `phoenix.ui.onEvent` handlers, by id.
+   #[cfg(target_os = "android")]
+   event_hooks:   RefCell<Vec<(u64, String, phoenix_wire::Key, bool, Function<'js>)>>,
+   /// `phoenix.ui.onNode` watchers, by id.
+   #[cfg(target_os = "android")]
+   node_watchers: RefCell<HashMap<u64, (String, Function<'js>)>>,
+   /// Open full-screen plugin pages (`phoenix.ui.openPage`) and their button
+   /// callbacks, by page id.
+   #[cfg(target_os = "android")]
+   open_pages:    RefCell<HashMap<u32, (String, Vec<Function<'js>>)>>,
+   /// Active in-app notification banner tap callbacks (`phoenix.ui.notify`), by banner id.
+   #[cfg(target_os = "android")]
+   banners:       RefCell<HashMap<u32, (String, Function<'js>)>>,
 }
 
 /// A contribution's plugin callbacks. `evaluate` is `render`, or `visible`
@@ -288,16 +330,37 @@ impl Engine {
 
    pub fn set_setting(&self, plugin: &str, key: &str, value: Chosen) {
       self.context.with(|ctx| {
-         if let Some(registry) = ctx.userdata::<Registry<'_>>() {
+         let callback = if let Some(registry) = ctx.userdata::<Registry<'_>>() {
             registry
                .chosen
                .borrow_mut()
                .entry(plugin.to_owned())
                .or_default()
-               .insert(key.to_owned(), value);
+               .insert(key.to_owned(), value.clone());
             redact_secrets(&registry);
+            registry
+               .defined
+               .borrow()
+               .get(plugin)
+               .and_then(|list| list.iter().find(|definition| definition.key == key))
+               .and_then(|definition| definition.on_change.clone())
+         } else {
+            None
+         };
+         if let Some(callback) = callback {
+            let js_value = match &value {
+               Chosen::Switch(on) => Ok(Value::new_bool(ctx.clone(), *on)),
+               Chosen::Number(number) => Ok(Value::new_float(ctx.clone(), *number)),
+               Chosen::Text(text) => rquickjs::String::from_str(ctx.clone(), text).map(rquickjs::String::into_value),
+            };
+            if let Ok(js_value) = js_value
+               && let Err(err) = callback.call::<_, Value<'_>>((js_value,)).catch(&ctx)
+            {
+               log::error!("[{plugin}] {key} onChange: {err}");
+            }
          }
       });
+      drain(&self.runtime);
       self.save_choices();
    }
 
@@ -421,6 +484,62 @@ impl Engine {
          }
       });
       drain(&self.runtime);
+   }
+
+   /// Runs button `index` on plugin full-screen page `page`.
+   #[cfg(target_os = "android")]
+   pub fn page_press(&self, page: u32, index: u32) {
+      self.context.with(|ctx| {
+         let Some((plugin, handler)) = ctx.userdata::<Registry<'_>>().and_then(|registry| {
+            let pages = registry.open_pages.borrow();
+            let (plugin, handlers) = pages.get(&page)?;
+            let handler = handlers.get(usize::try_from(index).ok()?)?;
+            Some((plugin.clone(), handler.clone()))
+         }) else {
+            return;
+         };
+         if let Err(err) = handler.call::<_, Value<'_>>(()).catch(&ctx) {
+            log::error!("[{plugin}] page button: {err}");
+         }
+      });
+      drain(&self.runtime);
+   }
+
+   /// Drops button callbacks for a closed plugin full-screen page.
+   #[cfg(target_os = "android")]
+   pub fn page_closed(&self, page: u32) {
+      self.context.with(|ctx| {
+         if let Some(registry) = ctx.userdata::<Registry<'_>>() {
+            registry.open_pages.borrow_mut().remove(&page);
+         }
+      });
+   }
+
+   /// Runs the tap callback for in-app notification banner `id` and cleans it up.
+   #[cfg(target_os = "android")]
+   pub fn banner_press(&self, id: u32) {
+      self.context.with(|ctx| {
+         let Some((plugin, handler)) = ctx
+            .userdata::<Registry<'_>>()
+            .and_then(|registry| registry.banners.borrow_mut().remove(&id))
+         else {
+            return;
+         };
+         if let Err(err) = handler.call::<_, Value<'_>>(()).catch(&ctx) {
+            log::error!("[{plugin}] notify onPress: {err}");
+         }
+      });
+      drain(&self.runtime);
+   }
+
+   /// Drops the tap callback for a dismissed in-app notification banner.
+   #[cfg(target_os = "android")]
+   pub fn banner_closed(&self, id: u32) {
+      self.context.with(|ctx| {
+         if let Some(registry) = ctx.userdata::<Registry<'_>>() {
+            registry.banners.borrow_mut().remove(&id);
+         }
+      });
    }
 
    #[cfg(target_os = "android")]
@@ -558,6 +677,110 @@ impl Engine {
       picked
    }
 
+   /// Runs `phoenix.ui.onEvent` handlers matching `event`. When `intercepted` is
+   /// true, returns whether any intercepting handler consumed the event (true)
+   /// or all returned `false` (false, re-injecting to Phoenix).
+   #[cfg(target_os = "android")]
+   pub fn view_event(
+      &self,
+      node: i32,
+      event: phoenix_wire::Key,
+      payload: &phoenix_wire::Value,
+      aid: Option<&str>,
+      context: Option<&UiContext>,
+      intercepted: bool,
+   ) -> bool {
+      let consumed = self.context.with(|ctx| {
+         let Some(registry) = ctx.userdata::<Registry<'_>>() else {
+            return false;
+         };
+         let handlers = registry
+            .event_hooks
+            .borrow()
+            .iter()
+            .filter(|(_, _, key, ..)| *key == event)
+            .map(|(_, plugin, _, intercept, function)| {
+               (plugin.clone(), *intercept, function.clone())
+            })
+            .collect::<Vec<_>>();
+         drop(registry);
+         if handlers.is_empty() {
+            return false;
+         }
+         let Ok(ev) = Object::new(ctx.clone()) else {
+            return false;
+         };
+         let event_name = phoenix_ui::PROPS
+            .get(usize::from(event.get()))
+            .copied()
+            .unwrap_or_default();
+         let _ = ev.set("node", node);
+         let _ = ev.set("event", event_name);
+         if let Ok(val) = wire_to_js(&ctx, payload) {
+            let _ = ev.set("payload", val);
+         }
+         let _ = ev.set("accessibilityId", aid);
+         if let Some(context) = context {
+            let _ = ev.set("channelId", context.channel_id.clone());
+            let _ = ev.set("currentUserId", context.current_user_id.clone());
+            if let Some(id) = &context.message_id {
+               let _ = ev.set("messageId", id.as_str());
+            }
+            if let Some(message) = &context.message
+               && let Ok(parsed) = ctx.json_parse(message.as_str())
+            {
+               let _ = ev.set("message", parsed);
+            }
+         }
+         let mut taken = false;
+         for (plugin, is_interceptor, function) in handlers {
+            match function.call::<_, Value<'_>>((ev.clone(),)).catch(&ctx) {
+               Ok(result) if intercepted && is_interceptor && result.as_bool() != Some(false) => {
+                  taken = true;
+               },
+               Ok(_) => {},
+               Err(err) => log::error!("[{plugin}] onEvent({event_name}): {err}"),
+            }
+         }
+         taken
+      });
+      drain(&self.runtime);
+      consumed
+   }
+
+   /// Runs `phoenix.ui.onNode` watchers for a newly created node.
+   #[cfg(target_os = "android")]
+   pub fn node_created(&self, watcher_ids: &[u64], info: &NodeInfo) {
+      self.context.with(|ctx| {
+         let Some(registry) = ctx.userdata::<Registry<'_>>() else {
+            return;
+         };
+         let handlers = {
+            let watchers = registry.node_watchers.borrow();
+            watcher_ids
+               .iter()
+               .filter_map(|id| {
+                  let (plugin, function) = watchers.get(id)?;
+                  Some((plugin.clone(), function.clone()))
+               })
+               .collect::<Vec<_>>()
+         };
+         drop(registry);
+         if handlers.is_empty() {
+            return;
+         }
+         let Ok(obj) = node_info_object(&ctx, info) else {
+            return;
+         };
+         for (plugin, function) in handlers {
+            if let Err(err) = function.call::<_, Value<'_>>((obj.clone(),)).catch(&ctx) {
+               log::error!("[{plugin}] onNode: {err}");
+            }
+         }
+      });
+      drain(&self.runtime);
+   }
+
    /// Evaluates `name` with a fresh `phoenix` object, recording any error.
    fn eval(&mut self, name: &str) {
       let Some(loaded) = self.plugins.get_mut(name) else {
@@ -612,14 +835,49 @@ impl Engine {
                .commands
                .borrow_mut()
                .retain(|_, (plugin, _)| plugin != name);
+            let mut interceptors = registry.interceptors.borrow_mut();
+            interceptors.retain(|(_, plugin, _)| plugin != name);
+            patches::set_interceptors(interceptors.len());
+            drop(interceptors);
             registry
-               .interceptors
+               .request_hooks
                .borrow_mut()
-               .retain(|(_, plugin, _)| plugin != name);
+               .retain(|_, (plugin, _)| plugin != name);
+            discord::forget_request_hooks(name);
             let mut pickers = registry.pickers.borrow_mut();
             pickers.retain(|(_, plugin, _)| plugin != name);
             patches::set_emoji_pickers(pickers.len());
             drop(pickers);
+            registry
+               .event_hooks
+               .borrow_mut()
+               .retain(|(_, plugin, ..)| plugin != name);
+            registry
+               .node_watchers
+               .borrow_mut()
+               .retain(|_, (plugin, _)| plugin != name);
+            let mut open_pages = registry.open_pages.borrow_mut();
+            let closed = open_pages
+               .iter()
+               .filter(|(_, (plugin, _))| plugin == name)
+               .map(|(id, _)| *id)
+               .collect::<Vec<_>>();
+            for id in closed {
+               open_pages.remove(&id);
+               patches::close_page(id);
+            }
+            drop(open_pages);
+            let mut banners = registry.banners.borrow_mut();
+            let dismissed = banners
+               .iter()
+               .filter(|(_, (plugin, _))| plugin == name)
+               .map(|(id, _)| *id)
+               .collect::<Vec<_>>();
+            for id in dismissed {
+               banners.remove(&id);
+               patches::dismiss_banner(id);
+            }
+            drop(banners);
             patches::forget(name);
          }
          let mut hooks = registry.hooks.borrow_mut();
@@ -695,13 +953,17 @@ impl Engine {
       }
    }
 
-   fn save_choices(&self) {
+   pub fn save_choices(&self) {
       let disabled = self
          .plugins
          .iter()
          .filter(|(_, loaded)| !loaded.enabled)
          .map(|(name, _)| name.clone())
          .collect();
+      #[cfg(target_os = "android")]
+      let remote_shell = crate::remote_shell_enabled();
+      #[cfg(not(target_os = "android"))]
+      let remote_shell = false;
       let json = self.context.with(|ctx| {
          let registry = ctx.userdata::<Registry<'_>>();
          let chosen = registry.as_ref().map(|registry| registry.chosen.borrow());
@@ -709,6 +971,8 @@ impl Engine {
          serde_json::to_vec(&Choices {
             disabled,
             settings: Cow::Borrowed(chosen.as_deref().unwrap_or(&empty)),
+            staff: crate::staff_enabled(),
+            remote_shell,
          })
       });
       let path = state().choices_path();
@@ -746,6 +1010,82 @@ impl Engine {
       });
       drain(&self.runtime);
       result
+   }
+
+   /// Runs matching `phoenix.discord.onRequest` hooks on an outgoing Discord API request.
+   #[cfg(target_os = "android")]
+   pub fn intercept_request(
+      &self,
+      matched: &[u64],
+      method: &str,
+      path: &str,
+      body: &[u8],
+   ) -> discord::RequestAction {
+      let action = self.context.with(|ctx| {
+         let Some(registry) = ctx.userdata::<Registry<'_>>() else {
+            return discord::RequestAction::Pass;
+         };
+         let hooks = {
+            let map = registry.request_hooks.borrow();
+            matched
+               .iter()
+               .filter_map(|id| {
+                  let (plugin, function) = map.get(id)?;
+                  Some((plugin.clone(), function.clone()))
+               })
+               .collect::<Vec<_>>()
+         };
+         drop(registry);
+         if hooks.is_empty() {
+            return discord::RequestAction::Pass;
+         }
+         let mut current_body = String::from_utf8_lossy(body).into_owned();
+         let mut changed = false;
+         for (plugin, function) in hooks {
+            let Ok(req) = Object::new(ctx.clone()) else {
+               break;
+            };
+            let _ = req.set("method", method);
+            let _ = req.set("path", path);
+            let _ = req.set("body", current_body.as_str());
+            let json_source = current_body.clone();
+            if let Ok(json_fn) = json_parser_fn(&ctx, json_source) {
+               let _ = req.set("json", json_fn);
+            }
+            match function.call::<_, Value<'_>>((req,)).catch(&ctx) {
+               Ok(result) if result.as_bool() == Some(false) => {
+                  return discord::RequestAction::Drop;
+               },
+               Ok(ref result) if let Some(obj) = result.as_object() => {
+                  if let Ok(new_body) = obj.get::<_, Value<'_>>("body")
+                     && !new_body.is_undefined()
+                     && !new_body.is_null()
+                  {
+                     if let Some(text) = new_body.as_string() {
+                        if let Ok(text) = text.to_string() {
+                           current_body = text;
+                           changed = true;
+                        }
+                     } else if let Ok(Some(json)) = ctx.json_stringify(new_body)
+                        && let Ok(text) = json.to_string()
+                     {
+                        current_body = text;
+                        changed = true;
+                     }
+                  }
+               },
+               Ok(_) => {},
+               Err(err) => log::error!("[{plugin}] onRequest: {err}"),
+            }
+         }
+         if changed {
+            discord::RequestAction::Replace(current_body.into_bytes())
+         } else {
+            discord::RequestAction::Pass
+         }
+      });
+      drain(&self.runtime);
+      action
    }
 
    /// Runs the `before` hooks for `event`. Each sees the previous hook's
@@ -930,7 +1270,17 @@ fn registry<'js>(ctx: &Ctx<'js>, events: &GatewayRegistry) -> rquickjs::Result<R
       #[cfg(target_os = "android")]
       interceptors: RefCell::default(),
       #[cfg(target_os = "android")]
+      request_hooks: RefCell::default(),
+      #[cfg(target_os = "android")]
       pickers: RefCell::default(),
+      #[cfg(target_os = "android")]
+      event_hooks: RefCell::default(),
+      #[cfg(target_os = "android")]
+      node_watchers: RefCell::default(),
+      #[cfg(target_os = "android")]
+      open_pages: RefCell::default(),
+      #[cfg(target_os = "android")]
+      banners: RefCell::default(),
    })
 }
 
@@ -1077,7 +1427,7 @@ fn api<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    #[cfg(target_os = "android")]
    api.set("stores", stores_object(ctx)?)?;
    #[cfg(target_os = "android")]
-   api.set("discord", discord_object(ctx)?)?;
+   api.set("discord", discord_object(ctx, plugin)?)?;
    #[cfg(target_os = "android")]
    api.set(
       "fetch",
@@ -1182,6 +1532,7 @@ fn patch_api<'js>(
 fn context_object<'js>(ctx: &Ctx<'js>, context: &UiContext) -> rquickjs::Result<Object<'js>> {
    let object = Object::new(ctx.clone())?;
    object.set("channelId", context.channel_id.clone())?;
+   object.set("currentUserId", context.current_user_id.clone())?;
    if let Some(id) = &context.message_id {
       object.set("messageId", id.as_str())?;
    }
@@ -1451,8 +1802,25 @@ fn remover<'js>(
    if let Some((id, target)) = update {
       function.set(
          "update",
-         Function::new(ctx.clone(), move |at: rquickjs::function::Opt<String>| {
-            let place = at.0.map(|at| {
+         Function::new(ctx.clone(), move |arg: rquickjs::function::Opt<Value<'_>>| {
+            if matches!(target, Target::Header | Target::Composer)
+               && let Some(object) = arg.0.as_ref().and_then(Value::as_object)
+            {
+               let icon = object.get::<_, Option<String>>("icon").ok().flatten();
+               let label = object.get::<_, Option<String>>("label").ok().flatten();
+               let tint = match object.get::<_, Value<'_>>("tint") {
+                  Ok(value) if value.is_null() => Some(None),
+                  Ok(value) if value.is_undefined() => None,
+                  Ok(value) => value.as_number().map(|color| Some(color as i64)),
+                  Err(_) => None,
+               };
+               patches::update_button(id, icon, label, tint);
+               return;
+            }
+            let at = arg
+               .0
+               .and_then(|value| value.as_string().and_then(|text| text.to_string().ok()));
+            let place = at.map(|at| {
                if target == Target::Tab {
                   Place::User(Some(at))
                } else {
@@ -1492,26 +1860,7 @@ fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>>
       Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
          let title = options.get::<_, Option<String>>("title")?;
          let message = options.get::<_, Option<String>>("message")?;
-         let items = options
-            .get::<_, Option<Vec<Value<'js>>>>("options")?
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|option| {
-               if let Some(label) = option.as_string() {
-                  return Some(patches::MenuItem {
-                     label:  label.to_string().ok()?,
-                     icon:   None,
-                     danger: false,
-                  });
-               }
-               let option = option.as_object()?;
-               Some(patches::MenuItem {
-                  label:  option.get::<_, Option<String>>("label").ok().flatten()?,
-                  icon:   option.get::<_, Option<String>>("icon").ok().flatten(),
-                  danger: option.get::<_, Option<bool>>("danger").ok().flatten().unwrap_or_default(),
-               })
-            })
-            .collect::<Vec<_>>();
+         let items = parse_menu_items(&options)?;
          if message.is_none() && items.is_empty() {
             return Err(Exception::throw_type(&ctx, "choose needs options or a message"));
          }
@@ -1528,6 +1877,277 @@ fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>>
       })?,
    )?;
    ui.set(
+      "showSheet",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
+         let title = options.get::<_, Option<String>>("title")?;
+         let text = options.get::<_, String>("text")?;
+         let monospace = options
+            .get::<_, Option<bool>>("monospace")?
+            .unwrap_or_default();
+         let highlight = options
+            .get::<_, Option<bool>>("highlight")?
+            .unwrap_or_default();
+         let items = parse_menu_items(&options)?;
+         in_background(&ctx, move || {
+            let labels = items.iter().map(|item| item.label.clone()).collect::<Vec<_>>();
+            let body = patches::SheetBody {
+               text: text.clone(),
+               monospace,
+               highlight,
+            };
+            if let Some(index) = patches::sheet(title.clone(), body, items) {
+               return Settlement::Int(Ok(index));
+            }
+            Settlement::Int(crate::picker::view(
+               title.as_deref(),
+               &text,
+               monospace,
+               &labels,
+            ))
+         })
+      })?,
+   )?;
+   let owner = plugin.to_owned();
+   ui.set(
+      "openPage",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         let title = options
+            .get::<_, Option<String>>("title")?
+            .unwrap_or_else(|| owner.clone());
+         let raw_sections = options
+            .get::<_, Option<Vec<Object<'js>>>>("sections")?
+            .unwrap_or_default();
+         let mut handlers = Vec::new();
+         let mut sections = Vec::new();
+         for sec in raw_sections {
+            let kind = sec.get::<_, Option<String>>("type")?.unwrap_or_default();
+            let heading = sec.get::<_, Option<String>>("title")?;
+            match kind.as_str() {
+               "code" => {
+                  sections.push(patches::PageSection::Code {
+                     title:     heading,
+                     text:      sec.get::<_, Option<String>>("text")?.unwrap_or_default(),
+                     monospace: sec.get::<_, Option<bool>>("monospace")?.unwrap_or(true),
+                     highlight: sec.get::<_, Option<bool>>("highlight")?.unwrap_or(false),
+                  });
+               },
+               "text" => {
+                  sections.push(patches::PageSection::Text {
+                     title: heading,
+                     text:  sec.get::<_, Option<String>>("text")?.unwrap_or_default(),
+                  });
+               },
+               "buttons" => {
+                  let raw_buttons = sec
+                     .get::<_, Option<Vec<Object<'js>>>>("buttons")?
+                     .unwrap_or_default();
+                  let mut buttons = Vec::new();
+                  for btn in raw_buttons {
+                     let Some(label) = btn.get::<_, Option<String>>("label")? else {
+                        continue;
+                     };
+                     let Some(on_press) = btn.get::<_, Option<Function<'js>>>("onPress")? else {
+                        continue;
+                     };
+                     #[expect(clippy::cast_possible_truncation, reason = "pages have few buttons")]
+                     let index = handlers.len() as u32;
+                     handlers.push(on_press);
+                     buttons.push(patches::PageButton {
+                        label,
+                        icon: btn.get::<_, Option<String>>("icon")?,
+                        danger: btn.get::<_, Option<bool>>("danger")?.unwrap_or(false),
+                        index,
+                     });
+                  }
+                  sections.push(patches::PageSection::Buttons {
+                     title: heading,
+                     buttons,
+                  });
+               },
+               _ => {},
+            }
+         }
+         ctx.userdata::<Registry<'js>>()
+            .ok_or_else(|| Exception::throw_internal(&ctx, "no registry"))?
+            .open_pages
+            .borrow_mut()
+            .insert(id, (owner.clone(), handlers));
+         patches::open_page(id, title, sections);
+         let handle = Object::new(ctx.clone())?;
+         handle.set("close", Function::new(ctx, move || patches::close_page(id))?)?;
+         Ok::<_, rquickjs::Error>(handle)
+      })?,
+   )?;
+   let owner = plugin.to_owned();
+   ui.set(
+      "hide",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, aid: String| {
+         let handle = patches::hide(owner.clone(), aid);
+         remover(&ctx, move |_| patches::unhide(handle), None)
+      })?,
+   )?;
+   let owner = plugin.to_owned();
+   ui.set(
+      "onEvent",
+      Function::new(
+         ctx.clone(),
+         move |ctx: Ctx<'js>,
+               event: String,
+               handler: Function<'js>,
+               options: Opt<Object<'js>>| {
+            on_view_event(&ctx, &owner, &event, handler, options.0)
+         },
+      )?,
+   )?;
+   ui.set(
+      "dispatch",
+      Function::new(
+         ctx.clone(),
+         |ctx: Ctx<'js>, node: i32, event: String, payload: Opt<Value<'js>>| {
+            let prop = phoenix_ui::Prop::from_str(&event).map_err(|_| {
+               Exception::throw_type(&ctx, &format!("unknown Phoenix event {event:?}"))
+            })?;
+            let wire = match payload.0 {
+               Some(value) if !value.is_undefined() && !value.is_null() => {
+                  js_to_wire(&ctx, value)?
+               },
+               _ => phoenix_wire::Value::Obj(Vec::new()),
+            };
+            Ok::<_, rquickjs::Error>(patches::dispatch_event(node, prop.key(), &wire))
+         },
+      )?,
+   )?;
+   let owner = plugin.to_owned();
+   ui.set(
+      "onNode",
+      Function::new(
+         ctx.clone(),
+         move |ctx: Ctx<'js>, matcher: Value<'js>, handler: Function<'js>| {
+            let matcher = parse_node_match(&ctx, &matcher)?;
+            on_node_created(&ctx, &owner, matcher, handler)
+         },
+      )?,
+   )?;
+   let owner = plugin.to_owned();
+   ui.set(
+      "patchProps",
+      Function::new(
+         ctx.clone(),
+         move |ctx: Ctx<'js>,
+               matcher: Value<'js>,
+               patch: Object<'js>,
+               options: Opt<Object<'js>>| {
+            let matcher = parse_node_match(&ctx, &matcher)?;
+            let add_on = patch
+               .get::<_, Option<Vec<String>>>("addOn")?
+               .unwrap_or_default();
+            let props = parse_props(&ctx, &patch, Some("addOn"))?;
+            let (target, once, timeout) = match options.0 {
+               Some(opts) => {
+                  let target = match opts.get::<_, Option<String>>("target")?.as_deref() {
+                     Some("sheet") => PatchTarget::Sheet,
+                     Some("list") => PatchTarget::List,
+                     Some("node") | None => PatchTarget::Node,
+                     Some(other) => {
+                        return Err(Exception::throw_type(
+                           &ctx,
+                           &format!("unknown patchProps target {other:?}"),
+                        ));
+                     },
+                  };
+                  let once = opts.get::<_, Option<bool>>("once")?.unwrap_or(false);
+                  let timeout = opts
+                     .get::<_, Option<f64>>("timeoutMs")?
+                     .filter(|ms| *ms > 0.0)
+                     .map(|ms| std::time::Duration::from_millis(ms as u64));
+                  (target, once, timeout)
+               },
+               None => (PatchTarget::Node, false, None),
+            };
+            let handle =
+               patches::add_prop_patch(owner.clone(), matcher, target, props, add_on, once, timeout);
+            remover(&ctx, move |_| patches::remove_prop_patch(handle), None)
+         },
+      )?,
+   )?;
+   ui.set(
+      "update",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, node: i32, patch: Object<'js>| {
+         let props = parse_props(&ctx, &patch, None)?;
+         patches::update_node(node, props);
+         Ok::<_, rquickjs::Error>(())
+      })?,
+   )?;
+   ui.set(
+      "find",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, matcher: Value<'js>| {
+         let matcher = parse_node_match(&ctx, &matcher)?;
+         Ok::<_, rquickjs::Error>(patches::find_nodes(&matcher))
+      })?,
+   )?;
+   ui.set(
+      "findDown",
+      Function::new(
+         ctx.clone(),
+         |ctx: Ctx<'js>, root: i32, matcher: Value<'js>, depth: Opt<usize>| {
+            let matcher = parse_node_match(&ctx, &matcher)?;
+            Ok::<_, rquickjs::Error>(patches::find_down(root, &matcher, depth.0.unwrap_or(8)))
+         },
+      )?,
+   )?;
+   ui.set(
+      "node",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, id: i32| -> rquickjs::Result<Value<'js>> {
+         match patches::node_info(id) {
+            Some(info) => Ok(node_info_object(&ctx, &info)?.into_value()),
+            None => Ok(Value::new_null(ctx)),
+         }
+      })?,
+   )?;
+   let owner = plugin.to_owned();
+   ui.set(
+      "notify",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         let title = options
+            .get::<_, Option<String>>("title")?
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| Exception::throw_type(&ctx, "notify({ title }) requires a title"))?;
+         let body = options.get::<_, Option<String>>("body")?;
+         let icon = options.get::<_, Option<String>>("icon")?;
+         let accent = options
+            .get::<_, Option<f64>>("accent")?
+            .map(|color| color as i64);
+         let duration_ms = options
+            .get::<_, Option<f64>>("durationMs")?
+            .map_or(5000, |ms| if ms <= 0.0 { 0 } else { ms as u64 });
+         let on_press = options.get::<_, Option<Function<'js>>>("onPress")?;
+         let action = if on_press.is_some() {
+            patches::BannerAction::JsCallback
+         } else {
+            patches::BannerAction::None
+         };
+         let id = patches::show_banner(title, body, icon, accent, duration_ms, action);
+         if let Some(callback) = on_press {
+            ctx.userdata::<Registry<'js>>()
+               .ok_or_else(|| Exception::throw_internal(&ctx, "no registry"))?
+               .banners
+               .borrow_mut()
+               .insert(id, (owner.clone(), callback));
+         }
+         remover(&ctx, move |_| patches::dismiss_banner(id), None)
+      })?,
+   )?;
+   ui.set(
+      "copy",
+      Function::new(ctx.clone(), |text: String| {
+         if let Err(err) = crate::picker::copy(&text) {
+            log::warn!("copy: {err}");
+         }
+      })?,
+   )?;
+   ui.set(
       "toast",
       Function::new(ctx.clone(), |text: String| {
          if let Err(err) = crate::picker::toast(&text) {
@@ -1536,6 +2156,30 @@ fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>>
       })?,
    )?;
    Ok(ui)
+}
+
+#[cfg(target_os = "android")]
+fn parse_menu_items<'js>(options: &Object<'js>) -> rquickjs::Result<Vec<patches::MenuItem>> {
+   Ok(options
+      .get::<_, Option<Vec<Value<'js>>>>("options")?
+      .unwrap_or_default()
+      .into_iter()
+      .filter_map(|option| {
+         if let Some(label) = option.as_string() {
+            return Some(patches::MenuItem {
+               label:  label.to_string().ok()?,
+               icon:   None,
+               danger: false,
+            });
+         }
+         let option = option.as_object()?;
+         Some(patches::MenuItem {
+            label:  option.get::<_, Option<String>>("label").ok().flatten()?,
+            icon:   option.get::<_, Option<String>>("icon").ok().flatten(),
+            danger: option.get::<_, Option<bool>>("danger").ok().flatten().unwrap_or_default(),
+         })
+      })
+      .collect())
 }
 
 #[cfg(target_os = "android")]
@@ -1596,6 +2240,9 @@ fn add_contribution<'js>(
       target,
       label: label.unwrap_or_default(),
       icon: options.get("icon")?,
+      tint: options
+         .get::<_, Option<f64>>("tint")?
+         .map(|color| color as i64),
       danger: options
          .get::<_, Option<bool>>("danger")?
          .unwrap_or_default(),
@@ -1745,6 +2392,271 @@ fn on_emoji_pick<'js>(
    )
 }
 
+#[cfg(target_os = "android")]
+fn on_view_event<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   event: &str,
+   function: Function<'js>,
+   options: Option<Object<'js>>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+   let prop = phoenix_ui::Prop::from_str(event)
+      .map_err(|_| Exception::throw_type(ctx, &format!("unknown Phoenix event {event:?}")))?;
+   let intercept = options
+      .and_then(|opts| opts.get::<_, Option<bool>>("intercept").ok().flatten())
+      .unwrap_or(false);
+   let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+   let key = prop.key();
+   let registry = ctx
+      .userdata::<Registry<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .event_hooks
+      .borrow_mut()
+      .push((id, plugin.to_owned(), key, intercept, function));
+   drop(registry);
+   patches::add_event_hook(id, plugin.to_owned(), key, intercept);
+   remover(
+      ctx,
+      move |ctx| {
+         if let Some(registry) = ctx.userdata::<Registry<'js>>() {
+            registry
+               .event_hooks
+               .borrow_mut()
+               .retain(|(existing, ..)| *existing != id);
+         }
+         patches::remove_event_hook(id);
+      },
+      None,
+   )
+}
+
+#[cfg(target_os = "android")]
+fn on_node_created<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   matcher: NodeMatch,
+   function: Function<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+   let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+   let registry = ctx
+      .userdata::<Registry<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .node_watchers
+      .borrow_mut()
+      .insert(id, (plugin.to_owned(), function));
+   drop(registry);
+   patches::add_node_watcher(id, plugin.to_owned(), matcher);
+   remover(
+      ctx,
+      move |ctx| {
+         if let Some(registry) = ctx.userdata::<Registry<'js>>() {
+            registry.node_watchers.borrow_mut().remove(&id);
+         }
+         patches::remove_node_watcher(id);
+      },
+      None,
+   )
+}
+
+#[cfg(target_os = "android")]
+fn parse_node_match<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> rquickjs::Result<NodeMatch> {
+   if let Some(text) = value.as_string() {
+      return Ok(NodeMatch::Exact(text.to_string()?));
+   }
+   if let Some(obj) = value.as_object() {
+      if let Some(exact) = obj.get::<_, Option<String>>("exact")? {
+         return Ok(NodeMatch::Exact(exact));
+      }
+      if let Some(prefix) = obj.get::<_, Option<String>>("prefix")? {
+         return Ok(NodeMatch::Prefix(prefix));
+      }
+   }
+   Err(Exception::throw_type(
+      ctx,
+      "expected accessibilityId string or { exact | prefix }",
+   ))
+}
+
+#[cfg(target_os = "android")]
+fn is_float_prop(name: &str) -> bool {
+   matches!(
+      name,
+      "opacity"
+         | "scrimOpacity"
+         | "width"
+         | "height"
+         | "minWidth"
+         | "maxWidth"
+         | "minHeight"
+         | "maxHeight"
+         | "radius"
+         | "radiusTopLeft"
+         | "radiusTopRight"
+         | "radiusBottomLeft"
+         | "radiusBottomRight"
+         | "fontSize"
+         | "lineHeight"
+         | "gap"
+         | "gapX"
+         | "gapY"
+         | "flex"
+         | "scale"
+         | "scaleX"
+         | "scaleY"
+         | "translateX"
+         | "translateY"
+         | "rotation"
+         | "elevation"
+         | "borderWidth"
+         | "hitSlop"
+   )
+}
+
+#[cfg(target_os = "android")]
+fn parse_props<'js>(
+   ctx: &Ctx<'js>,
+   object: &Object<'js>,
+   skip: Option<&str>,
+) -> rquickjs::Result<phoenix_ui::Props> {
+   let mut out = Vec::new();
+   for entry in object.props::<String, Value<'js>>() {
+      let (name, value) = entry?;
+      if skip == Some(name.as_str()) || value.is_undefined() {
+         continue;
+      }
+      let prop = phoenix_ui::Prop::from_str(&name)
+         .map_err(|_| Exception::throw_type(ctx, &format!("unknown Phoenix prop {name:?}")))?;
+      let wire = if is_float_prop(&name)
+         && let Some(num) = value.as_number()
+      {
+         phoenix_wire::Value::F64(num)
+      } else {
+         js_to_wire(ctx, value)?
+      };
+      out.push((prop, wire));
+   }
+   Ok(out)
+}
+
+#[cfg(target_os = "android")]
+fn js_to_wire<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<phoenix_wire::Value> {
+   if value.is_null() || value.is_undefined() {
+      return Ok(phoenix_wire::Value::Null);
+   }
+   if let Some(flag) = value.as_bool() {
+      return Ok(phoenix_wire::Value::Bool(flag));
+   }
+   if let Some(int) = value.as_int() {
+      return Ok(phoenix_wire::Value::I32(int));
+   }
+   if let Some(num) = value.as_float() {
+      if num.fract() == 0.0 && num > f64::from(i32::MAX) && num <= (1i64 << 53) as f64 {
+         #[expect(clippy::cast_possible_truncation, reason = "checked finite integer range")]
+         return Ok(phoenix_wire::Value::I64(num as i64));
+      }
+      return Ok(phoenix_wire::Value::F64(num));
+   }
+   if let Some(text) = value.as_string() {
+      return Ok(phoenix_wire::Value::Str(text.to_string()?));
+   }
+   if let Some(array) = value.as_array() {
+      let mut items = Vec::with_capacity(array.len());
+      for item in array.iter::<Value<'js>>() {
+         items.push(js_to_wire(ctx, item?)?);
+      }
+      return Ok(phoenix_wire::Value::Arr(items));
+   }
+   if let Some(object) = value.as_object() {
+      let mut fields = Vec::new();
+      for entry in object.props::<String, Value<'js>>() {
+         let (name, field_value) = entry?;
+         if field_value.is_undefined() {
+            continue;
+         }
+         let prop = phoenix_ui::Prop::from_str(&name).map_err(|_| {
+            Exception::throw_type(ctx, &format!("unknown Phoenix prop/field {name:?}"))
+         })?;
+         fields.push((prop.key(), js_to_wire(ctx, field_value)?));
+      }
+      return Ok(phoenix_wire::Value::Obj(fields));
+   }
+   Ok(phoenix_wire::Value::Null)
+}
+
+#[cfg(target_os = "android")]
+fn wire_to_js<'js>(ctx: &Ctx<'js>, value: &phoenix_wire::Value) -> rquickjs::Result<Value<'js>> {
+   match value {
+      phoenix_wire::Value::Null => Ok(Value::new_null(ctx.clone())),
+      phoenix_wire::Value::Bool(flag) => Ok(Value::new_bool(ctx.clone(), *flag)),
+      phoenix_wire::Value::I32(int) => Ok(Value::new_int(ctx.clone(), *int)),
+      phoenix_wire::Value::I64(int) => Ok(Value::new_float(ctx.clone(), *int as f64)),
+      phoenix_wire::Value::F64(num) => Ok(Value::new_float(ctx.clone(), *num)),
+      phoenix_wire::Value::Str(text) => text.as_str().into_js(ctx),
+      phoenix_wire::Value::Arr(items) => {
+         let arr = rquickjs::Array::new(ctx.clone())?;
+         for (idx, item) in items.iter().enumerate() {
+            arr.set(idx, wire_to_js(ctx, item)?)?;
+         }
+         Ok(arr.into_value())
+      },
+      phoenix_wire::Value::Obj(fields) => {
+         let obj = Object::new(ctx.clone())?;
+         for (key, val) in fields {
+            let name = phoenix_ui::PROPS
+               .get(usize::from(key.get()))
+               .copied()
+               .map(ToOwned::to_owned)
+               .unwrap_or_else(|| key.get().to_string());
+            obj.set(name, wire_to_js(ctx, val)?)?;
+         }
+         Ok(obj.into_value())
+      },
+      phoenix_wire::Value::Map(entries) => {
+         let obj = Object::new(ctx.clone())?;
+         for (key, val) in entries {
+            obj.set(key.as_str(), wire_to_js(ctx, val)?)?;
+         }
+         Ok(obj.into_value())
+      },
+      phoenix_wire::Value::Rect(rect) => {
+         let arr = rquickjs::Array::new(ctx.clone())?;
+         for (idx, val) in rect.iter().enumerate() {
+            arr.set(idx, f64::from(*val))?;
+         }
+         Ok(arr.into_value())
+      },
+      phoenix_wire::Value::Words(words) => words.clone().into_js(ctx),
+      phoenix_wire::Value::WPatch { .. } => Ok(Value::new_null(ctx.clone())),
+   }
+}
+
+#[cfg(target_os = "android")]
+fn json_parser_fn<'js>(ctx: &Ctx<'js>, source: String) -> rquickjs::Result<Function<'js>> {
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      ctx.json_parse(source.as_str())
+         .unwrap_or_else(|_| Value::new_null(ctx))
+   })
+}
+
+#[cfg(target_os = "android")]
+fn node_info_object<'js>(ctx: &Ctx<'js>, info: &NodeInfo) -> rquickjs::Result<Object<'js>> {
+   let obj = Object::new(ctx.clone())?;
+   obj.set("id", info.id)?;
+   obj.set("accessibilityId", info.accessibility_id.clone())?;
+   obj.set("parent", info.parent)?;
+   obj.set("children", info.children.clone())?;
+   obj.set("sheet", info.sheet)?;
+   obj.set("list", info.list)?;
+   obj.set("on", info.on.clone())?;
+   Ok(obj)
+}
+
 /// `phoenix.log`, whose lines carry the plugin's name.
 fn log_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    let log = Object::new(ctx.clone())?;
@@ -1858,10 +2770,10 @@ fn start_fetch<'js>(
 }
 
 /// `phoenix.discord`, Discord's API on the app's own client and session:
-/// `request(path, init)`, `get` and `delete(path, init)`, and `post`, `put` and
-/// `patch(path, body, init)`.
+/// `request(path, init)`, `get` and `delete(path, init)`, `post`, `put` and
+/// `patch(path, body, init)`, and `onRequest(filter, handler)`.
 #[cfg(target_os = "android")]
-fn discord_object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+fn discord_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    fn send<'js>(
       ctx: &Ctx<'js>,
       path: String,
@@ -1878,6 +2790,39 @@ fn discord_object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
    }
 
    let object = Object::new(ctx.clone())?;
+   let owner = plugin.to_owned();
+   object.set(
+      "onRequest",
+      Function::new(
+         ctx.clone(),
+         move |ctx: Ctx<'js>, filter: Object<'js>, handler: Function<'js>| {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let parsed = discord::RequestFilter {
+               method:        filter.get::<_, Option<String>>("method")?,
+               path_prefix:   filter.get::<_, Option<String>>("pathPrefix")?,
+               path_suffix:   filter.get::<_, Option<String>>("pathSuffix")?,
+               path_includes: filter.get::<_, Option<String>>("pathIncludes")?,
+            };
+            ctx.userdata::<Registry<'js>>()
+               .ok_or_else(|| Exception::throw_internal(&ctx, "no registry"))?
+               .request_hooks
+               .borrow_mut()
+               .insert(id, (owner.clone(), handler));
+            discord::add_request_hook(id, owner.clone(), parsed);
+            remover(
+               &ctx,
+               move |ctx| {
+                  if let Some(registry) = ctx.userdata::<Registry<'js>>() {
+                     registry.request_hooks.borrow_mut().remove(&id);
+                  }
+                  discord::remove_request_hook(id);
+               },
+               None,
+            )
+         },
+      )?,
+   )?;
    object.set(
       "authorize",
       Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
@@ -2101,6 +3046,7 @@ fn define<'js>(
       definitions.push(Definition {
          title: spec.get("title")?,
          description: spec.get("description")?,
+         on_change: spec.get("onChange")?,
          kind,
          key,
       });
@@ -2216,6 +3162,21 @@ fn storage<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    reason = "plugins load under one engine lock so no gateway event sees a half-loaded set"
 )]
 pub fn load_plugins(state: &State, bundled: Vec<Plugin>) -> Result<Vec<String>, Error> {
+   let choices_path = state.choices_path();
+   let choices = match fs::read(&choices_path) {
+      Ok(bytes) => {
+         serde_json::from_slice::<Choices>(&bytes).unwrap_or_else(|err| {
+            log::error!("{}: {err}", choices_path.display());
+            Choices::default()
+         })
+      },
+      Err(err) if err.kind() == ErrorKind::NotFound => Choices::default(),
+      Err(err) => return Err(io_error(&choices_path)(err)),
+   };
+   gateway::set_staff_enabled(choices.staff);
+   #[cfg(target_os = "android")]
+   crate::set_remote_shell_flag(choices.remote_shell);
+
    let dir = state.plugins_dir();
    let mut sources = bundled
       .into_iter()
@@ -2241,18 +3202,6 @@ pub fn load_plugins(state: &State, bundled: Vec<Plugin>) -> Result<Vec<String>, 
       let source = fs::read_to_string(&path).map_err(io_error(&path))?;
       sources.insert(name.to_owned(), (source, true));
    }
-
-   let choices_path = state.choices_path();
-   let choices = match fs::read(&choices_path) {
-      Ok(bytes) => {
-         serde_json::from_slice::<Choices>(&bytes).unwrap_or_else(|err| {
-            log::error!("{}: {err}", choices_path.display());
-            Choices::default()
-         })
-      },
-      Err(err) if err.kind() == ErrorKind::NotFound => Choices::default(),
-      Err(err) => return Err(io_error(&choices_path)(err)),
-   };
 
    let mut engine = state
       .js

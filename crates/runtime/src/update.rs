@@ -76,8 +76,28 @@ pub fn check() {
          update.loader,
          update.plugins
       );
+      let body = match (&update.loader, update.plugins.is_empty()) {
+         (Some(version), true) => format!("Build {version} — tap to download"),
+         (Some(version), false) => {
+            format!(
+               "Build {version} & {} plugin update{} — tap to open",
+               update.plugins.len(),
+               if update.plugins.len() == 1 { "" } else { "s" }
+            )
+         },
+         (None, false) => format!("Updated plugins: {} — tap to open", update.plugins.join(", ")),
+         (None, true) => String::new(),
+      };
       if FOUND.set(update).is_ok() {
          crate::settings::refresh();
+         crate::patches::show_banner(
+            "Phoenix Unlock update available".to_owned(),
+            Some(body),
+            Some("res://ic_mana_puzzle_piece_retry".to_owned()),
+            Some(0xFF23_A55A),
+            8000,
+            crate::patches::BannerAction::OpenUrl(SITE.to_owned()),
+         );
       }
    });
 }

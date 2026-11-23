@@ -68,6 +68,7 @@ fn view(props: Vec<(Prop, Value)>, kids: Vec<Draft>) -> Draft {
       props,
       kids,
       press: None,
+      src: None,
    }
 }
 
@@ -470,6 +471,7 @@ pub(super) fn badge_detail(badge: &Badge, dismiss: Handler) -> Draft {
          vec![badge_body(badge)],
       )],
       press: Some(dismiss),
+      src: None,
    }
 }
 
@@ -501,6 +503,7 @@ fn badge_body(badge: &Badge) -> Draft {
       ],
       kids:  Vec::new(),
       press: None,
+      src: None,
    };
    let title = Draft {
       kind:  ViewKind::Text,
@@ -518,6 +521,7 @@ fn badge_body(badge: &Badge) -> Draft {
       ],
       kids:  Vec::new(),
       press: None,
+      src: None,
    };
    let pill = view(
       vec![
@@ -543,6 +547,7 @@ fn badge_body(badge: &Badge) -> Draft {
             ],
             kids:  Vec::new(),
             press: None,
+            src: None,
          },
          Draft {
             kind:  ViewKind::Text,
@@ -557,6 +562,7 @@ fn badge_body(badge: &Badge) -> Draft {
             ],
             kids:  Vec::new(),
             press: None,
+            src: None,
          },
       ],
    );
@@ -570,6 +576,7 @@ fn badge_body(badge: &Badge) -> Draft {
       ],
       kids:  vec![pill],
       press: None,
+      src: None,
    };
    let credit_wrap = view(
       vec![
@@ -591,6 +598,7 @@ fn badge_body(badge: &Badge) -> Draft {
          vec![text_block],
       )],
       press: None,
+      src: None,
    };
    let image = Draft {
       kind:  ViewKind::Image,
@@ -603,6 +611,7 @@ fn badge_body(badge: &Badge) -> Draft {
       ],
       kids:  Vec::new(),
       press: None,
+      src: None,
    };
    let image_center = view(
       vec![direction("column"), fill(), align("center")],
@@ -630,6 +639,7 @@ fn badge_body(badge: &Badge) -> Draft {
       ],
       kids:  Vec::new(),
       press: None,
+      src: None,
    });
    let mut body_kids = vec![hero];
    body_kids.extend(description);
@@ -680,6 +690,7 @@ fn badge_node(badge: &Badge) -> Draft {
       props: Vec::new(),
       kids:  Vec::new(),
       press: None,
+      src: None,
    };
    node.set(Prop::URI, Some(Value::Str(badge.uri.clone())));
    node.set(Prop::named("width"), Some(Value::I32(20)));

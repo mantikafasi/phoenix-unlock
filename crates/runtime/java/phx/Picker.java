@@ -2,7 +2,13 @@ package phx;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.DialogInterface;
+import android.graphics.Typeface;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 import android.app.Fragment;
 import android.content.ContentResolver;
@@ -120,6 +126,71 @@ public final class Picker extends Fragment {
                     Toast.makeText(findActivity(owner), text, Toast.LENGTH_SHORT).show();
                 } catch (Throwable t) {
                     android.util.Log.e("phoenix", "toast: " + t);
+                }
+            }
+        });
+    }
+
+    public static void copy(final Object owner, final String text) {
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            public void run() {
+                try {
+                    Activity a = findActivity(owner);
+                    if (a == null) return;
+                    ClipboardManager cm = (ClipboardManager) a.getSystemService(Context.CLIPBOARD_SERVICE);
+                    if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("phoenix", text));
+                } catch (Throwable t) {
+                    android.util.Log.e("phoenix", "copy: " + t);
+                }
+            }
+        });
+    }
+
+    /** Scrollable selectable text/code dialog fallback when no Phoenix sheet can be drawn. */
+    public static void view(final Object owner, final int id, final String title, final String text, final boolean monospace, final String[] options) {
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            public void run() {
+                final boolean[] answered = {false};
+                class Answer implements DialogInterface.OnClickListener {
+                    final int index;
+                    Answer(int index) { this.index = index; }
+                    public void onClick(DialogInterface d, int which) {
+                        if (answered[0]) return;
+                        answered[0] = true;
+                        onChosen(id, index);
+                    }
+                }
+                try {
+                    Activity a = findActivity(owner);
+                    float dp = a.getResources().getDisplayMetrics().density;
+                    int pad = (int) (16 * dp);
+                    TextView tv = new TextView(a);
+                    tv.setText(text);
+                    tv.setTextSize(12f);
+                    tv.setTextColor(0xFFF6F6F7);
+                    if (monospace) tv.setTypeface(Typeface.MONOSPACE);
+                    tv.setTextIsSelectable(true);
+                    tv.setPadding(pad, pad, pad, pad);
+                    ScrollView sv = new ScrollView(a);
+                    sv.setBackgroundColor(0xFF141518);
+                    sv.addView(tv);
+                    AlertDialog.Builder b = new AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert);
+                    if (title != null) b.setTitle(title);
+                    b.setView(sv);
+                    if (options.length > 0) b.setPositiveButton(options[0], new Answer(0));
+                    if (options.length > 1) b.setNegativeButton(options[1], new Answer(1));
+                    if (options.length > 2) b.setNeutralButton(options[2], new Answer(2));
+                    b.setOnDismissListener(new DialogInterface.OnDismissListener() {
+                        public void onDismiss(DialogInterface d) {
+                            if (answered[0]) return;
+                            answered[0] = true;
+                            onChosen(id, -1);
+                        }
+                    });
+                    b.show();
+                } catch (Throwable t) {
+                    android.util.Log.e("phoenix", "view: " + t);
+                    if (!answered[0]) { answered[0] = true; onChosen(id, -1); }
                 }
             }
         });

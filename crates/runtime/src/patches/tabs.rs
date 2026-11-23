@@ -64,6 +64,7 @@ fn node(kind: ViewKind, props: Vec<(&str, Value)>) -> Draft {
          .collect(),
       kids: Vec::new(),
       press: None,
+      src: None,
    }
 }
 

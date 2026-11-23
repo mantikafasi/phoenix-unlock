@@ -339,9 +339,24 @@ unsafe extern "C" fn detour(
    result
 }
 
+/// Whether READY and USER_UPDATE carry the staff flag.
+static STAFF_UNLOCK: AtomicBool = AtomicBool::new(true);
+
+#[must_use]
+pub fn staff_enabled() -> bool {
+   STAFF_UNLOCK.load(Ordering::Relaxed)
+}
+
+pub fn set_staff_enabled(enabled: bool) {
+   STAFF_UNLOCK.store(enabled, Ordering::Relaxed);
+}
+
 /// Gives the signed-in user the staff flag, which unlocks Phoenix's
 /// experiments. `None` leaves the event as it was.
 fn promote(name: &str, data: &str) -> Option<String> {
+   if !staff_enabled() {
+      return None;
+   }
    let promoted = match name {
       "READY" => ready_with_staff(data),
       "USER_UPDATE" => with_staff(data),

@@ -34,6 +34,8 @@ use std::{
       PoisonError,
       atomic::{
          AtomicBool,
+         AtomicI32,
+         AtomicU32,
          AtomicU64,
          Ordering,
       },
@@ -43,6 +45,10 @@ use std::{
       },
    },
    thread,
+   time::{
+      Duration,
+      Instant,
+   },
 };
 
 use memchr::memmem;
@@ -124,6 +130,7 @@ pub struct Contribution {
    pub target:      Target,
    pub label:       String,
    pub icon:        Option<String>,
+   pub tint:        Option<i64>,
    pub danger:      bool,
    pub priority:    i32,
    /// Shown only where the plugin's `visible` says so.
@@ -223,14 +230,80 @@ pub enum Sent {
    Unchanged,
 }
 
+/// Matches a Phoenix node's `accessibilityId`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeMatch {
+   Exact(String),
+   Prefix(String),
+}
+
+impl NodeMatch {
+   pub fn matches(&self, aid: &str) -> bool {
+      match self {
+         Self::Exact(expected) => aid == expected,
+         Self::Prefix(prefix) => aid.starts_with(prefix.as_str()),
+      }
+   }
+}
+
+/// Which node a declarative [`PropPatch`] targets when a matching node mounts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatchTarget {
+   /// The matching node itself.
+   Node,
+   /// The enclosing sheet (and its created outer wrapper), for zero-flash suppression.
+   Sheet,
+   /// The enclosing virtualized/row-gesture list.
+   List,
+}
+
+/// Snapshot of a live Phoenix node from [`Mirror`], exposed to plugins.
+#[derive(Clone, Debug)]
+pub struct NodeInfo {
+   pub id:               i32,
+   pub accessibility_id: Option<String>,
+   pub parent:           Option<i32>,
+   pub children:         Vec<i32>,
+   pub sheet:            Option<i32>,
+   pub list:             Option<i32>,
+   pub on:               Vec<String>,
+}
+
+/// A synchronous Rust-side prop patch applied inside `rewrite` with zero JS
+/// overhead per batch.
+struct PropPatch {
+   id:       u64,
+   plugin:   String,
+   matcher:  NodeMatch,
+   target:   PatchTarget,
+   props:    Props,
+   add_on:   Vec<String>,
+   once:     bool,
+   deadline: Option<Instant>,
+}
+
+struct EventHookMeta {
+   id:        u64,
+   plugin:    String,
+   event:     Key,
+   intercept: bool,
+}
+
+struct NodeWatcher {
+   id:      u64,
+   plugin:  String,
+   matcher: NodeMatch,
+}
+
 /// What plugin callbacks receive as `ctx`.
 #[derive(Default)]
 pub struct UiContext {
-   pub channel_id: Option<String>,
-   pub message_id: Option<String>,
-   pub user_id:    Option<String>,
+   pub channel_id:      Option<String>,
+   pub message_id:      Option<String>,
+   pub user_id:         Option<String>,
+   pub current_user_id: Option<String>,
    /// The message as Phoenix cached it, JSON.
-   pub message:    Option<String>,
+   pub message:         Option<String>,
 }
 
 #[derive(Clone)]
@@ -271,6 +344,14 @@ enum Handler {
       contribution: ContributionId,
       index:        u32,
    },
+   /// Back button of a plugin full-screen page.
+   PageBack(u32),
+   /// Action button on a plugin full-screen page.
+   PageButton { page: u32, index: u32 },
+   /// Tap on an in-app notification banner card.
+   BannerPress(u32),
+   /// Tap on an in-app notification banner's dismiss button.
+   BannerDismiss(u32),
 }
 
 /// A node to create, with the handler its subtree answers presses with.
@@ -279,6 +360,7 @@ pub struct Draft {
    props: Props,
    kids:  Vec<Self>,
    press: Option<Handler>,
+   src:   Option<u32>,
 }
 
 impl Draft {
@@ -288,7 +370,15 @@ impl Draft {
          props: node.props.clone(),
          kids:  node.kids.iter().map(Self::from_node).collect(),
          press: None,
+         src:   node.src,
       }
+   }
+
+   fn find(&mut self, src: u32) -> Option<&mut Self> {
+      if self.src == Some(src) {
+         return Some(self);
+      }
+      self.kids.iter_mut().find_map(|kid| kid.find(src))
    }
 
    fn set(&mut self, key: Prop, value: Option<Value>) {
@@ -302,6 +392,54 @@ enum SlotKind {
    Suggestions,
    /// A plugin menu sheet.
    Menu(u32),
+   /// A plugin full-screen page pushed onto a navigator.
+   Page(u32),
+   /// A native top in-app notification banner attached to the root view.
+   Banner(u32),
+}
+
+/// What happens when the user taps an in-app notification banner.
+pub enum BannerAction {
+   None,
+   OpenUrl(String),
+   JsCallback,
+}
+
+/// Specification for a native Discord in-app notification banner.
+pub struct BannerSpec {
+   pub id:          u32,
+   pub title:       String,
+   pub body:        Option<String>,
+   pub icon:        Option<String>,
+   pub accent:      Option<i64>,
+   pub duration_ms: u64,
+   pub action:      BannerAction,
+}
+
+/// A button row on a plugin full-screen page.
+pub struct PageButton {
+   pub label:  String,
+   pub icon:   Option<String>,
+   pub danger: bool,
+   pub index:  u32,
+}
+
+/// A section on a plugin full-screen page.
+pub enum PageSection {
+   Code {
+      title:     Option<String>,
+      text:      String,
+      monospace: bool,
+      highlight: bool,
+   },
+   Text {
+      title: Option<String>,
+      text:  String,
+   },
+   Buttons {
+      title:   Option<String>,
+      buttons: Vec<PageButton>,
+   },
 }
 
 /// A menu sheet row a plugin asked for.
@@ -309,6 +447,13 @@ pub struct MenuItem {
    pub label:  String,
    pub icon:   Option<String>,
    pub danger: bool,
+}
+
+/// Scrollable text content shown inside a plugin sheet.
+pub struct SheetBody {
+   pub text:      String,
+   pub monospace: bool,
+   pub highlight: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -378,6 +523,7 @@ enum Job {
    /// and -2 when no sheet can be drawn.
    Menu {
       title:  Option<String>,
+      body:   Option<SheetBody>,
       items:  Vec<MenuItem>,
       answer: Sender<i32>,
    },
@@ -385,6 +531,18 @@ enum Job {
    CloseMenu { menu: u32, index: i32 },
    /// Show one badge in the badge directory's detail sheet.
    Detail { badge: Badge },
+   /// Push a full-screen page onto the active navigator.
+   OpenPage {
+      id:       u32,
+      title:    String,
+      sections: Vec<PageSection>,
+   },
+   /// Pop plugin full-screen page `id`.
+   ClosePage(u32),
+   /// Run button `index` on plugin full-screen page `page`.
+   PagePress { page: u32, index: u32 },
+   /// Reconcile `hidden: true` across live nodes matching `self.hidden`.
+   RefreshHidden,
    /// A press on custom emoji `id` in the picker, held for the `onEmojiPick`
    /// handlers.
    Emoji {
@@ -393,18 +551,52 @@ enum Job {
       text:  String,
       frame: Vec<u8>,
    },
+   /// Re-apply declarative `PatchTarget::List` prop patches to live lists.
+   RefreshPropPatches,
+   /// Send a raw `Op::Update` requested by `phoenix.ui.update`.
+   UpdateNode {
+      node:  i32,
+      props: Props,
+   },
+   /// A view event matching one or more `phoenix.ui.onEvent` handlers.
+   ViewEvent {
+      node:       i32,
+      event:      Key,
+      payload:    Value,
+      aid:        Option<String>,
+      message_id: Option<String>,
+      frame:      Option<Vec<u8>>,
+   },
+   /// A node matching one or more `phoenix.ui.onNode` watchers was created.
+   NodeCreated {
+      watchers: Vec<u64>,
+      info:     NodeInfo,
+   },
+   /// Show a native top in-app notification banner.
+   ShowBanner(BannerSpec),
+   /// Show any banners queued while waiting for the root UI to settle.
+   FlushBanners,
+   /// Dismiss in-app notification banner `id` if still visible.
+   DismissBanner(u32),
+   /// User tapped in-app notification banner `id`.
+   BannerPressed(u32),
 }
 
 #[derive(Default)]
 struct Patches {
-   mirror:        Mirror,
-   templates:     Templates,
-   seen:          Seen,
-   contributions: Vec<Contribution>,
-   commands:      Vec<Command>,
-   interceptors:  usize,
-   pickers:       usize,
-   slots:         Vec<Slot>,
+   mirror:          Mirror,
+   templates:       Templates,
+   seen:            Seen,
+   contributions:   Vec<Contribution>,
+   commands:        Vec<Command>,
+   interceptors:    usize,
+   pickers:         usize,
+   event_hooks:     Vec<EventHookMeta>,
+   node_watchers:   Vec<NodeWatcher>,
+   prop_patches:    Vec<PropPatch>,
+   /// Live lists discovered for each `PatchTarget::List` prop patch (by patch id).
+   patched_lists:   HashMap<i32, HashSet<u64>>,
+   slots:           Vec<Slot>,
    anchors:       HashMap<Target, HashSet<i32>>,
    /// Badge directory titles still waiting for their grid, with the retries spent.
    badge_retries: HashMap<i32, u8>,
@@ -434,10 +626,36 @@ struct Patches {
    tab_parts:     HashMap<i32, (i32, i32)>,
    /// Open menu sheets and who waits for them.
    menus:         HashMap<u32, Sender<i32>>,
+   /// Last seen parent container that hosts sheets, kept so sheets can open
+   /// even after a message action sheet dismisses.
+   sheet_host:    Option<i32>,
    /// Pagers whose own tab labels we color, since a plugin tab was opened:
    /// their animation stops at Phoenix's last tab and would light it up.
-   static_tabs:   HashSet<i32>,
+   static_tabs:    HashSet<i32>,
+   /// Accessibility ids hidden by `phoenix.ui.hide`, with active refcount.
+   hidden:         HashMap<String, usize>,
+   /// `(handle, plugin, aid)` entries for `phoenix.ui.hide`.
+   hidden_entries: Vec<(u64, String, String)>,
+   /// Node ids on which `phoenix.ui.hide` currently holds `hidden: true`
+   /// (`View.GONE`). Reconciled on every batch so dynamic swaps (like
+   /// `"Record Voice Message"` -> `"send"` inside the same wrapper) restore
+   /// visibility automatically.
+   hidden_nodes:           HashSet<i32>,
+   /// When the root view first became ready, so cold-start banners wait for
+   /// the splash screen to clear.
+   root_ready_at:          Option<Instant>,
+   /// Banners waiting for the root view / cold-start settle delay.
+   pending_banners:        Vec<BannerSpec>,
+   banner_flush_scheduled: bool,
+   /// Tap actions for currently visible in-app notification banners, by id.
+   banner_actions:         HashMap<u32, BannerAction>,
 }
+
+/// Delay after the first `Op::Root` before showing cold-start banners so they
+/// appear over the live screen rather than behind the splash animation.
+const BANNER_STARTUP_DELAY: Duration = Duration::from_millis(1500);
+
+static ROOT_ID: AtomicI32 = AtomicI32::new(0);
 
 static PATCHES: LazyLock<Mutex<Patches>> = LazyLock::new(|| {
    Mutex::new(Patches {
@@ -524,6 +742,18 @@ impl Sink for PatchSink {
    fn ops(&self, batch: &[u8]) -> Action {
       let active = ACTIVE.load(Ordering::Acquire);
       if !active && !GUARDING.load(Ordering::Acquire) {
+         let root = ROOT_ID.load(Ordering::Acquire);
+         if root != 0 && memmem::find(batch, &root.to_le_bytes()).is_none() {
+            return Action::Pass;
+         }
+         if let Ok(ops) = decode(batch) {
+            let mut state = patches();
+            state.mirror.apply(&ops);
+            if let Some(found) = state.mirror.root() {
+               ROOT_ID.store(found, Ordering::Release);
+               state.note_root_ready();
+            }
+         }
          return Action::Pass;
       }
       let mut ops = match decode(batch) {
@@ -620,11 +850,31 @@ fn run(job: Job) -> Vec<Op> {
       },
       Job::Menu {
          title,
+         body,
          items,
          answer,
-      } => patches().open_menu(title.as_deref(), items, answer),
+      } => patches().open_menu(title.as_deref(), body.as_ref(), items, answer),
       Job::CloseMenu { menu, index } => patches().close_menu(menu, index),
       Job::Detail { badge } => patches().open_badge_detail(&badge),
+      Job::OpenPage {
+         id,
+         title,
+         sections,
+      } => patches().open_page(id, &title, sections),
+      Job::ClosePage(id) => {
+         let ops = patches().close_page(id);
+         if let Some(engine) = crate::engine() {
+            engine.page_closed(id);
+         }
+         ops
+      },
+      Job::PagePress { page, index } => {
+         if let Some(engine) = crate::engine() {
+            engine.page_press(page, index);
+         }
+         Vec::new()
+      },
+      Job::RefreshHidden => patches().reconcile_hidden(),
       Job::Block {
          contribution,
          place,
@@ -648,6 +898,7 @@ fn run(job: Job) -> Vec<Op> {
                Place::User(id) => id.clone(),
                _ => None,
             },
+            current_user_id: None,
             message:    None,
          };
          let outcome =
@@ -685,6 +936,72 @@ fn run(job: Job) -> Vec<Op> {
          text,
          frame,
       } => emoji::pick(input, &id, text, frame),
+      Job::RefreshPropPatches => patches().refresh_list_patches(),
+      Job::UpdateNode { node, props } => vec![Op::Update { id: node, props }],
+      Job::ViewEvent {
+         node,
+         event,
+         payload,
+         aid,
+         message_id,
+         frame,
+      } => {
+         let context = message_id
+            .as_deref()
+            .map(|id| press_context(&Place::Message(id.to_owned())));
+         let consumed = crate::engine().is_some_and(|engine| {
+            engine.view_event(
+               node,
+               event,
+               &payload,
+               aid.as_deref(),
+               context.as_ref(),
+               frame.is_some(),
+            )
+         });
+         if let Some(frame) = frame
+            && !consumed
+         {
+            patches().resent.push(frame.clone());
+            if !bridge::inject(&frame) {
+               patches().resent.retain(|sent| *sent != frame);
+               log::warn!("patches: view event re-inject failed");
+            }
+         }
+         Vec::new()
+      },
+      Job::NodeCreated { watchers, info } => {
+         if let Some(engine) = crate::engine() {
+            engine.node_created(&watchers, &info);
+         }
+         Vec::new()
+      },
+      Job::ShowBanner(spec) => patches().show_banner(spec),
+      Job::FlushBanners => patches().flush_banners(),
+      Job::DismissBanner(id) => {
+         let (ops, notify_js) = patches().close_banner(id);
+         if notify_js && let Some(engine) = crate::engine() {
+            engine.banner_closed(id);
+         }
+         ops
+      },
+      Job::BannerPressed(id) => {
+         let (ops, action) = patches().press_banner(id);
+         match action {
+            BannerAction::None => {},
+            BannerAction::OpenUrl(url) => {
+               if let Err(err) = crate::picker::open(&url) {
+                  log::error!("banner open {url}: {err}");
+               }
+            },
+            BannerAction::JsCallback => {
+               if let Some(engine) = crate::engine() {
+                  engine.banner_press(id);
+               }
+            },
+         }
+         ops
+      },
    }
 }
 
@@ -733,6 +1050,16 @@ fn press_context(place: &Place) -> UiContext {
    if let Place::User(id) = place {
       context.user_id.clone_from(id);
    }
+   let me = rows("SELECT v FROM meta WHERE k = ?", &["me".to_owned()]).unwrap_or_default();
+   context.current_user_id = value(&me, "v")
+      .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+      .and_then(|user| {
+         match user.get("id")? {
+            serde_json::Value::String(id) => Some(id.clone()),
+            serde_json::Value::Number(id) => Some(id.to_string()),
+            _ => None,
+         }
+      });
    if context.channel_id.is_none() {
       let selected =
          rows("SELECT v FROM meta WHERE k = ?", &["selected".to_owned()]).unwrap_or_default();
@@ -811,16 +1138,142 @@ pub fn update(id: ContributionId, place: Option<Place>) {
    queue(Job::Refresh(target));
 }
 
+/// Updates a button contribution's icon, label, or tint and redraws its target.
+pub fn update_button(
+   id: ContributionId,
+   icon: Option<String>,
+   label: Option<String>,
+   tint: Option<Option<i64>>,
+) {
+   let mut state = patches();
+   let Some(contribution) = state
+      .contributions
+      .iter_mut()
+      .find(|known| known.id == id)
+   else {
+      return;
+   };
+   if let Some(icon) = icon {
+      contribution.icon = Some(icon);
+   }
+   if let Some(label) = label {
+      contribution.label = label;
+   }
+   if let Some(tint) = tint {
+      contribution.tint = tint;
+   }
+   let target = contribution.target;
+   drop(state);
+   queue(Job::Refresh(target));
+}
+
 /// Shows a menu sheet like the message long-press one and waits for the
 /// choice: the row's index, -1 when it was swiped away, or `None` when no
 /// such sheet can be drawn yet.
 pub fn menu(title: Option<String>, items: Vec<MenuItem>) -> Option<i32> {
    let (answer, receiver) = mpsc::channel();
-   queue(Job::Menu { title, items, answer });
+   queue(Job::Menu {
+      title,
+      body: None,
+      items,
+      answer,
+   });
    match receiver.recv() {
       Ok(-2) | Err(_) => None,
       Ok(index) => Some(index),
    }
+}
+
+/// Shows a scrollable text/code viewer sheet with optional action rows.
+pub fn sheet(title: Option<String>, body: SheetBody, items: Vec<MenuItem>) -> Option<i32> {
+   let (answer, receiver) = mpsc::channel();
+   queue(Job::Menu {
+      title,
+      body: Some(body),
+      items,
+      answer,
+   });
+   match receiver.recv() {
+      Ok(-2) | Err(_) => None,
+      Ok(index) => Some(index),
+   }
+}
+
+/// Pushes a full-screen page onto Phoenix's active navigator.
+pub fn open_page(id: u32, title: String, sections: Vec<PageSection>) {
+   ACTIVE.store(true, Ordering::Release);
+   queue(Job::OpenPage {
+      id,
+      title,
+      sections,
+   });
+}
+
+/// Closes a plugin full-screen page pushed with [`open_page`].
+pub fn close_page(id: u32) {
+   queue(Job::ClosePage(id));
+}
+
+/// Shows a native Discord in-app notification banner at the top of the screen.
+/// Returns the banner id so it can be dismissed early with [`dismiss_banner`].
+pub fn show_banner(
+   title: String,
+   body: Option<String>,
+   icon: Option<String>,
+   accent: Option<i64>,
+   duration_ms: u64,
+   action: BannerAction,
+) -> u32 {
+   static NEXT: AtomicU32 = AtomicU32::new(1);
+   let id = NEXT.fetch_add(1, Ordering::Relaxed);
+   ACTIVE.store(true, Ordering::Release);
+   queue(Job::ShowBanner(BannerSpec {
+      id,
+      title,
+      body,
+      icon,
+      accent,
+      duration_ms,
+      action,
+   }));
+   id
+}
+
+/// Dismisses an in-app notification banner early if it is still visible.
+pub fn dismiss_banner(id: u32) {
+   queue(Job::DismissBanner(id));
+}
+
+/// Hides every Phoenix node with accessibility id `aid` by setting
+/// `hidden: true` (`View.GONE`) on it (or its unnamed single-child wrapper).
+/// Returns a handle for [`unhide`].
+pub fn hide(plugin: String, aid: String) -> u64 {
+   static NEXT: AtomicU64 = AtomicU64::new(1);
+   let handle = NEXT.fetch_add(1, Ordering::Relaxed);
+   ACTIVE.store(true, Ordering::Release);
+   let mut state = patches();
+   *state.hidden.entry(aid.clone()).or_default() += 1;
+   state.hidden_entries.push((handle, plugin, aid));
+   drop(state);
+   queue(Job::RefreshHidden);
+   handle
+}
+
+/// Undoes a [`hide`] call and restores the node if no other plugin hides it.
+pub fn unhide(handle: u64) {
+   let mut state = patches();
+   let Some(pos) = state.hidden_entries.iter().position(|(id, ..)| *id == handle) else {
+      return;
+   };
+   let (_, _, aid) = state.hidden_entries.remove(pos);
+   if let Some(count) = state.hidden.get_mut(&aid) {
+      *count = count.saturating_sub(1);
+      if *count == 0 {
+         state.hidden.remove(&aid);
+      }
+   }
+   drop(state);
+   queue(Job::RefreshHidden);
 }
 
 /// A plugin settled a `render` or `visible` it returned as a promise.
@@ -867,6 +1320,115 @@ pub fn set_emoji_pickers(count: usize) {
    emoji::unlock(count > 0);
 }
 
+/// Registers a raw view event hook (`phoenix.ui.onEvent`).
+pub fn add_event_hook(id: u64, plugin: String, event: Key, intercept: bool) {
+   ACTIVE.store(true, Ordering::Release);
+   patches().event_hooks.push(EventHookMeta {
+      id,
+      plugin,
+      event,
+      intercept,
+   });
+}
+
+pub fn remove_event_hook(id: u64) {
+   patches().event_hooks.retain(|hook| hook.id != id);
+}
+
+/// Registers a raw node creation watcher (`phoenix.ui.onNode`).
+pub fn add_node_watcher(id: u64, plugin: String, matcher: NodeMatch) {
+   ACTIVE.store(true, Ordering::Release);
+   patches().node_watchers.push(NodeWatcher {
+      id,
+      plugin,
+      matcher,
+   });
+}
+
+pub fn remove_node_watcher(id: u64) {
+   patches().node_watchers.retain(|watcher| watcher.id != id);
+}
+
+/// Registers a declarative Rust-side prop patch (`phoenix.ui.patchProps`).
+pub fn add_prop_patch(
+   plugin: String,
+   matcher: NodeMatch,
+   target: PatchTarget,
+   props: Props,
+   add_on: Vec<String>,
+   once: bool,
+   timeout: Option<Duration>,
+) -> u64 {
+   static NEXT: AtomicU64 = AtomicU64::new(1);
+   let id = NEXT.fetch_add(1, Ordering::Relaxed);
+   ACTIVE.store(true, Ordering::Release);
+   let is_list = target == PatchTarget::List;
+   patches().prop_patches.push(PropPatch {
+      id,
+      plugin,
+      matcher,
+      target,
+      props,
+      add_on,
+      once,
+      deadline: timeout.map(|dur| Instant::now() + dur),
+   });
+   if is_list {
+      queue(Job::RefreshPropPatches);
+   }
+   id
+}
+
+pub fn remove_prop_patch(id: u64) {
+   let mut state = patches();
+   let was_list = state
+      .prop_patches
+      .iter()
+      .any(|patch| patch.id == id && patch.target == PatchTarget::List);
+   state.prop_patches.retain(|patch| patch.id != id);
+   drop(state);
+   if was_list {
+      queue(Job::RefreshPropPatches);
+   }
+}
+
+/// Injects a raw view event (`phoenix.ui.dispatch`) straight to Phoenix's Rust guest.
+pub fn dispatch_event(node: i32, event: Key, payload: &Value) -> bool {
+   let frame = encode_view_event(node, event, payload);
+   patches().resent.push(frame.clone());
+   if !bridge::inject(&frame) {
+      patches().resent.retain(|sent| *sent != frame);
+      return false;
+   }
+   true
+}
+
+/// Sends a raw `Op::Update` (`phoenix.ui.update`) on the patches worker thread.
+pub fn update_node(node: i32, props: Props) {
+   ACTIVE.store(true, Ordering::Release);
+   queue(Job::UpdateNode { node, props });
+}
+
+/// Finds all live nodes matching `matcher` (`phoenix.ui.find`).
+pub fn find_nodes(matcher: &NodeMatch) -> Vec<i32> {
+   patches()
+      .mirror
+      .nodes_where(&|aid| matcher.matches(aid))
+}
+
+/// Finds the first node at or under `root` matching `matcher` (`phoenix.ui.findDown`).
+pub fn find_down(root: i32, matcher: &NodeMatch, max_depth: usize) -> Option<i32> {
+   patches()
+      .mirror
+      .find_down(root, &|aid| matcher.matches(aid), max_depth)
+}
+
+/// Snapshot of a live node (`phoenix.ui.node`).
+pub fn node_info(id: i32) -> Option<NodeInfo> {
+   let state = patches();
+   state.mirror.exists(id).then(|| state.build_node_info(id))
+}
+
 /// Drops everything `plugin` added.
 pub fn forget(plugin: &str) {
    let mut state = patches();
@@ -893,12 +1455,42 @@ pub fn forget(plugin: &str) {
       .iter()
       .any(|command| command.plugin == plugin);
    state.commands.retain(|command| command.plugin != plugin);
+   let mut unhidden = Vec::new();
+   state.hidden_entries.retain(|(_, owner, aid)| {
+      if owner == plugin {
+         unhidden.push(aid.clone());
+         false
+      } else {
+         true
+      }
+   });
+   for aid in &unhidden {
+      if let Some(count) = state.hidden.get_mut(aid) {
+         *count = count.saturating_sub(1);
+         if *count == 0 {
+            state.hidden.remove(aid);
+         }
+      }
+   }
+   state.event_hooks.retain(|hook| hook.plugin != plugin);
+   state.node_watchers.retain(|watcher| watcher.plugin != plugin);
+   let had_list_patches = state
+      .prop_patches
+      .iter()
+      .any(|patch| patch.plugin == plugin && patch.target == PatchTarget::List);
+   state.prop_patches.retain(|patch| patch.plugin != plugin);
    drop(state);
+   if !unhidden.is_empty() {
+      queue(Job::RefreshHidden);
+   }
    for target in targets {
       queue(Job::Refresh(target));
    }
    if had_commands {
       queue(Job::Suggest);
+   }
+   if had_list_patches {
+      queue(Job::RefreshPropPatches);
    }
 }
 
@@ -909,9 +1501,16 @@ impl Patches {
       let mut mine = Vec::new();
       let mut touched = HashSet::new();
       let mut extra_deletes;
+      let mut patch_ops: HashMap<i32, (Props, Vec<String>)> = HashMap::new();
+      let mut list_updates: HashSet<i32> = HashSet::new();
+      let mut skip_action_placement = false;
       {
          let (created, deleted) = self.mirror.apply(&ops);
          self.templates.learn_badge_tile(&self.mirror, &created);
+         if let Some(found) = self.mirror.root() {
+            ROOT_ID.store(found, Ordering::Release);
+            self.note_root_ready();
+         }
          extra_deletes = self.drop_deleted(&deleted);
          self.track_badge_user(&ops, &created);
          for id in &deleted {
@@ -946,6 +1545,100 @@ impl Patches {
             .filter(|id| self.mirror.accessibility_id(*id).is_some())
             .collect::<Vec<_>>();
          named.sort_unstable();
+
+         // Expire timed prop patches before matching.
+         if !self.prop_patches.is_empty() {
+            let now = Instant::now();
+            self.prop_patches
+               .retain(|patch| patch.deadline.is_none_or(|deadline| now <= deadline));
+         }
+         // Apply declarative Rust-side prop patches synchronously.
+         if !self.prop_patches.is_empty() {
+            let mut consumed_once = Vec::new();
+            for id in &named {
+               let Some(aid) = self.mirror.accessibility_id(*id) else {
+                  continue;
+               };
+               for patch in &self.prop_patches {
+                  if !patch.matcher.matches(aid) {
+                     continue;
+                  }
+                  match patch.target {
+                     PatchTarget::Node => {
+                        let entry = patch_ops.entry(*id).or_default();
+                        entry.0.extend(patch.props.iter().cloned());
+                        entry.1.extend(patch.add_on.iter().cloned());
+                        if patch.once {
+                           consumed_once.push(patch.id);
+                        }
+                     },
+                     PatchTarget::Sheet => {
+                        if let Some(sheet) = self.mirror.sheet_of(*id) {
+                           let outer = self
+                              .mirror
+                              .parent(sheet)
+                              .filter(|parent| created.contains_key(parent));
+                           for target_id in std::iter::once(sheet).chain(outer) {
+                              let entry = patch_ops.entry(target_id).or_default();
+                              entry.0.extend(patch.props.iter().cloned());
+                              entry.1.extend(patch.add_on.iter().cloned());
+                           }
+                           if aid == "message.actions.root"
+                              && patch
+                                 .props
+                                 .iter()
+                                 .any(|(k, v)| *k == HIDDEN && *v == Value::Bool(true))
+                           {
+                              skip_action_placement = true;
+                           }
+                           if patch.once {
+                              consumed_once.push(patch.id);
+                           }
+                        }
+                     },
+                     PatchTarget::List => {
+                        if let Some(list_id) = self.mirror.enclosing_list(*id) {
+                           let is_new = self
+                              .patched_lists
+                              .entry(list_id)
+                              .or_default()
+                              .insert(patch.id);
+                           if is_new {
+                              list_updates.insert(list_id);
+                           }
+                           if patch.once {
+                              consumed_once.push(patch.id);
+                           }
+                        }
+                     },
+                  }
+               }
+            }
+            if !consumed_once.is_empty() {
+               self.prop_patches
+                  .retain(|patch| !consumed_once.contains(&patch.id));
+            }
+         }
+         // Notify raw node watchers (`phoenix.ui.onNode`) for matching newly created nodes.
+         if !self.node_watchers.is_empty() {
+            for id in &named {
+               let Some(aid) = self.mirror.accessibility_id(*id) else {
+                  continue;
+               };
+               let watchers = self
+                  .node_watchers
+                  .iter()
+                  .filter(|watcher| watcher.matcher.matches(aid))
+                  .map(|watcher| watcher.id)
+                  .collect::<Vec<_>>();
+               if !watchers.is_empty() {
+                  queue(Job::NodeCreated {
+                     watchers,
+                     info: self.build_node_info(*id),
+                  });
+               }
+            }
+         }
          for id in &named {
             let aid = self
                .mirror
@@ -960,6 +1653,14 @@ impl Patches {
                self.seen.profile_user = profile_user(&ops);
             }
          }
+         if let Some(host) = self
+            .mirror
+            .newest_sheet()
+            .and_then(|sheet| self.mirror.parent(sheet))
+            .and_then(|outer| self.mirror.parent(outer))
+         {
+            self.sheet_host = Some(host);
+         }
          if self.suggestions.scroll.is_some() {
             self.learn_suggestion_row(&created);
          }
@@ -970,6 +1671,9 @@ impl Patches {
                .unwrap_or_default()
                .to_owned();
             for target in Target::ALL {
+               if skip_action_placement && target == Target::Action {
+                  continue;
+               }
                if !target.matches(&aid) {
                   continue;
                }
@@ -1000,14 +1704,21 @@ impl Patches {
          self.suggest(&mut extra);
       }
 
+      let hidden_ops = self.reconcile_hidden();
       let slot_parents = self
          .slots
          .iter()
          .map(|slot| slot.parent)
          .collect::<HashSet<_>>();
       let rewrites_children = ops.iter().any(|op| {
-         matches!(op, Op::Children { id, .. } | Op::ChildEdits { id, .. } if slot_parents.contains(id))
+         matches!(op, Op::Children { id, .. } | Op::ChildEdits { id, .. }
+            if slot_parents.contains(id))
       });
+      let unhides_hidden = !self.hidden_nodes.is_empty()
+         && ops.iter().any(|op| {
+            matches!(op, Op::Update { id, props }
+               if self.hidden_nodes.contains(id) && prop(props, HIDDEN).is_some())
+         });
       let tabbed = ops
          .iter()
          .any(|op| matches!(op, Op::Update { id, .. }
@@ -1016,9 +1727,19 @@ impl Patches {
          && ops.iter().any(|op| {
             matches!(op, Op::Create { id, .. } | Op::Update { id, .. } if self.tint_of(*id).is_some())
          });
+      let updates_list_on = !self.patched_lists.is_empty()
+         && ops.iter().any(|op| {
+            matches!(op, Op::Create { id, props, .. } | Op::Update { id, props }
+               if self.patched_lists.contains_key(id) && prop(props, Prop::ON).is_some())
+         });
       if touched.is_empty()
          && extra_deletes.is_empty()
          && extra.is_empty()
+         && hidden_ops.is_empty()
+         && !unhides_hidden
+         && patch_ops.is_empty()
+         && list_updates.is_empty()
+         && !updates_list_on
          && !rewrites_children
          && !restored
          && !recolors
@@ -1032,6 +1753,28 @@ impl Patches {
       let mut recolor = Vec::new();
       for op in ops {
          match op {
+            Op::Create { id, kind, mut props } if patch_ops.contains_key(&id) => {
+               if let Some((extra_props, add_on)) = patch_ops.get(&id) {
+                  apply_prop_patch(&mut props, extra_props, add_on, None);
+               }
+               out.push(Op::Create { id, kind, props });
+            },
+            Op::Create { id, kind, mut props }
+               if self.patched_lists.contains_key(&id) && prop(&props, Prop::ON).is_some() =>
+            {
+               let (extra_props, add_on) = self.list_patch_for(id);
+               apply_prop_patch(&mut props, &extra_props, &add_on, Some(self.mirror.list_on(id)));
+               list_updates.remove(&id);
+               out.push(Op::Create { id, kind, props });
+            },
+            Op::Update { id, mut props }
+               if self.patched_lists.contains_key(&id) && prop(&props, Prop::ON).is_some() =>
+            {
+               let (extra_props, add_on) = self.list_patch_for(id);
+               apply_prop_patch(&mut props, &extra_props, &add_on, Some(self.mirror.list_on(id)));
+               list_updates.remove(&id);
+               out.push(Op::Update { id, props });
+            },
             Op::Update { id, mut props }
                if self.shown.contains_key(&id) || self.static_tabs.contains(&id) =>
             {
@@ -1055,6 +1798,12 @@ impl Patches {
                   // Rust sized the pager to its own page, under ours.
                   set_prop(&mut props, Prop::HEIGHT, Some(Value::F64(*height)));
                }
+               out.push(Op::Update { id, props });
+            },
+            Op::Update { id, mut props }
+               if self.hidden_nodes.contains(&id) && prop(&props, HIDDEN).is_some() =>
+            {
+               set_prop(&mut props, HIDDEN, Some(Value::Bool(true)));
                out.push(Op::Update { id, props });
             },
             Op::Children { id, .. } | Op::ChildEdits { id, .. } if slot_parents.contains(&id) => {
@@ -1082,6 +1831,11 @@ impl Patches {
             op => out.push(op),
          }
       }
+      for list_id in list_updates {
+         if let Some(op) = self.list_update_op(list_id) {
+            out.push(op);
+         }
+      }
       // Plugin nodes go after the batch that creates the rows they sit in,
       // or the host drops them as orphans.
       out.extend(mine);
@@ -1091,6 +1845,7 @@ impl Patches {
             ids: self.merged(parent),
          });
       }
+      out.extend(hidden_ops);
       out.extend(extra);
       for pager in left {
          out.extend(self.leave_tab(pager, None));
@@ -1128,6 +1883,8 @@ impl Patches {
          self.rust_heights.remove(id);
          self.page_heights.retain(|(pager, _), _| pager != id);
          self.tab_parts.remove(id);
+         self.patched_lists.remove(id);
+         self.hidden_nodes.remove(id);
          if self.suggestions.scroll == Some(*id) {
             orphans.extend(self.drop_suggestions());
          }
@@ -1159,6 +1916,13 @@ impl Patches {
             frames.push(raw);
             continue;
          };
+         if *event == Prop::NAVIGATE.key()
+            && let Some(page) = self.top_page_on(*node)
+         {
+            queue(Job::ClosePage(page));
+            changed = true;
+            continue;
+         }
          if PAGE_EVENTS.contains(event) && self.beyond_rust(*node, payload) {
             // About a plugin page, which Rust does not know.
             changed = true;
@@ -1174,6 +1938,31 @@ impl Patches {
             && let Some(index) = payload.field(Prop::INDEX.key()).and_then(Value::as_i32)
          {
             self.seen.long_pressed = self.row_message(*node, index);
+         }
+         if !self.event_hooks.is_empty()
+            && self.event_hooks.iter().any(|hook| hook.event == *event)
+         {
+            let intercept = self
+               .event_hooks
+               .iter()
+               .any(|hook| hook.event == *event && hook.intercept);
+            let message_id = payload
+               .field(Prop::INDEX.key())
+               .and_then(Value::as_i32)
+               .and_then(|index| self.row_message(*node, index));
+            let aid = self.mirror.accessibility_id(*node).map(str::to_owned);
+            queue(Job::ViewEvent {
+               node: *node,
+               event: *event,
+               payload: payload.clone(),
+               aid,
+               message_id,
+               frame: intercept.then(|| raw.clone()),
+            });
+            if intercept {
+               changed = true;
+               continue;
+            }
          }
          if *event == Prop::CHANGE_TEXT.key() && self.mirror.is_composer(*node) {
             let text = payload
@@ -1288,6 +2077,10 @@ impl Patches {
          },
          Handler::Choice { menu, index } => queue(Job::CloseMenu { menu, index }),
          Handler::Detail { badge } => queue(Job::Detail { badge }),
+         Handler::PageBack(page) => queue(Job::ClosePage(page)),
+         Handler::PageButton { page, index } => queue(Job::PagePress { page, index }),
+         Handler::BannerPress(id) => queue(Job::BannerPressed(id)),
+         Handler::BannerDismiss(id) => queue(Job::DismissBanner(id)),
          Handler::Input { .. } | Handler::Page { .. } | Handler::Hold { .. } => {},
          Handler::Pick(name) => {
             if let Some((input, _)) = self.mirror.composer() {
@@ -1364,7 +2157,13 @@ impl Patches {
    }
 
    /// Shows a menu sheet over the top sheet, like the message long-press one.
-   fn open_menu(&mut self, title: Option<&str>, items: Vec<MenuItem>, answer: Sender<i32>) -> Vec<Op> {
+   fn open_menu(
+      &mut self,
+      title: Option<&str>,
+      body: Option<&SheetBody>,
+      items: Vec<MenuItem>,
+      answer: Sender<i32>,
+   ) -> Vec<Op> {
       static NEXT: AtomicU64 = AtomicU64::new(1);
       #[expect(clippy::cast_possible_truncation, reason = "menus are few")]
       let menu = NEXT.fetch_add(1, Ordering::Relaxed) as u32;
@@ -1372,7 +2171,8 @@ impl Patches {
          .mirror
          .newest_sheet()
          .and_then(|sheet| self.mirror.parent(sheet))
-         .and_then(|outer| self.mirror.parent(outer));
+         .and_then(|outer| self.mirror.parent(outer))
+         .or_else(|| self.sheet_host.filter(|host| self.mirror.has_kids(*host)));
       let rows = items
          .into_iter()
          .enumerate()
@@ -1389,7 +2189,7 @@ impl Patches {
             }
          })
          .collect();
-      let draft = self.templates.menu(title, rows, Handler::Choice { menu, index: -1 });
+      let draft = self.templates.menu(title, body, rows, Handler::Choice { menu, index: -1 });
       let (Some(host), Some(draft)) = (host, draft) else {
          let _ = answer.send(-2);
          return Vec::new();
@@ -1432,6 +2232,585 @@ impl Patches {
       }
       out.push(Op::Delete { ids: slot.all });
       out
+   }
+
+   /// The topmost plugin page pushed onto `navigator`, if any.
+   fn top_page_on(&self, navigator: i32) -> Option<u32> {
+      self.slots.iter().rev().find_map(|slot| match slot.kind {
+         SlotKind::Page(id) if slot.parent == navigator => Some(id),
+         _ => None,
+      })
+   }
+
+   /// Pushes a full-screen native Phoenix page onto the active `Navigator`.
+   fn open_page(&mut self, id: u32, title: &str, sections: Vec<PageSection>) -> Vec<Op> {
+      const PAGE_HEADER_SPACER: u32 = 0x4E1;
+      const PAGE_CONTENT: u32 = 0x4E4;
+      const PAGE_HEADER: u32 = 0x562;
+      const PAGE_BACK: u32 = 0x565;
+      const PAGE_TITLE: u32 = 0x56A;
+      const RADII: [Prop; 5] = [
+         Prop::RADIUS,
+         Prop::RADIUS_TOP_LEFT,
+         Prop::RADIUS_TOP_RIGHT,
+         Prop::RADIUS_BOTTOM_LEFT,
+         Prop::RADIUS_BOTTOM_RIGHT,
+      ];
+
+      let Some(navigator) = self.mirror.active_navigator() else {
+         log::warn!("open_page: no active navigator");
+         return Vec::new();
+      };
+      log::info!("open_page: pushing page {id} onto navigator {navigator}");
+      let layouts = phoenix_ui::templates();
+      let mut page = Draft::from_node(&layouts.page);
+      page.set(Prop::PANE_TITLE, Some(Value::Str(title.to_owned())));
+      if let Some(title_node) = page.find(PAGE_TITLE) {
+         title_node.set(Prop::TEXT, Some(Value::Str(title.to_owned())));
+      }
+      let (header_padding, header_height) = self
+         .mirror
+         .stack_header()
+         .map_or_else(
+            || (Value::Rect([6.0, 44.0, 6.0, 0.0]), Value::F64(100.0)),
+            |header| {
+               let padding = prop(header, Prop::PADDING)
+                  .cloned()
+                  .unwrap_or_else(|| Value::Rect([6.0, 44.0, 6.0, 0.0]));
+               let height = prop(header, Prop::HEIGHT)
+                  .cloned()
+                  .unwrap_or(Value::F64(100.0));
+               (padding, height)
+            },
+         );
+      if let Some(node) = page.find(PAGE_HEADER) {
+         node.set(Prop::PADDING, Some(header_padding));
+         node.set(Prop::HEIGHT, Some(header_height.clone()));
+      }
+      if let Some(node) = page.find(PAGE_HEADER_SPACER) {
+         node.set(Prop::HEIGHT, Some(header_height));
+      }
+      if let Some(back) = page.find(PAGE_BACK) {
+         back.set(Prop::ACCESSIBILITY_LABEL, Some(Value::Str("Back".to_owned())));
+         back.press = Some(Handler::PageBack(id));
+      }
+
+      let built_sections = sections
+         .into_iter()
+         .map(|section| {
+            let mut root = Draft::from_node(&layouts.section);
+            let mut group = Draft::from_node(&layouts.group);
+            let (heading, rows) = match section {
+               PageSection::Buttons { title, buttons } => {
+                  let rows = buttons
+                     .into_iter()
+                     .map(|btn| {
+                        let mut row_root = Draft::from_node(&layouts.button_row);
+                        for radius in RADII {
+                           row_root.set(radius, None);
+                        }
+                        row_root.set(
+                           Prop::ACCESSIBILITY_LABEL,
+                           Some(Value::Str(btn.label.clone())),
+                        );
+                        row_root.set(
+                           Prop::ACCESSIBILITY_ID,
+                           Some(Value::Str(format!("phoenix-page-{}", btn.label))),
+                        );
+                        row_root.press = Some(Handler::PageButton {
+                           page:  id,
+                           index: btn.index,
+                        });
+                        if let Some(row) = row_root.kids.first_mut() {
+                           let icon = self.templates.resolve_icon(btn.icon.as_deref()).to_owned();
+                           if let Some(img) = row.kids.first_mut() {
+                              img.set(Prop::URI, Some(Value::Str(icon)));
+                              if btn.danger {
+                                 img.set(Prop::TINT, Some(Value::I64(0xFFF2_3F42)));
+                              }
+                           }
+                           if let Some(label) = row.kids.get_mut(1) {
+                              label.set(Prop::TEXT, Some(Value::Str(btn.label)));
+                              if btn.danger {
+                                 label.set(Prop::COLOR, Some(Value::I64(0xFFF2_3F42)));
+                              }
+                           }
+                           row.kids.truncate(2);
+                        }
+                        row_root
+                     })
+                     .collect::<Vec<_>>();
+                  (title, rows)
+               },
+               PageSection::Code {
+                  title,
+                  text,
+                  monospace,
+                  highlight,
+               } => {
+                  let mut content = Draft {
+                     kind:  ViewKind::Text,
+                     props: vec![
+                        (Prop::TEXT, Value::Str(text.clone())),
+                        (Prop::COLOR, Value::I64(0xFFF6_F6F7)),
+                        (Prop::FONT_SIZE, Value::F64(12.0)),
+                        (Prop::LINE_HEIGHT, Value::F64(17.0)),
+                        (Prop::named("fontWeight"), Value::I32(400)),
+                        (Prop::SELECTABLE, Value::Bool(true)),
+                     ],
+                     kids:  Vec::new(),
+                     press: None,
+                     src:   None,
+                  };
+                  if monospace {
+                     content.set(Prop::FONT_FAMILY, Some(Value::Str("monospace".to_owned())));
+                  }
+                  if highlight && text.len() <= 48 * 1024 {
+                     let spans = crate::highlight::js(&text)
+                        .into_iter()
+                        .map(|(kind, run)| {
+                           let color = match kind {
+                              crate::highlight::Kind::Plain => 0xFFF6_F6F7,
+                              crate::highlight::Kind::Comment => 0xFF8B_949E,
+                              crate::highlight::Kind::String => 0xFF7E_E787,
+                              crate::highlight::Kind::Keyword => 0xFFFF_7B72,
+                              crate::highlight::Kind::Number => 0xFF79_C0FF,
+                           };
+                           Value::Obj(vec![
+                              (Prop::TEXT.key(), Value::Str(run.to_owned())),
+                              (Prop::COLOR.key(), Value::I64(color)),
+                           ])
+                        })
+                        .collect();
+                     content.set(Prop::named("spans"), Some(Value::Arr(spans)));
+                  }
+                  let box_view = Draft {
+                     kind:  ViewKind::View,
+                     props: vec![
+                        (Prop::named("width"), Value::Str("fill".to_owned())),
+                        (Prop::named("background"), Value::I64(0xFF14_1518)),
+                        (Prop::PADDING, Value::Rect([14.0, 12.0, 14.0, 12.0])),
+                     ],
+                     kids:  vec![content],
+                     press: None,
+                     src:   None,
+                  };
+                  (title, vec![box_view])
+               },
+               PageSection::Text { title, text } => {
+                  let content = Draft {
+                     kind:  ViewKind::Text,
+                     props: vec![
+                        (Prop::TEXT, Value::Str(text)),
+                        (Prop::COLOR, Value::I64(0xFFF6_F6F7)),
+                        (Prop::FONT_SIZE, Value::F64(14.0)),
+                        (Prop::LINE_HEIGHT, Value::F64(20.0)),
+                        (Prop::SELECTABLE, Value::Bool(true)),
+                     ],
+                     kids:  Vec::new(),
+                     press: None,
+                     src:   None,
+                  };
+                  let box_view = Draft {
+                     kind:  ViewKind::View,
+                     props: vec![
+                        (Prop::named("width"), Value::Str("fill".to_owned())),
+                        (Prop::named("background"), Value::I64(0xFF14_1518)),
+                        (Prop::PADDING, Value::Rect([14.0, 12.0, 14.0, 12.0])),
+                     ],
+                     kids:  vec![content],
+                     press: None,
+                     src:   None,
+                  };
+                  (title, vec![box_view])
+               },
+            };
+            group.kids = rows
+               .into_iter()
+               .enumerate()
+               .flat_map(|(index, row)| {
+                  let divider = (index > 0).then(|| Draft::from_node(&layouts.divider));
+                  divider.into_iter().chain([row])
+               })
+               .collect();
+            if let Some(heading) = heading.filter(|h| !h.is_empty()) {
+               let mut header = Draft::from_node(&layouts.header);
+               header.set(Prop::TEXT, Some(Value::Str(heading)));
+               root.kids.push(header);
+            }
+            root.kids.push(group);
+            root
+         })
+         .collect::<Vec<_>>();
+
+      if let Some(content) = page.find(PAGE_CONTENT) {
+         content.kids = built_sections;
+      }
+
+      let mut out = Vec::new();
+      let mut all = Vec::new();
+      let root = self.emit(page, None, &mut out, &mut all);
+      self.slots.push(Slot {
+         kind: SlotKind::Page(id),
+         anchor: navigator,
+         parent: navigator,
+         before: Before::End,
+         place: Place::Screen,
+         roots: vec![root],
+         all,
+      });
+      let ids = self.merged(navigator);
+      let index = i32::try_from(ids.len().saturating_sub(1)).unwrap_or(i32::MAX);
+      out.push(Op::Children { id: navigator, ids });
+      out.push(Op::Update {
+         id:    navigator,
+         props: vec![(Prop::INDEX, Value::I32(index))],
+      });
+      out
+   }
+
+   fn close_page(&mut self, id: u32) -> Vec<Op> {
+      let Some(at) = self
+         .slots
+         .iter()
+         .position(|slot| slot.kind == SlotKind::Page(id))
+      else {
+         return Vec::new();
+      };
+      let slot = self.slots.remove(at);
+      self.forget_ids(&slot.all);
+      let mut out = Vec::new();
+      if self.mirror.has_kids(slot.parent) {
+         let ids = self.merged(slot.parent);
+         let index = i32::try_from(ids.len().saturating_sub(1)).unwrap_or(i32::MAX);
+         out.push(Op::Children {
+            id:  slot.parent,
+            ids,
+         });
+         out.push(Op::Update {
+            id:    slot.parent,
+            props: vec![(Prop::INDEX, Value::I32(index))],
+         });
+      }
+      out.push(Op::Delete { ids: slot.all });
+      out
+   }
+
+   fn note_root_ready(&mut self) {
+      if self.root_ready_at.is_none() {
+         self.root_ready_at = Some(Instant::now());
+      }
+      if !self.pending_banners.is_empty() && !self.banner_flush_scheduled {
+         self.banner_flush_scheduled = true;
+         let delay = self
+            .root_ready_at
+            .map_or(Duration::ZERO, |at| BANNER_STARTUP_DELAY.saturating_sub(at.elapsed()));
+         thread::spawn(move || {
+            if !delay.is_zero() {
+               thread::sleep(delay);
+            }
+            queue(Job::FlushBanners);
+         });
+      }
+   }
+
+   fn show_banner(&mut self, spec: BannerSpec) -> Vec<Op> {
+      let ready = self.mirror.root().is_some()
+         && !bridge::guest_host().is_null()
+         && self
+            .root_ready_at
+            .is_some_and(|at| at.elapsed() >= BANNER_STARTUP_DELAY);
+      if !ready {
+         self.pending_banners.push(spec);
+         if self.mirror.root().is_some() {
+            self.note_root_ready();
+         }
+         return Vec::new();
+      }
+      self.open_banner(spec)
+   }
+
+   fn flush_banners(&mut self) -> Vec<Op> {
+      self.banner_flush_scheduled = false;
+      if self.mirror.root().is_none() || bridge::guest_host().is_null() {
+         return Vec::new();
+      }
+      if self
+         .root_ready_at
+         .is_some_and(|at| at.elapsed() < BANNER_STARTUP_DELAY)
+      {
+         self.note_root_ready();
+         return Vec::new();
+      }
+      let queued = std::mem::take(&mut self.pending_banners);
+      let mut out = Vec::new();
+      for spec in queued {
+         out.extend(self.open_banner(spec));
+      }
+      out
+   }
+
+   /// Attaches a native Phoenix `banner` overlay to the root view.
+   fn open_banner(&mut self, spec: BannerSpec) -> Vec<Op> {
+      let Some(root) = self.mirror.root() else {
+         self.pending_banners.push(spec);
+         return Vec::new();
+      };
+      // Replace any currently visible banner so notifications don't pile up.
+      let mut out = Vec::new();
+      let existing = self
+         .slots
+         .iter()
+         .filter_map(|slot| match slot.kind {
+            SlotKind::Banner(id) => Some(id),
+            _ => None,
+         })
+         .collect::<Vec<_>>();
+      for old_id in existing {
+         let (close_ops, _) = self.close_banner(old_id);
+         out.extend(close_ops);
+      }
+
+      let id = spec.id;
+      let announce = match spec.body.as_deref().filter(|text| !text.is_empty()) {
+         Some(body) => format!("{}. {body}", spec.title),
+         None => spec.title.clone(),
+      };
+      let icon_uri = spec
+         .icon
+         .unwrap_or_else(|| "res://ic_mana_puzzle_piece_plus".to_owned());
+      let accent = spec.accent.unwrap_or(0xFF58_65F2);
+
+      let icon = Draft {
+         kind:  ViewKind::Image,
+         props: vec![
+            (Prop::URI, Value::Str(icon_uri)),
+            (Prop::named("width"), Value::F64(22.0)),
+            (Prop::HEIGHT, Value::F64(22.0)),
+            (Prop::TINT, Value::I64(0xFFFF_FFFF)),
+            (Prop::named("scale"), Value::Str("fit".to_owned())),
+         ],
+         kids:  Vec::new(),
+         press: None,
+         src:   None,
+      };
+      let badge = Draft {
+         kind:  ViewKind::View,
+         props: vec![
+            (Prop::named("width"), Value::F64(40.0)),
+            (Prop::HEIGHT, Value::F64(40.0)),
+            (Prop::RADIUS, Value::F64(20.0)),
+            (BACKGROUND, Value::I64(accent)),
+            (Prop::named("align"), Value::Str("center".to_owned())),
+            (Prop::named("justify"), Value::Str("center".to_owned())),
+         ],
+         kids:  vec![icon],
+         press: None,
+         src:   None,
+      };
+
+      let mut text_kids = vec![Draft {
+         kind:  ViewKind::Text,
+         props: vec![
+            (Prop::TEXT, Value::Str(spec.title)),
+            (Prop::COLOR, Value::I64(0xFFF2_F3F5)),
+            (Prop::FONT_SIZE, Value::F64(15.0)),
+            (Prop::named("fontWeight"), Value::I32(700)),
+            (Prop::LINE_HEIGHT, Value::F64(19.0)),
+            (Prop::named("maxLines"), Value::I32(1)),
+            (Prop::named("ellipsize"), Value::Str("end".to_owned())),
+         ],
+         kids:  Vec::new(),
+         press: None,
+         src:   None,
+      }];
+      if let Some(body) = spec.body.filter(|text| !text.is_empty()) {
+         text_kids.push(Draft {
+            kind:  ViewKind::Text,
+            props: vec![
+               (Prop::TEXT, Value::Str(body)),
+               (Prop::COLOR, Value::I64(0xFFB5_BAC1)),
+               (Prop::FONT_SIZE, Value::F64(13.0)),
+               (Prop::named("fontWeight"), Value::I32(400)),
+               (Prop::LINE_HEIGHT, Value::F64(17.0)),
+               (Prop::named("maxLines"), Value::I32(2)),
+               (Prop::named("ellipsize"), Value::Str("end".to_owned())),
+            ],
+            kids:  Vec::new(),
+            press: None,
+            src:   None,
+         });
+      }
+      let text_col = Draft {
+         kind:  ViewKind::View,
+         props: vec![
+            (Prop::named("direction"), Value::Str("column".to_owned())),
+            (Prop::named("flex"), Value::F64(1.0)),
+            (Prop::GAP, Value::F64(2.0)),
+         ],
+         kids:  text_kids,
+         press: None,
+         src:   None,
+      };
+
+      let dismiss_icon = Draft {
+         kind:  ViewKind::Image,
+         props: vec![
+            (Prop::URI, Value::Str("res://ic_mana_x_small".to_owned())),
+            (Prop::named("width"), Value::F64(16.0)),
+            (Prop::HEIGHT, Value::F64(16.0)),
+            (Prop::TINT, Value::I64(0xFF94_9BA4)),
+            (Prop::named("scale"), Value::Str("fit".to_owned())),
+         ],
+         kids:  Vec::new(),
+         press: None,
+         src:   None,
+      };
+      let dismiss_btn = Draft {
+         kind:  ViewKind::View,
+         props: vec![
+            (Prop::named("width"), Value::F64(36.0)),
+            (Prop::HEIGHT, Value::F64(36.0)),
+            (Prop::MARGIN, Value::Rect([0.0, 0.0, 8.0, 0.0])),
+            (Prop::RADIUS, Value::F64(18.0)),
+            (Prop::named("align"), Value::Str("center".to_owned())),
+            (Prop::named("justify"), Value::Str("center".to_owned())),
+            (Prop::named("activeBackground"), Value::I64(0x1AFF_FFFF)),
+            (Prop::ROLE, Value::Str("button".to_owned())),
+            (Prop::ACCESSIBILITY_LABEL, Value::Str("Dismiss".to_owned())),
+            (
+               Prop::ACCESSIBILITY_ID,
+               Value::Str("phoenix.in-app-notification.dismiss".to_owned()),
+            ),
+            (Prop::ON, Value::Arr(vec![Value::Str("press".to_owned())])),
+         ],
+         kids:  vec![dismiss_icon],
+         press: Some(Handler::BannerDismiss(id)),
+         src:   None,
+      };
+
+      let body_hit = Draft {
+         kind:  ViewKind::View,
+         props: vec![
+            (Prop::named("direction"), Value::Str("row".to_owned())),
+            (Prop::named("flex"), Value::F64(1.0)),
+            (Prop::named("align"), Value::Str("center".to_owned())),
+            (Prop::GAP, Value::F64(12.0)),
+            (Prop::PADDING, Value::Rect([12.0, 12.0, 6.0, 12.0])),
+            (Prop::named("activeBackground"), Value::I64(0xFF2B_2D31)),
+            (Prop::ROLE, Value::Str("button".to_owned())),
+            (Prop::ACCESSIBILITY_LABEL, Value::Str(announce.clone())),
+            (
+               Prop::ACCESSIBILITY_ID,
+               Value::Str("phoenix.in-app-notification.body".to_owned()),
+            ),
+            (Prop::ON, Value::Arr(vec![Value::Str("press".to_owned())])),
+         ],
+         kids:  vec![badge, text_col],
+         press: Some(Handler::BannerPress(id)),
+         src:   None,
+      };
+
+      let card = Draft {
+         kind:  ViewKind::View,
+         props: vec![
+            (Prop::named("direction"), Value::Str("row".to_owned())),
+            (Prop::named("width"), Value::Str("fill".to_owned())),
+            (Prop::named("align"), Value::Str("center".to_owned())),
+            (Prop::MARGIN, Value::Rect([12.0, 8.0, 12.0, 0.0])),
+            (BACKGROUND, Value::I64(0xFF23_2428)),
+            (Prop::RADIUS, Value::F64(16.0)),
+            (Prop::named("clip"), Value::Bool(true)),
+            (Prop::named("borderWidth"), Value::F64(1.0)),
+            (Prop::named("borderColor"), Value::I64(0x26FF_FFFF)),
+            (
+               Prop::ACCESSIBILITY_ID,
+               Value::Str("phoenix.in-app-notification".to_owned()),
+            ),
+         ],
+         kids:  vec![body_hit, dismiss_btn],
+         press: None,
+         src:   None,
+      };
+
+      let banner = Draft {
+         kind:  ViewKind::Other("banner".to_owned()),
+         props: vec![
+            (Prop::named("edge"), Value::Str("top".to_owned())),
+            (Prop::named("passthrough"), Value::Bool(false)),
+            (Prop::named("announce"), Value::Str(announce)),
+            (Prop::named("announcePolite"), Value::Bool(true)),
+         ],
+         kids:  vec![card],
+         press: None,
+         src:   None,
+      };
+
+      let mut all = Vec::new();
+      let banner_root = self.emit(banner, None, &mut out, &mut all);
+      self.slots.push(Slot {
+         kind: SlotKind::Banner(id),
+         anchor: root,
+         parent: root,
+         before: Before::End,
+         place: Place::Screen,
+         roots: vec![banner_root],
+         all,
+      });
+      self.banner_actions.insert(id, spec.action);
+      out.push(Op::Children {
+         id:  root,
+         ids: self.merged(root),
+      });
+      if spec.duration_ms > 0 {
+         let dur = Duration::from_millis(spec.duration_ms);
+         thread::spawn(move || {
+            thread::sleep(dur);
+            queue(Job::DismissBanner(id));
+         });
+      }
+      out
+   }
+
+   fn close_banner(&mut self, id: u32) -> (Vec<Op>, bool) {
+      let mut had_js = false;
+      self.pending_banners.retain(|spec| {
+         if spec.id == id {
+            if matches!(spec.action, BannerAction::JsCallback) {
+               had_js = true;
+            }
+            false
+         } else {
+            true
+         }
+      });
+      if let Some(BannerAction::JsCallback) = self.banner_actions.remove(&id) {
+         had_js = true;
+      }
+      let Some(at) = self
+         .slots
+         .iter()
+         .position(|slot| slot.kind == SlotKind::Banner(id))
+      else {
+         return (Vec::new(), had_js);
+      };
+      let slot = self.slots.remove(at);
+      self.forget_ids(&slot.all);
+      let mut out = Vec::new();
+      if self.mirror.has_kids(slot.parent) {
+         out.push(Op::Children {
+            id:  slot.parent,
+            ids: self.merged(slot.parent),
+         });
+      }
+      out.push(Op::Delete { ids: slot.all });
+      (out, had_js)
+   }
+
+   fn press_banner(&mut self, id: u32) -> (Vec<Op>, BannerAction) {
+      let action = self.banner_actions.remove(&id).unwrap_or(BannerAction::None);
+      let (ops, _) = self.close_banner(id);
+      (ops, action)
    }
 
    /// The node of text box `index` on `contribution`'s page at `place`.
@@ -1657,6 +3036,98 @@ impl Patches {
       message_id(self.mirror.accessibility_id(hit)?).map(str::to_owned)
    }
 
+   fn build_node_info(&self, id: i32) -> NodeInfo {
+      let on = self
+         .mirror
+         .list_on(id)
+         .iter()
+         .filter_map(|v| v.as_str().map(str::to_owned))
+         .collect();
+      NodeInfo {
+         id,
+         accessibility_id: self.mirror.accessibility_id(id).map(str::to_owned),
+         parent: self.mirror.parent(id),
+         children: self.mirror.kids(id).to_vec(),
+         sheet: self.mirror.sheet_of(id),
+         list: self.mirror.enclosing_list(id),
+         on,
+      }
+   }
+
+   fn list_patch_for(&self, list_id: i32) -> (Props, Vec<String>) {
+      let Some(patch_ids) = self.patched_lists.get(&list_id) else {
+         return (Vec::new(), Vec::new());
+      };
+      let mut props = Vec::new();
+      let mut add_on = Vec::new();
+      for patch in &self.prop_patches {
+         if patch.target == PatchTarget::List && patch_ids.contains(&patch.id) {
+            props.extend(patch.props.iter().cloned());
+            add_on.extend(patch.add_on.iter().cloned());
+         }
+      }
+      (props, add_on)
+   }
+
+   fn list_update_op(&self, list_id: i32) -> Option<Op> {
+      if !self.mirror.is_row_list(list_id) {
+         return None;
+      }
+      let (extra_props, add_on) = self.list_patch_for(list_id);
+      let mut props = Vec::new();
+      apply_prop_patch(&mut props, &extra_props, &add_on, Some(self.mirror.list_on(list_id)));
+      if props.is_empty() {
+         return None;
+      }
+      Some(Op::Update { id: list_id, props })
+   }
+
+   /// Recomputes `PatchTarget::List` patches across live lists (discovering
+   /// already-mounted lists and restoring original `on` arrays when removed).
+   fn refresh_list_patches(&mut self) -> Vec<Op> {
+      let mut affected: HashSet<i32> = self.patched_lists.keys().copied().collect();
+      let list_patches = self
+         .prop_patches
+         .iter()
+         .filter(|patch| patch.target == PatchTarget::List)
+         .map(|patch| (patch.id, patch.matcher.clone()))
+         .collect::<Vec<_>>();
+      for (patch_id, matcher) in &list_patches {
+         for node in self.mirror.nodes_where(&|aid| matcher.matches(aid)) {
+            if let Some(list_id) = self.mirror.enclosing_list(node) {
+               self.patched_lists.entry(list_id).or_default().insert(*patch_id);
+               affected.insert(list_id);
+            }
+         }
+      }
+      let active_ids: HashSet<u64> = list_patches.iter().map(|(id, _)| *id).collect();
+      for ids in self.patched_lists.values_mut() {
+         ids.retain(|id| active_ids.contains(id));
+      }
+      let mut out = Vec::new();
+      for list_id in affected {
+         if !self.mirror.is_row_list(list_id) {
+            continue;
+         }
+         let (extra_props, add_on) = self.list_patch_for(list_id);
+         let mut props = Vec::new();
+         // Always emit Prop::ON so removed `addOn` entries restore Rust's original list.
+         let mut on = self.mirror.list_on(list_id).to_vec();
+         for event in &add_on {
+            if !on.iter().any(|v| matches!(v, Value::Str(s) if s == event)) {
+               on.push(Value::Str(event.clone()));
+            }
+         }
+         props.push((Prop::ON, Value::Arr(on)));
+         for (key, value) in extra_props {
+            set_prop(&mut props, key, Some(value));
+         }
+         out.push(Op::Update { id: list_id, props });
+      }
+      self.patched_lists.retain(|_, ids| !ids.is_empty());
+      out
+   }
+
    /// Opens `target`'s slot for the anchor `id` and draws into it. Returns
    /// the parent when it opened a new slot.
    fn place(&mut self, target: Target, id: i32, out: &mut Vec<Op>) -> Option<i32> {
@@ -1832,6 +3303,57 @@ impl Patches {
       id
    }
 
+   /// Walks up through unnamed single-child wrapper views so hiding a button
+   /// collapses its fixed-size slot wrapper too (no empty gap).
+   fn hide_root(&self, mut id: i32) -> i32 {
+      for _ in 0..4 {
+         let Some(parent) = self.mirror.parent(id) else {
+            break;
+         };
+         if self.mirror.accessibility_id(parent).is_some()
+            || self.mirror.kids(parent).len() != 1
+         {
+            break;
+         }
+         id = parent;
+      }
+      id
+   }
+
+   /// Reconciles `hidden: true` (`View.GONE`) across all live wrappers matching
+   /// `self.hidden`, restoring `hidden: false` whenever a node stops matching
+   /// (e.g. `"Record Voice Message"` swapping to `"send"` inside the same slot).
+   fn reconcile_hidden(&mut self) -> Vec<Op> {
+      if self.hidden.is_empty() && self.hidden_nodes.is_empty() {
+         return Vec::new();
+      }
+      let mut desired = HashSet::new();
+      for aid in self.hidden.keys() {
+         for id in self.mirror.nodes_with_id(aid) {
+            desired.insert(self.hide_root(id));
+         }
+      }
+      let mut ops = Vec::new();
+      for &id in &desired {
+         if !self.hidden_nodes.contains(&id) {
+            ops.push(Op::Update {
+               id,
+               props: vec![(HIDDEN, Value::Bool(true))],
+            });
+         }
+      }
+      for &id in &self.hidden_nodes {
+         if !desired.contains(&id) && self.mirror.exists(id) {
+            ops.push(Op::Update {
+               id,
+               props: vec![(HIDDEN, Value::Bool(false))],
+            });
+         }
+      }
+      self.hidden_nodes = desired;
+      ops
+   }
+
    /// `parent`'s children as Rust has them, with the slots spliced in.
    fn merged(&self, parent: i32) -> Vec<i32> {
       let mut list = self.mirror.kids(parent).to_vec();
@@ -1983,6 +3505,31 @@ fn recolored(props: &Props, color: i64, all: bool) -> Props {
 }
 
 const HIDDEN: Prop = Prop::named("hidden");
+
+fn apply_prop_patch(
+   props: &mut Props,
+   extra: &Props,
+   add_on: &[String],
+   base_on: Option<&[Value]>,
+) {
+   for (key, value) in extra {
+      set_prop(props, *key, Some(value.clone()));
+   }
+   if !add_on.is_empty() {
+      let mut on = base_on.map(ToOwned::to_owned).unwrap_or_else(|| {
+         match prop(props, Prop::ON) {
+            Some(Value::Arr(existing)) => existing.clone(),
+            _ => Vec::new(),
+         }
+      });
+      for event in add_on {
+         if !on.iter().any(|v| matches!(v, Value::Str(s) if s == event)) {
+            on.push(Value::Str(event.clone()));
+         }
+      }
+      set_prop(props, Prop::ON, Some(Value::Arr(on)));
+   }
+}
 
 fn number(value: &Value) -> Option<f64> {
    match value {

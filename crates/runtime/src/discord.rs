@@ -139,6 +139,83 @@ struct Reply {
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static PENDING: LazyLock<Mutex<HashMap<i32, Sender<Reply>>>> = LazyLock::new(Mutex::default);
 static NEXT_ID: AtomicI32 = AtomicI32::new(FIRST_ID);
+static REQUEST_HOOKS: LazyLock<Mutex<Vec<RequestHook>>> = LazyLock::new(Mutex::default);
+static REQUEST_HOOK_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Rust-side filter for `phoenix.discord.onRequest` so non-matching API calls
+/// never enter QuickJS.
+#[derive(Clone, Default)]
+pub struct RequestFilter {
+   pub method:        Option<String>,
+   pub path_prefix:   Option<String>,
+   pub path_suffix:   Option<String>,
+   pub path_includes: Option<String>,
+}
+
+impl RequestFilter {
+   fn matches(&self, method: &str, path: &str) -> bool {
+      if let Some(expected) = &self.method
+         && !method.eq_ignore_ascii_case(expected)
+      {
+         return false;
+      }
+      let clean = path.split(['?', '#']).next().unwrap_or(path);
+      if let Some(prefix) = &self.path_prefix
+         && !clean.starts_with(prefix.as_str())
+      {
+         return false;
+      }
+      if let Some(suffix) = &self.path_suffix
+         && !clean.ends_with(suffix.as_str())
+      {
+         return false;
+      }
+      if let Some(needle) = &self.path_includes
+         && !path.contains(needle.as_str())
+      {
+         return false;
+      }
+      true
+   }
+}
+
+struct RequestHook {
+   id:     u64,
+   plugin: String,
+   filter: RequestFilter,
+}
+
+/// Outcome of running matching `phoenix.discord.onRequest` hooks.
+pub enum RequestAction {
+   Pass,
+   Drop,
+   Replace(Vec<u8>),
+}
+
+pub fn add_request_hook(id: u64, plugin: String, filter: RequestFilter) {
+   let mut hooks = REQUEST_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+   hooks.push(RequestHook { id, plugin, filter });
+   REQUEST_HOOK_COUNT.store(hooks.len(), Ordering::Relaxed);
+}
+
+pub fn remove_request_hook(id: u64) {
+   let mut hooks = REQUEST_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+   hooks.retain(|hook| hook.id != id);
+   REQUEST_HOOK_COUNT.store(hooks.len(), Ordering::Relaxed);
+}
+
+pub fn forget_request_hooks(plugin: &str) {
+   let mut hooks = REQUEST_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+   hooks.retain(|hook| hook.plugin != plugin);
+   REQUEST_HOOK_COUNT.store(hooks.len(), Ordering::Relaxed);
+}
+
+/// Relative path under the API base (e.g. `https://discord.com/api/v9/foo` -> `/foo`).
+fn api_path(url: &str) -> Option<&str> {
+   let base = api_base(url)?;
+   let rest = &url[base.len()..];
+   rest.starts_with('/').then_some(rest)
+}
 
 /// `Networking.request`'s `headers`, an array of `[name, value]` pairs.
 fn headers(args: &Value) -> Vec<(String, String)> {
@@ -174,11 +251,64 @@ pub fn wants(head: &[u8]) -> bool {
    HostCall::target(head) == Some((NETWORKING, REQUEST))
 }
 
-/// Keeps the session of one of Phoenix's own API requests.
-pub fn observe_call(frame: &[u8]) {
-   let Ok(call) = HostCall::decode(frame) else {
-      return;
+/// Observes one of Phoenix's own API requests and runs any matching
+/// `phoenix.discord.onRequest` hooks (filtered in Rust first so non-matching
+/// calls never enter QuickJS). Never exposes session headers to JS.
+pub fn intercept_call(frame: &[u8]) -> Action {
+   let Ok(mut call) = HostCall::decode(frame) else {
+      return Action::Pass;
    };
+   observe_decoded(&call);
+   if REQUEST_HOOK_COUNT.load(Ordering::Relaxed) == 0 {
+      return Action::Pass;
+   }
+   let Some(method) = call.args.field(METHOD).and_then(Value::as_str).map(str::to_owned) else {
+      return Action::Pass;
+   };
+   let Some(path) = call
+      .args
+      .field(URL)
+      .and_then(Value::as_str)
+      .and_then(api_path)
+      .map(str::to_owned)
+   else {
+      return Action::Pass;
+   };
+   let matched = {
+      let hooks = REQUEST_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+      hooks
+         .iter()
+         .filter(|hook| hook.filter.matches(&method, &path))
+         .map(|hook| hook.id)
+         .collect::<Vec<_>>()
+   };
+   if matched.is_empty() {
+      return Action::Pass;
+   }
+   match crate::intercept_request(&matched, &method, &path, &call.body) {
+      RequestAction::Pass => Action::Pass,
+      RequestAction::Drop => Action::Drop,
+      RequestAction::Replace(body) => {
+         call.body = body;
+         // Drop any stale content-length header so OkHttp uses the new body length.
+         if let Value::Obj(ref mut fields) = call.args {
+            for (key, value) in fields.iter_mut() {
+               if *key == HEADERS
+                  && let Value::Arr(pairs) = value
+               {
+                  pairs.retain(|pair| {
+                     !matches!(pair, Value::Arr(parts) if matches!(parts.first(), Some(Value::Str(name)) if name.eq_ignore_ascii_case("content-length")))
+                  });
+               }
+            }
+         }
+         Action::Replace(call.encode())
+      },
+   }
+}
+
+/// Keeps the session of one of Phoenix's own API requests.
+fn observe_decoded(call: &HostCall) {
    if let Some(id) = call.args.field(URL).and_then(Value::as_str).and_then(profile_of) {
       *LAST_PROFILE.lock().unwrap_or_else(PoisonError::into_inner) = Some((id, Instant::now()));
    }

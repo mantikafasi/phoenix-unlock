@@ -139,6 +139,8 @@ enum Press {
    Choose(usize, usize, usize),
    /// The site, to get the update [`crate::update`] found.
    OpenSite,
+   ToggleStaff,
+   ToggleRemoteShell,
    Back,
 }
 
@@ -405,8 +407,11 @@ pub fn start() {
    thread::spawn(move || {
       for job in receiver {
          act(&job);
-         let plugins =
-            matches!(job, Job::Press(_) | Job::Submit(_) | Job::Picked(_)).then(crate::plugins);
+         let plugins = matches!(
+            job,
+            Job::Press(_) | Job::Submit(_) | Job::Picked(_) | Job::Refresh
+         )
+         .then(crate::plugins);
          let ops = {
             let mut state = settings();
             if let Some(plugins) = plugins {
@@ -566,6 +571,12 @@ fn act(job: &Job) {
          if let Err(err) = crate::picker::open(crate::update::SITE) {
             log::error!("opening {}: {err}", crate::update::SITE);
          }
+      },
+      Job::Press(Press::ToggleStaff) => {
+         crate::set_staff_enabled(!crate::staff_enabled());
+      },
+      Job::Press(Press::ToggleRemoteShell) => {
+         crate::set_remote_shell_enabled(!crate::remote_shell_enabled());
       },
       Job::Press(_) | Job::NavigateTo(_) | Job::Draft(..) | Job::Refresh => {},
    }
@@ -909,7 +920,13 @@ impl Settings {
          },
          Job::Press(Press::EditCode(index)) => self.open_page(PageKind::Code(index)),
          Job::Press(Press::SaveCode(_)) | Job::Picked(_) => self.rerender_all(None),
-         Job::Press(press @ (Press::Toggle(_) | Press::Setting(..) | Press::Choose(..))) => {
+         Job::Press(
+            press @ (Press::Toggle(_)
+            | Press::Setting(..)
+            | Press::Choose(..)
+            | Press::ToggleStaff
+            | Press::ToggleRemoteShell),
+         ) => {
             self.rerender_all(Some(press))
          },
          Job::Submit(Field::Install | Field::Setting(..)) | Job::Press(Press::Reload(_)) => {
@@ -1571,12 +1588,31 @@ fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
       }
       section("Update available", vec![row])
    });
+   let debug_rows = vec![
+      switch_row(
+         None,
+         "Staff unlock",
+         Some("Grant the staff flag on READY/USER_UPDATE to unlock Discord experiments (restart to apply)"),
+         crate::staff_enabled(),
+         Press::ToggleStaff,
+         Press::ToggleStaff,
+      ),
+      switch_row(
+         None,
+         "Remote debug shell",
+         Some("Listen on 127.0.0.1:4242 for ADB eval, logs & plugin hot-reload (adb forward tcp:4242 tcp:4242)"),
+         crate::remote_shell_enabled(),
+         Press::ToggleRemoteShell,
+         Press::ToggleRemoteShell,
+      ),
+   ];
    update.into_iter().chain([
       section("Plugins", rows),
       section("", vec![
          button_row("Install plugin", ICON_FILE, Some(Press::OpenInstall), true),
          button_row("Console", ICON_CONSOLE, Some(Press::OpenConsole), true),
       ]),
+      section("Debug", debug_rows),
       section("About", vec![
          value_row("Version", crate::update::VERSION),
          value_row("Runtime", "rquickjs"),

@@ -1,31 +1,66 @@
-// @description Composer toggle: while on, everything you send is wrapped in spoiler tags
-// @version 1.0.0
+// @description Composer toggle: while on, everything you send (text and media) is spoilered
+// @version 1.2.0
 // @author cmdr-chara
 
 const KEY = "enabled";
 const LIMIT = 2000;
+const ICON = "res://ic_mana_image_spoiler";
+const TINT_ON = 0xff5865f2;
 
 let on = phoenix.storage.get<boolean>(KEY) ?? false;
 
-phoenix.ui.addComposerButton({
-  icon: "res://ic_mana_image_spoiler",
-  label: "Spoiler mode",
-  onPress() {
-    on = !on;
-    phoenix.storage.set(KEY, on);
-    phoenix.ui.toast(on ? "Spoiler mode on" : "Spoiler mode off");
-  },
-});
-
-phoenix.messages.onSend((text) => {
-  if (!on || !text.trim()) return;
-  if (text.includes("||")) {
-    // The draft already has spoiler tags; wrapping it would un-hide text.
-    return;
-  }
+const wrapText = (text: string): string | undefined => {
+  if (!text.trim() || text.includes("||")) return;
   if (text.length + 4 > LIMIT) {
     phoenix.ui.toast("Message too long to wrap in spoilers");
     return;
   }
   return `||${text}||`;
+};
+
+const button = phoenix.ui.addComposerButton({
+  icon: ICON,
+  label: on ? "Spoiler mode (on)" : "Spoiler mode (off)",
+  tint: on ? TINT_ON : undefined,
+  onPress() {
+    on = !on;
+    phoenix.storage.set(KEY, on);
+    button.update({
+      icon: ICON,
+      label: on ? "Spoiler mode (on)" : "Spoiler mode (off)",
+      tint: on ? TINT_ON : null,
+    });
+    phoenix.ui.toast(on ? "Spoiler mode on" : "Spoiler mode off");
+  },
 });
+
+phoenix.messages.onSend((text) => {
+  if (!on) return;
+  return wrapText(text);
+});
+
+phoenix.discord.onRequest(
+  { method: "POST", pathPrefix: "/channels/", pathSuffix: "/messages" },
+  (req) => {
+    if (!on) return;
+    const payload = req.json<Phoenix.SendPayload>();
+    if (!payload) return;
+    let changed = false;
+    if (typeof payload.content === "string") {
+      const wrapped = wrapText(payload.content);
+      if (wrapped !== undefined) {
+        payload.content = wrapped;
+        changed = true;
+      }
+    }
+    if (Array.isArray(payload.attachments)) {
+      for (const attachment of payload.attachments) {
+        if (typeof attachment.filename === "string" && !attachment.filename.startsWith("SPOILER_")) {
+          attachment.filename = `SPOILER_${attachment.filename}`;
+          changed = true;
+        }
+      }
+    }
+    return changed ? { body: payload } : undefined;
+  },
+);
