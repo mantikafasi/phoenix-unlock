@@ -3,6 +3,7 @@
 //! Remote debug shell in Phoenix Unlocker settings.
 
 use std::{
+   collections::VecDeque,
    io::{
       BufRead,
       BufReader,
@@ -13,19 +14,115 @@ use std::{
       TcpListener,
       TcpStream,
    },
-   sync::atomic::{
-      AtomicBool,
-      Ordering,
+   sync::{
+      LazyLock,
+      Mutex,
+      PoisonError,
+      atomic::{
+         AtomicBool,
+         Ordering,
+      },
    },
    thread,
    time::Duration,
 };
 
+use phoenix_ui::Op;
+
+use crate::patches::mirror::wire_to_json;
+
 pub const ADDR: &str = "127.0.0.1:4242";
 const MAX_BODY: usize = 4 << 20;
+const MAX_OPS_LOG: usize = 64;
+const MAX_EVENTS_LOG: usize = 128;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static RUNNING: AtomicBool = AtomicBool::new(false);
+static OPS_LOG: LazyLock<Mutex<VecDeque<serde_json::Value>>> =
+   LazyLock::new(|| Mutex::new(VecDeque::with_capacity(MAX_OPS_LOG)));
+static EVENTS_LOG: LazyLock<Mutex<VecDeque<serde_json::Value>>> =
+   LazyLock::new(|| Mutex::new(VecDeque::with_capacity(MAX_EVENTS_LOG)));
+
+/// Records a decoded Phoenix UI-op batch into the debug ring buffer when the
+/// remote debug shell is enabled. Zero-cost atomic check when disabled.
+pub fn record_ops(ops: &[Op]) {
+   if !enabled() || ops.is_empty() {
+      return;
+   }
+   let items = ops.iter().map(op_to_json).collect::<Vec<_>>();
+   let entry = serde_json::json!({
+      "count": items.len(),
+      "ops": items,
+   });
+   let mut log = OPS_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+   if log.len() == MAX_OPS_LOG {
+      log.pop_front();
+   }
+   log.push_back(entry);
+}
+
+/// Records a view or host event into the debug ring buffer when the remote
+/// debug shell is enabled. Never pass HTTP headers or credentials here.
+pub fn record_event(source: &str, mut detail: serde_json::Value) {
+   if !enabled() {
+      return;
+   }
+   if let Some(map) = detail.as_object_mut() {
+      map.insert("source".to_owned(), serde_json::json!(source));
+   }
+   let mut log = EVENTS_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+   if log.len() == MAX_EVENTS_LOG {
+      log.pop_front();
+   }
+   log.push_back(detail);
+}
+
+fn props_to_json(props: &phoenix_ui::Props) -> serde_json::Value {
+   let mut map = serde_json::Map::new();
+   for (key, value) in props {
+      let name = key
+         .name()
+         .map_or_else(|| format!("#{}", key.key().get()), str::to_owned);
+      map.insert(name, wire_to_json(value));
+   }
+   serde_json::Value::Object(map)
+}
+
+fn op_to_json(op: &Op) -> serde_json::Value {
+   match op {
+      Op::Create { id, kind, props } => {
+         serde_json::json!({
+            "op": "create",
+            "id": id,
+            "kind": kind.as_str(),
+            "props": props_to_json(props),
+         })
+      },
+      Op::Update { id, props } => {
+         serde_json::json!({
+            "op": "update",
+            "id": id,
+            "props": props_to_json(props),
+         })
+      },
+      Op::Children { id, ids } => serde_json::json!({ "op": "children", "id": id, "ids": ids }),
+      Op::ChildEdits { id, edits } => {
+         let edits = edits
+            .iter()
+            .map(|edit| serde_json::json!({ "keep": edit.keep, "del": edit.del, "ins": edit.ins }))
+            .collect::<Vec<_>>();
+         serde_json::json!({ "op": "childEdits", "id": id, "edits": edits })
+      },
+      Op::Delete { ids } => serde_json::json!({ "op": "delete", "ids": ids }),
+      Op::Root { id } => serde_json::json!({ "op": "root", "id": id }),
+      Op::Focus { id } => serde_json::json!({ "op": "focus", "id": id }),
+      Op::ScrollTo { id, value } => {
+         serde_json::json!({ "op": "scrollTo", "id": id, "value": wire_to_json(value) })
+      },
+      Op::RequestFrame => serde_json::json!({ "op": "requestFrame" }),
+      Op::Motion { words } => serde_json::json!({ "op": "motion", "words": words.len() }),
+   }
+}
 
 #[must_use]
 pub fn enabled() -> bool {
@@ -85,10 +182,10 @@ fn handle(mut stream: TcpStream) {
    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
 
-   let Ok((method, path, body)) = read_request(&stream) else {
+   let Ok((method, path, query, body)) = read_request(&stream) else {
       return;
    };
-   let (status, content_type, response) = dispatch(&method, &path, &body);
+   let (status, content_type, response) = dispatch(&method, &path, &query, &body);
    let header = format!(
       "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
       response.len()
@@ -97,7 +194,7 @@ fn handle(mut stream: TcpStream) {
    let _ = stream.write_all(&response);
 }
 
-fn read_request(stream: &TcpStream) -> std::io::Result<(String, String, Vec<u8>)> {
+fn read_request(stream: &TcpStream) -> std::io::Result<(String, String, String, Vec<u8>)> {
    let mut reader = BufReader::new(stream);
    let mut request_line = String::new();
    if reader.read_line(&mut request_line)? == 0 {
@@ -106,7 +203,10 @@ fn read_request(stream: &TcpStream) -> std::io::Result<(String, String, Vec<u8>)
    let mut parts = request_line.split_whitespace();
    let method = parts.next().unwrap_or_default().to_owned();
    let raw_path = parts.next().unwrap_or("/");
-   let path = raw_path.split('?').next().unwrap_or("/").to_owned();
+   let (path, query) = match raw_path.split_once('?') {
+      Some((path, query)) => (path.to_owned(), query.to_owned()),
+      None => (raw_path.to_owned(), String::new()),
+   };
 
    let mut content_length: usize = 0;
    loop {
@@ -128,10 +228,23 @@ fn read_request(stream: &TcpStream) -> std::io::Result<(String, String, Vec<u8>)
    if content_length > 0 {
       reader.read_exact(&mut body)?;
    }
-   Ok((method, path, body))
+   Ok((method, path, query, body))
 }
 
-fn dispatch(method: &str, path: &str, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+   query
+      .split('&')
+      .filter_map(|pair| pair.split_once('='))
+      .find(|(k, _)| *k == key)
+      .map(|(_, v)| v)
+}
+
+fn dispatch(
+   method: &str,
+   path: &str,
+   query: &str,
+   body: &[u8],
+) -> (&'static str, &'static str, Vec<u8>) {
    match (method, path) {
       ("GET", "/" | "/status") => {
          let plugins = crate::plugins()
@@ -191,6 +304,98 @@ fn dispatch(method: &str, path: &str, body: &[u8]) -> (&'static str, &'static st
             Err(message) => err("500 Internal Server Error", &message),
          }
       },
+      ("GET", "/ops") => {
+         let filter = query_param(query, "match");
+         let limit = query_param(query, "limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(20);
+         let log = OPS_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+         let items = log
+            .iter()
+            .rev()
+            .filter(|entry| {
+               filter.is_none_or(|needle| {
+                  serde_json::to_string(entry)
+                     .is_ok_and(|text| text.contains(needle))
+               })
+            })
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+         ok_json(&serde_json::Value::Array(items))
+      },
+      ("GET", "/events") => {
+         let filter = query_param(query, "match");
+         let limit = query_param(query, "limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50);
+         let log = EVENTS_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+         let items = log
+            .iter()
+            .rev()
+            .filter(|entry| {
+               filter.is_none_or(|needle| {
+                  serde_json::to_string(entry)
+                     .is_ok_and(|text| text.contains(needle))
+               })
+            })
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+         ok_json(&serde_json::Value::Array(items))
+      },
+      ("POST", "/clear") => {
+         OPS_LOG
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+         EVENTS_LOG
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+         ok_json(&serde_json::json!({ "cleared": true }))
+      },
+      ("GET", "/tree") => {
+         let depth = query_param(query, "depth")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(6);
+         ok_json(&crate::patches::dump_tree(None, depth))
+      },
+      ("GET", _) if path.starts_with("/tree/") => {
+         let Ok(id) = path["/tree/".len()..].parse::<i32>() else {
+            return err("400 Bad Request", "invalid node id");
+         };
+         let depth = query_param(query, "depth")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(6);
+         ok_json(&crate::patches::dump_tree(Some(id), depth))
+      },
+      ("GET", "/update") => {
+         let found = crate::update::found().map(|u| {
+            serde_json::json!({
+               "loader": u.loader,
+               "plugins": u.plugins,
+            })
+         });
+         ok_json(&serde_json::json!({
+            "version": crate::update::VERSION,
+            "busy": crate::update::busy(),
+            "status": crate::update::status(),
+            "found": found,
+         }))
+      },
+      ("POST", "/update/check") => {
+         crate::update::check();
+         ok_json(&serde_json::json!({ "started": true }))
+      },
+      ("POST", "/update/apply") => {
+         crate::update::apply();
+         ok_json(&serde_json::json!({ "started": true }))
+      },
+      ("POST", "/update/self") => {
+         crate::update::self_update_from_site();
+         ok_json(&serde_json::json!({ "started": true }))
+      },
       ("POST", "/debug/staff") => {
          let text = String::from_utf8_lossy(body);
          let on = matches!(text.trim(), "1" | "true" | "on");
@@ -201,7 +406,7 @@ fn dispatch(method: &str, path: &str, body: &[u8]) -> (&'static str, &'static st
       _ if path.starts_with("/plugins/") => plugin_route(method, &path["/plugins/".len()..], body),
       _ => err(
          "404 Not Found",
-         "endpoints: GET /status, GET /plugins, GET|PUT|DELETE /plugins/<name>, POST /plugins/<name>/{reload,enable,disable}, POST /eval, GET /logs",
+         "endpoints: GET /status, GET /plugins, GET|PUT|DELETE /plugins/<name>, POST /plugins/<name>/{reload,enable,disable}, POST /eval, GET /logs, GET /ops[?match=&limit=], GET /events[?match=&limit=], GET /tree[/<id>][?depth=], POST /clear",
       ),
    }
 }

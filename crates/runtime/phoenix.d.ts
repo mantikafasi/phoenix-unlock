@@ -960,6 +960,20 @@ declare namespace Phoenix {
     /// relative to the API base, like `/users/@me`. Rejects until the app has made a request of its
     /// own.
     readonly discord: Discord;
+    /// Raw access to Phoenix's Android host modules (`GuestHost.invoke`).
+    readonly bridge: Bridge;
+  }
+
+  interface Bridge {
+    /// Invokes a native Phoenix host module method by its `hh.jb` numeric IDs (see
+    /// `docs/phoenix-356207.md`). Keys in `args` may be numeric `hh.jb` field IDs as strings
+    /// (e.g. `"421"`) or known Phoenix prop names.
+    invoke(
+      moduleId: number,
+      methodId: number,
+      args?: Record<string, unknown>,
+      body?: string
+    ): boolean;
   }
 
   interface AuthorizeOptions {
@@ -1074,12 +1088,30 @@ declare namespace Phoenix {
 
   interface NodeInfo {
     readonly id: number;
+    /// Phoenix `ViewKind` when Remote Debug Shell is enabled, else `null`.
+    readonly kind: string | null;
     readonly accessibilityId: string | null;
     readonly parent: number | null;
     readonly children: number[];
     readonly sheet: number | null;
     readonly list: number | null;
     readonly on: string[];
+  }
+
+  interface MountNode {
+    /// Phoenix `ViewKind` (e.g. `"view"`, `"text"`, `"image"`, `"banner"`, `"sheet"`).
+    kind?: string;
+    /// Phoenix props (`padding`/`margin` accept `[left, top, right, bottom]` or a number).
+    props?: Record<string, unknown>;
+    children?: MountNode[];
+    /// Tap handler (`on: ["press"]` is added automatically).
+    onPress?(): void;
+    /// Dismiss handler (for overlays like `"sheet"`).
+    onDismiss?(): void;
+  }
+
+  interface MountOptions {
+    before?: "start" | "end" | number;
   }
 
   interface ViewEvent {
@@ -1332,6 +1364,11 @@ declare namespace Phoenix {
     findDown(root: number, match: NodeMatch, maxDepth?: number): number | null;
     /// Reads live tree metadata for `id` from Phoenix's mirrored view tree.
     node(id: number): NodeInfo | null;
+    /// The live root Phoenix node id (`Op::Root`), or `null` if not yet seen.
+    root(): number | null;
+    /// Mounts a raw Phoenix UI subtree onto `parentId` (or `"root"` for the root view). Returns a
+    /// function that unmounts and deletes all created nodes.
+    mount(parentId: number | "root", node: MountNode, options?: MountOptions): Remover;
     /// Shows a native Discord in-app notification banner at the top of the screen. Returns a
     /// function that dismisses it early.
     notify(options: NotifyOptions): () => void;

@@ -9,6 +9,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ABIS, abiOf, buildPatchedApk, buildPatchedSplits } from '../lib/apk.js';
+import { INJECTED } from '../lib/host.js';
 import { BOOTSTRAP_URL, bundleScripts, GADGET_URLS, gunzip } from '../lib/frida.js';
 import { keysFrom } from '../lib/sign.js';
 import { readZip } from '../lib/zip.js';
@@ -28,7 +29,10 @@ const abiIndex = files.findIndex(([, b]) => abiOf(readZip(b)));
 if (abiIndex < 0) { console.error(`no ${Object.keys(ABIS).join('/')} split among the inputs`); process.exit(1); }
 const abiName = abiOf(readZip(files[abiIndex][1]));
 console.log(`ABI: ${abiName}`);
-const libraries = Object.entries(ABIS[abiName].libs).map(([name, file]) => ({ name, bytes: read(web(file)) }));
+const libraries = Object.entries(ABIS[abiName].libs).map(([name, file]) => ({
+  name,
+  bytes: read(name === INJECTED && process.env.PHOENIX_LOADER ? process.env.PHOENIX_LOADER : web(file)),
+}));
 const bundled = JSON.parse(readFileSync(web('plugins/index.json'), 'utf8')).map((p) => p.name);
 const picked = opt.plugins === undefined ? bundled.filter((p) => p !== 'example') : opt.plugins.split(',').filter(Boolean);
 for (const p of picked) if (!bundled.includes(p)) { console.error(`unknown plugin ${p} (bundled: ${bundled.join(', ')})`); process.exit(1); }

@@ -56,3 +56,10 @@ codegen-units = 1
 lto           = "fat"
 panic         = "unwind"
 strip         = true
+
+[profile.dev-fast]
+inherits      = "release"
+codegen-units = 16
+lto           = false
+opt-level     = 1
+strip         = "debuginfo"

@@ -24,6 +24,7 @@ use serde::Deserialize;
 
 use crate::motion::Worklet;
 
+pub mod mirror;
 pub mod motion;
 
 /// The prop and event name table (`lh/c2.a`, versionCode 356207). The index is

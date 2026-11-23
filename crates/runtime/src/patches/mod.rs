@@ -13,7 +13,7 @@
 mod badges;
 mod commands;
 mod emoji;
-mod mirror;
+pub mod mirror;
 mod tabs;
 pub mod targets;
 
@@ -261,6 +261,7 @@ pub enum PatchTarget {
 #[derive(Clone, Debug)]
 pub struct NodeInfo {
    pub id:               i32,
+   pub kind:             Option<String>,
    pub accessibility_id: Option<String>,
    pub parent:           Option<i32>,
    pub children:         Vec<i32>,
@@ -352,6 +353,12 @@ enum Handler {
    BannerPress(u32),
    /// Tap on an in-app notification banner's dismiss button.
    BannerDismiss(u32),
+   /// Events on a raw JS-mounted subtree (`phoenix.ui.mount`).
+   Mounted {
+      mount:   u32,
+      press:   Option<u32>,
+      dismiss: Option<u32>,
+   },
 }
 
 /// A node to create, with the handler its subtree answers presses with.
@@ -396,12 +403,32 @@ enum SlotKind {
    Page(u32),
    /// A native top in-app notification banner attached to the root view.
    Banner(u32),
+   /// A raw JS-mounted subtree (`phoenix.ui.mount`).
+   Mounted(u32),
+}
+
+/// Placement of a raw JS-mounted subtree inside its parent.
+pub enum MountBefore {
+   Start,
+   End,
+   Node(i32),
+}
+
+/// A raw node specification for `phoenix.ui.mount`.
+pub struct MountNode {
+   pub kind:       ViewKind,
+   pub props:      Props,
+   pub kids:       Vec<Self>,
+   pub on_press:   Option<u32>,
+   pub on_dismiss: Option<u32>,
 }
 
 /// What happens when the user taps an in-app notification banner.
 pub enum BannerAction {
    None,
+   #[allow(dead_code)]
    OpenUrl(String),
+   ApplyUpdate,
    JsCallback,
 }
 
@@ -580,6 +607,20 @@ enum Job {
    DismissBanner(u32),
    /// User tapped in-app notification banner `id`.
    BannerPressed(u32),
+   /// Mount a raw JS-built subtree onto `parent` (or `mirror.root()` when None).
+   Mount {
+      id:     u32,
+      parent: Option<i32>,
+      before: MountBefore,
+      node:   MountNode,
+   },
+   /// Unmount a raw JS-built subtree.
+   Unmount(u32),
+   /// Run callback `callback` for raw JS mount `mount`.
+   MountCallback {
+      mount:    u32,
+      callback: u32,
+   },
 }
 
 #[derive(Default)]
@@ -741,14 +782,18 @@ struct PatchSink;
 impl Sink for PatchSink {
    fn ops(&self, batch: &[u8]) -> Action {
       let active = ACTIVE.load(Ordering::Acquire);
+      let debug = crate::remote::enabled();
       if !active && !GUARDING.load(Ordering::Acquire) {
          let root = ROOT_ID.load(Ordering::Acquire);
-         if root != 0 && memmem::find(batch, &root.to_le_bytes()).is_none() {
+         if !debug && root != 0 && memmem::find(batch, &root.to_le_bytes()).is_none() {
             return Action::Pass;
          }
          if let Ok(ops) = decode(batch) {
+            if debug {
+               crate::remote::record_ops(&ops);
+            }
             let mut state = patches();
-            state.mirror.apply(&ops);
+            state.mirror.apply(&ops, debug);
             if let Some(found) = state.mirror.root() {
                ROOT_ID.store(found, Ordering::Release);
                state.note_root_ready();
@@ -763,6 +808,9 @@ impl Sink for PatchSink {
             return Action::Pass;
          },
       };
+      if debug {
+         crate::remote::record_ops(&ops);
+      }
       let restored = restore_originals(&mut ops);
       let rewritten = if active {
          patches().rewrite(ops, restored)
@@ -773,7 +821,7 @@ impl Sink for PatchSink {
    }
 
    fn dispatch(&self, frame: &[u8]) -> Action {
-      if !ACTIVE.load(Ordering::Acquire) {
+      if !ACTIVE.load(Ordering::Acquire) && !crate::remote::enabled() {
          return Action::Pass;
       }
       patches().filter(frame)
@@ -994,6 +1042,9 @@ fn run(job: Job) -> Vec<Op> {
                   log::error!("banner open {url}: {err}");
                }
             },
+            BannerAction::ApplyUpdate => {
+               crate::update::apply();
+            },
             BannerAction::JsCallback => {
                if let Some(engine) = crate::engine() {
                   engine.banner_press(id);
@@ -1001,6 +1052,25 @@ fn run(job: Job) -> Vec<Op> {
             },
          }
          ops
+      },
+      Job::Mount {
+         id,
+         parent,
+         before,
+         node,
+      } => patches().open_mount(id, parent, before, node),
+      Job::Unmount(id) => {
+         let ops = patches().close_mount(id);
+         if let Some(engine) = crate::engine() {
+            engine.mount_closed(id);
+         }
+         ops
+      },
+      Job::MountCallback { mount, callback } => {
+         if let Some(engine) = crate::engine() {
+            engine.mount_callback(mount, callback);
+         }
+         Vec::new()
       },
    }
 }
@@ -1242,6 +1312,37 @@ pub fn show_banner(
 /// Dismisses an in-app notification banner early if it is still visible.
 pub fn dismiss_banner(id: u32) {
    queue(Job::DismissBanner(id));
+}
+
+/// Mounts a raw JS-constructed Phoenix subtree onto `parent` (or the root view
+/// when `parent` is `None`).
+pub fn mount(id: u32, parent: Option<i32>, before: MountBefore, node: MountNode) {
+   ACTIVE.store(true, Ordering::Release);
+   queue(Job::Mount {
+      id,
+      parent,
+      before,
+      node,
+   });
+}
+
+/// Unmounts a raw JS-constructed subtree mounted with [`mount`].
+pub fn unmount(id: u32) {
+   queue(Job::Unmount(id));
+}
+
+/// The current Phoenix root view id, if seen.
+pub fn root_id() -> Option<i32> {
+   patches().mirror.root()
+}
+
+/// Serializes the live mirrored view tree for the debug inspector (`GET /tree`).
+pub fn dump_tree(root: Option<i32>, max_depth: usize) -> serde_json::Value {
+   let state = patches();
+   let Some(id) = root.or_else(|| state.mirror.root()) else {
+      return serde_json::json!({ "error": "root node not seen yet" });
+   };
+   state.mirror.dump_tree(id, max_depth)
 }
 
 /// Hides every Phoenix node with accessibility id `aid` by setting
@@ -1505,7 +1606,7 @@ impl Patches {
       let mut list_updates: HashSet<i32> = HashSet::new();
       let mut skip_action_placement = false;
       {
-         let (created, deleted) = self.mirror.apply(&ops);
+         let (created, deleted) = self.mirror.apply(&ops, crate::remote::enabled());
          self.templates.learn_badge_tile(&self.mirror, &created);
          if let Some(found) = self.mirror.root() {
             ROOT_ID.store(found, Ordering::Release);
@@ -1913,9 +2014,29 @@ impl Patches {
             payload,
          } = &item.event
          else {
+            if crate::remote::enabled()
+               && let DispatchEvent::Host { event, .. } = &item.event
+            {
+               crate::remote::record_event("hostEvent", serde_json::json!({ "event": event }));
+            }
             frames.push(raw);
             continue;
          };
+         if crate::remote::enabled() {
+            let name = phoenix_ui::PROPS
+               .get(usize::from(event.get()))
+               .copied()
+               .map_or_else(|| format!("#{}", event.get()), str::to_owned);
+            crate::remote::record_event(
+               "view",
+               serde_json::json!({
+                  "node": node,
+                  "event": name,
+                  "aid": self.mirror.accessibility_id(*node),
+                  "payload": mirror::wire_to_json(payload),
+               }),
+            );
+         }
          if *event == Prop::NAVIGATE.key()
             && let Some(page) = self.top_page_on(*node)
          {
@@ -2081,7 +2202,15 @@ impl Patches {
          Handler::PageButton { page, index } => queue(Job::PagePress { page, index }),
          Handler::BannerPress(id) => queue(Job::BannerPressed(id)),
          Handler::BannerDismiss(id) => queue(Job::DismissBanner(id)),
-         Handler::Input { .. } | Handler::Page { .. } | Handler::Hold { .. } => {},
+         Handler::Mounted {
+            mount,
+            press: Some(callback),
+            ..
+         } => queue(Job::MountCallback { mount, callback }),
+         Handler::Mounted { press: None, .. }
+         | Handler::Input { .. }
+         | Handler::Page { .. }
+         | Handler::Hold { .. } => {},
          Handler::Pick(name) => {
             if let Some((input, _)) = self.mirror.composer() {
                frames.push(commands::change_text(input, &format!("/{name} ")));
@@ -2139,6 +2268,13 @@ impl Patches {
          },
          Handler::Choice { menu, .. } if event == DISMISS => {
             queue(Job::CloseMenu { menu, index: -1 });
+         },
+         Handler::Mounted {
+            mount,
+            dismiss: Some(callback),
+            ..
+         } if event == DISMISS => {
+            queue(Job::MountCallback { mount, callback });
          },
          Handler::Page { contribution } if event == LAYOUT => {
             if let (Some(slot), Some(height)) = (
@@ -2813,6 +2949,87 @@ impl Patches {
       (ops, action)
    }
 
+   fn open_mount(
+      &mut self,
+      id: u32,
+      parent: Option<i32>,
+      before: MountBefore,
+      node: MountNode,
+   ) -> Vec<Op> {
+      let Some(parent) = parent.or_else(|| self.mirror.root()) else {
+         log::warn!("mount {id}: parent/root not available");
+         return Vec::new();
+      };
+      if !self.mirror.has_kids(parent) && !self.mirror.exists(parent) {
+         log::warn!("mount {id}: parent {parent} not found in mirror");
+         return Vec::new();
+      }
+      fn to_draft(mount: u32, node: MountNode) -> Draft {
+         let press = (node.on_press.is_some() || node.on_dismiss.is_some()).then_some(
+            Handler::Mounted {
+               mount,
+               press: node.on_press,
+               dismiss: node.on_dismiss,
+            },
+         );
+         Draft {
+            kind: node.kind,
+            props: node.props,
+            kids: node
+               .kids
+               .into_iter()
+               .map(|kid| to_draft(mount, kid))
+               .collect(),
+            press,
+            src: None,
+         }
+      }
+      let draft = to_draft(id, node);
+      let before = match before {
+         MountBefore::Start => Before::Start,
+         MountBefore::End => Before::End,
+         MountBefore::Node(sib) => Before::Node(sib),
+      };
+      let mut out = Vec::new();
+      let mut all = Vec::new();
+      let root = self.emit(draft, None, &mut out, &mut all);
+      self.slots.push(Slot {
+         kind: SlotKind::Mounted(id),
+         anchor: parent,
+         parent,
+         before,
+         place: Place::Screen,
+         roots: vec![root],
+         all,
+      });
+      out.push(Op::Children {
+         id:  parent,
+         ids: self.merged(parent),
+      });
+      out
+   }
+
+   fn close_mount(&mut self, id: u32) -> Vec<Op> {
+      let Some(at) = self
+         .slots
+         .iter()
+         .position(|slot| slot.kind == SlotKind::Mounted(id))
+      else {
+         return Vec::new();
+      };
+      let slot = self.slots.remove(at);
+      self.forget_ids(&slot.all);
+      let mut out = Vec::new();
+      if self.mirror.has_kids(slot.parent) {
+         out.push(Op::Children {
+            id:  slot.parent,
+            ids: self.merged(slot.parent),
+         });
+      }
+      out.push(Op::Delete { ids: slot.all });
+      out
+   }
+
    /// The node of text box `index` on `contribution`'s page at `place`.
    fn input_node(&self, contribution: ContributionId, place: &Place, index: u32) -> Option<i32> {
       self
@@ -3045,6 +3262,7 @@ impl Patches {
          .collect();
       NodeInfo {
          id,
+         kind: self.mirror.kind(id).map(|k| k.as_str().to_owned()),
          accessibility_id: self.mirror.accessibility_id(id).map(str::to_owned),
          parent: self.mirror.parent(id),
          children: self.mirror.kids(id).to_vec(),

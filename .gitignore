@@ -26,6 +26,11 @@
 
 !scripts/
 !scripts/*.nu
+!scripts/*.ps1
+!scripts/*.py
+
+!docs/
+!docs/**
 
 !.github/
 !.github/**

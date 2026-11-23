@@ -430,6 +430,14 @@ unsafe extern "system" fn call_object_method_a(
       let request = (*args).l;
       let head = read_bytes(env, request, Some(6));
       if !head.starts_with(&[0; 4]) {
+         if crate::remote::enabled()
+            && let Some((module_id, method_id)) = phoenix_wire::HostCall::target(&head)
+         {
+            crate::remote::record_event(
+               "hostCall",
+               serde_json::json!({ "module": module_id, "method": method_id }),
+            );
+         }
          if discord::wants(&head) {
             let frame = read_bytes(env, request, None);
             match discord::intercept_call(&frame) {

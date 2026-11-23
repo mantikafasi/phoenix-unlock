@@ -6,6 +6,7 @@
 import { buildPool, decodeRaw, encodeRaw, parsePool } from './arsc.js';
 
 const ORIGINAL = 'com.discord';
+const REQ_INSTALL_PERM = 'android.permission.REQUEST_INSTALL_PACKAGES';
 const DROP_ATTRS = new Set([0x0101064e, 0x0101064f, 0x01010591]); // requiredSplitTypes, splitTypes, isSplitRequired
 const A = { name: 0x01010003, value: 0x01010024, label: 0x01010001, authorities: 0x01010018, taskAffinity: 0x01010012 };
 const TYPE_STRING = 0x03, TYPE_REFERENCE = 0x01;
@@ -30,7 +31,9 @@ export function patchManifest(src, { packageName = ORIGINAL, label = null } = {}
   const edits = new Map(); // attr offset -> string index
   const drops = new Set(); // attr offsets
   const bools = new Set(); // attr offsets set to false
-  const stats = { removed: 0, flipped: false, renamed: 0 };
+  const stats = { removed: 0, flipped: false, renamed: 0, addedInstallPerm: false };
+  let hasInstallPerm = false;
+  let samplePermStart = -1, samplePermEnd = -1;
 
   for (const [ci, p] of chunks.entries()) {
     const type = v.getUint16(p, true), size = v.getUint32(p + 4, true);
@@ -42,6 +45,13 @@ export function patchManifest(src, { packageName = ORIGINAL, label = null } = {}
       const resOf = (a) => resIds[v.getUint32(a + 4, true)];
       const valStr = (a) => (v.getUint8(a + 15) === TYPE_STRING ? str(v.getUint32(a + 16, true)) : null);
       const tag = str(v.getUint32(p + 20, true));
+      if (tag === 'uses-permission') {
+        if (attrs.some((a) => resOf(a) === A.name && valStr(a) === REQ_INSTALL_PERM)) hasInstallPerm = true;
+        if (samplePermStart < 0 && aCount === 1 && resOf(attrs[0]) === A.name && ci + 1 < chunks.length && v.getUint16(chunks[ci + 1], true) === 0x0103) {
+          samplePermStart = ci;
+          samplePermEnd = ci + 1;
+        }
+      }
       for (const a of attrs) if (DROP_ATTRS.has(resOf(a))) drops.add(a);
       if (tag === 'meta-data' && attrs.some((a) => resOf(a) === A.name && valStr(a) === 'com.android.vending.splits.required')) {
         const val = attrs.find((a) => resOf(a) === A.value);
@@ -65,13 +75,35 @@ export function patchManifest(src, { packageName = ORIGINAL, label = null } = {}
   }
   if (!pool) throw new Error('manifest has no string pool');
 
+  let installPermIdx = -1;
+  if (!hasInstallPerm && samplePermStart >= 0) {
+    installPermIdx = strIndex(REQ_INSTALL_PERM);
+    stats.addedInstallPerm = true;
+  }
+
   // pass 2: emit
   for (const s of newStrings.keys()) pool.raws.push(encodeRaw(s, pool.utf8));
   const out = [u8.subarray(0, v.getUint16(2, true))];
   for (const [ci, p] of chunks.entries()) {
     const size = v.getUint32(p + 4, true);
     if (ci === poolIdx) { out.push(newStrings.size ? buildPool(pool) : u8.subarray(p, p + size)); continue; }
-    if (v.getUint16(p, true) !== 0x0102) { out.push(u8.subarray(p, p + size)); continue; }
+    if (v.getUint16(p, true) !== 0x0102) {
+      out.push(u8.subarray(p, p + size));
+      if (ci === samplePermEnd && installPermIdx >= 0) {
+        const sp = chunks[samplePermStart], ss = v.getUint32(sp + 4, true);
+        const ep = chunks[samplePermEnd], es = v.getUint32(ep + 4, true);
+        const startCopy = u8.slice(sp, sp + ss);
+        const sv = new DataView(startCopy.buffer);
+        const ao = 16 + sv.getUint16(24, true);
+        sv.setUint32(ao + 8, installPermIdx, true);
+        sv.setUint16(ao + 12, 8, true);
+        sv.setUint8(ao + 14, 0);
+        sv.setUint8(ao + 15, TYPE_STRING);
+        sv.setUint32(ao + 16, installPermIdx, true);
+        out.push(startCopy, u8.subarray(ep, ep + es));
+      }
+      continue;
+    }
     const aStart = p + 16 + v.getUint16(p + 24, true), aSize = v.getUint16(p + 26, true), aCount = v.getUint16(p + 28, true);
     const attrs = Array.from({ length: aCount }, (_, i) => aStart + i * aSize);
     if (!attrs.some((a) => drops.has(a) || edits.has(a) || bools.has(a))) { out.push(u8.subarray(p, p + size)); continue; }

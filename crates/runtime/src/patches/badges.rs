@@ -384,7 +384,7 @@ fn badge_scroll(mirror: &Mirror, title: i32) -> Option<i32> {
          .kids(node)
          .iter()
          .copied()
-         .find(|kid| mirror.kind(*kid) == Some("scroll"))
+         .find(|kid| mirror.kind(*kid).is_some_and(|kind| kind.as_str() == "scroll"))
       {
          return Some(scroll);
       }
@@ -398,7 +398,7 @@ fn detail_host(mirror: &Mirror, title: i32) -> Option<i32> {
    let mut node = title;
    loop {
       let parent = mirror.parent(node)?;
-      if mirror.kind(parent) == Some("navigator") {
+      if mirror.kind(parent).is_some_and(|kind| kind.as_str() == "navigator") {
          return mirror.kids(node).first().copied().or(Some(node));
       }
       node = parent;
@@ -410,7 +410,7 @@ fn detail_host(mirror: &Mirror, title: i32) -> Option<i32> {
 fn badge_grid(mirror: &Mirror, title: i32) -> Option<i32> {
    let mut stack = vec![badge_scroll(mirror, title)?];
    while let Some(node) = stack.pop() {
-      if mirror.kind(node) == Some("flow")
+      if mirror.kind(node).is_some_and(|kind| kind.as_str() == "flow")
          && mirror.kids(node).iter().any(|kid| has_image(mirror, *kid))
       {
          return Some(node);

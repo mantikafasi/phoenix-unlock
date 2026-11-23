@@ -137,6 +137,8 @@ enum Press {
    Setting(usize, usize),
    /// Option `option` of a plugin's select setting.
    Choose(usize, usize, usize),
+   /// Apply the pending update in-app (OTA plugins / APK self-updater).
+   ApplyUpdate,
    /// The site, to get the update [`crate::update`] found.
    OpenSite,
    ToggleStaff,
@@ -567,6 +569,9 @@ fn act(job: &Job) {
             );
          }
       },
+      Job::Press(Press::ApplyUpdate) => {
+         crate::update::apply();
+      },
       Job::Press(Press::OpenSite) => {
          if let Err(err) = crate::picker::open(crate::update::SITE) {
             log::error!("opening {}: {err}", crate::update::SITE);
@@ -929,9 +934,8 @@ impl Settings {
          ) => {
             self.rerender_all(Some(press))
          },
-         Job::Submit(Field::Install | Field::Setting(..)) | Job::Press(Press::Reload(_)) => {
-            self.rerender_all(None)
-         },
+         Job::Submit(Field::Install | Field::Setting(..))
+         | Job::Press(Press::Reload(_) | Press::ApplyUpdate) => self.rerender_all(None),
          Job::Press(Press::Back) => self.close_top(),
          Job::Press(Press::Uninstall(_)) => {
             let mut ops = self.close_top();
@@ -1577,16 +1581,56 @@ fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
          .collect()
    };
    let enabled = plugins.iter().filter(|plugin| plugin.enabled).count();
-   let update = crate::update::found().map(|update| {
-      let what = update.loader.as_ref().map_or_else(
-         || format!("New plugin code: {}", update.plugins.join(", ")),
-         |version| format!("Phoenix Unlock {version}"),
-      );
-      let mut row = button_row(&what, ICON_RELOAD, Some(Press::OpenSite), true);
-      if let Some(label) = row.kids.first_mut().and_then(|row| row.kids.get_mut(1)) {
-         label.set(Prop::COLOR, Some(Value::I64(COLOR_STRING)));
+   let update_found = crate::update::found();
+   let update_status = crate::update::status();
+   let update_busy = crate::update::busy();
+   let update = (update_found.is_some() || update_status.is_some()).then(|| {
+      let mut update_rows = Vec::new();
+      if let Some(update) = &update_found {
+         let what = if update_busy {
+            update_status
+               .clone()
+               .unwrap_or_else(|| "Updating...".to_owned())
+         } else {
+            match (&update.loader, update.plugins.len()) {
+               (Some(version), 0) => format!("Install update ({version})"),
+               (Some(version), n) => format!(
+                  "Install update ({version}) + {n} plugin{}",
+                  if n == 1 { "" } else { "s" }
+               ),
+               (None, _) => format!("Update plugins now: {}", update.plugins.join(", ")),
+            }
+         };
+         let mut row = button_row(
+            &what,
+            ICON_RELOAD,
+            (!update_busy).then_some(Press::ApplyUpdate),
+            !update_busy,
+         );
+         if let Some(label) = row.kids.first_mut().and_then(|row| row.kids.get_mut(1)) {
+            let color = if update_busy { COLOR_ACCENT } else { COLOR_STRING };
+            label.set(Prop::COLOR, Some(Value::I64(color)));
+         }
+         update_rows.push(row);
       }
-      section("Update available", vec![row])
+      if let Some(status) = &update_status
+         && (!update_busy || update_found.is_none())
+      {
+         let mut line = log_line(vec![(status.clone(), COLOR_WARN)]);
+         line.set(Prop::FONT_FAMILY, None);
+         line.set(Prop::FONT_SIZE, Some(Value::F64(13.0)));
+         line.set(Prop::LINE_HEIGHT, Some(Value::F64(18.0)));
+         update_rows.push(line);
+      }
+      if update_found.is_some() {
+         update_rows.push(button_row(
+            "Open download page",
+            ICON_FILE,
+            Some(Press::OpenSite),
+            true,
+         ));
+      }
+      section("Update available", update_rows)
    });
    let debug_rows = vec![
       switch_row(

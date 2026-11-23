@@ -136,6 +136,7 @@ export async function buildPatchedApk({ base, abi, configs = [], keys, libraries
     if (e.name === 'AndroidManifest.xml') {
       const m = patchManifest(await entryData(e), { packageName, label });
       log(`manifest: removed ${m.removed} split attribute(s), splits.required=false: ${m.flipped}` +
+        (m.addedInstallPerm ? ', +REQUEST_INSTALL_PACKAGES' : '') +
         (m.renamed ? `, ${m.renamed} value(s) renamed to ${packageName}${label ? ` / "${label}"` : ''}` : ''));
       out.push(storedEntry(e.name, m.data));
     } else if (e.name === 'resources.arsc') {

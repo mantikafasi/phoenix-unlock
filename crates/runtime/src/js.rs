@@ -221,6 +221,9 @@ struct Registry<'js> {
    /// Active in-app notification banner tap callbacks (`phoenix.ui.notify`), by banner id.
    #[cfg(target_os = "android")]
    banners:       RefCell<HashMap<u32, (String, Function<'js>)>>,
+   /// Active raw JS-mounted subtrees (`phoenix.ui.mount`) and their callbacks, by mount id.
+   #[cfg(target_os = "android")]
+   mounts:        RefCell<HashMap<u32, (String, Vec<Function<'js>>)>>,
 }
 
 /// A contribution's plugin callbacks. `evaluate` is `render`, or `visible`
@@ -538,6 +541,35 @@ impl Engine {
       self.context.with(|ctx| {
          if let Some(registry) = ctx.userdata::<Registry<'_>>() {
             registry.banners.borrow_mut().remove(&id);
+         }
+      });
+   }
+
+   /// Runs callback `index` on raw JS-mounted subtree `mount`.
+   #[cfg(target_os = "android")]
+   pub fn mount_callback(&self, mount: u32, index: u32) {
+      self.context.with(|ctx| {
+         let Some((plugin, handler)) = ctx.userdata::<Registry<'_>>().and_then(|registry| {
+            let mounts = registry.mounts.borrow();
+            let (plugin, handlers) = mounts.get(&mount)?;
+            let handler = handlers.get(usize::try_from(index).ok()?)?;
+            Some((plugin.clone(), handler.clone()))
+         }) else {
+            return;
+         };
+         if let Err(err) = handler.call::<_, Value<'_>>(()).catch(&ctx) {
+            log::error!("[{plugin}] mount callback: {err}");
+         }
+      });
+      drain(&self.runtime);
+   }
+
+   /// Drops callbacks for an unmounted raw JS subtree.
+   #[cfg(target_os = "android")]
+   pub fn mount_closed(&self, mount: u32) {
+      self.context.with(|ctx| {
+         if let Some(registry) = ctx.userdata::<Registry<'_>>() {
+            registry.mounts.borrow_mut().remove(&mount);
          }
       });
    }
@@ -878,6 +910,17 @@ impl Engine {
                patches::dismiss_banner(id);
             }
             drop(banners);
+            let mut mounts = registry.mounts.borrow_mut();
+            let unmounted = mounts
+               .iter()
+               .filter(|(_, (plugin, _))| plugin == name)
+               .map(|(id, _)| *id)
+               .collect::<Vec<_>>();
+            for id in unmounted {
+               mounts.remove(&id);
+               patches::unmount(id);
+            }
+            drop(mounts);
             patches::forget(name);
          }
          let mut hooks = registry.hooks.borrow_mut();
@@ -1281,6 +1324,8 @@ fn registry<'js>(ctx: &Ctx<'js>, events: &GatewayRegistry) -> rquickjs::Result<R
       open_pages: RefCell::default(),
       #[cfg(target_os = "android")]
       banners: RefCell::default(),
+      #[cfg(target_os = "android")]
+      mounts: RefCell::default(),
    })
 }
 
@@ -1428,6 +1473,8 @@ fn api<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    api.set("stores", stores_object(ctx)?)?;
    #[cfg(target_os = "android")]
    api.set("discord", discord_object(ctx, plugin)?)?;
+   #[cfg(target_os = "android")]
+   api.set("bridge", bridge_object(ctx)?)?;
    #[cfg(target_os = "android")]
    api.set(
       "fetch",
@@ -2106,6 +2153,60 @@ fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>>
          }
       })?,
    )?;
+   ui.set(
+      "root",
+      Function::new(ctx.clone(), || patches::root_id())?,
+   )?;
+   let owner = plugin.to_owned();
+   ui.set(
+      "mount",
+      Function::new(
+         ctx.clone(),
+         move |ctx: Ctx<'js>,
+               parent: Value<'js>,
+               node: Object<'js>,
+               options: Opt<Object<'js>>| {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+            let parent_id = if parent.as_string().is_some_and(|s| s.to_string().ok().as_deref() == Some("root"))
+               || parent.is_null()
+               || parent.is_undefined()
+            {
+               None
+            } else if let Some(id) = parent.as_int() {
+               Some(id)
+            } else if let Some(num) = parent.as_float() {
+               #[expect(clippy::cast_possible_truncation, reason = "Phoenix node ids fit in i32")]
+               Some(num as i32)
+            } else {
+               return Err(Exception::throw_type(
+                  &ctx,
+                  "mount(parent, node) expects a node id or \"root\"",
+               ));
+            };
+            let before = match options.0.and_then(|opts| opts.get::<_, Value<'js>>("before").ok()) {
+               Some(val) if val.as_string().is_some_and(|s| s.to_string().ok().as_deref() == Some("start")) => {
+                  patches::MountBefore::Start
+               },
+               Some(val) if let Some(sib) = val.as_int() => patches::MountBefore::Node(sib),
+               Some(val) if let Some(num) = val.as_float() => {
+                  #[expect(clippy::cast_possible_truncation, reason = "Phoenix node ids fit in i32")]
+                  patches::MountBefore::Node(num as i32)
+               },
+               _ => patches::MountBefore::End,
+            };
+            let mut handlers = Vec::new();
+            let parsed = parse_mount_node(&ctx, &node, &mut handlers)?;
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ctx.userdata::<Registry<'js>>()
+               .ok_or_else(|| Exception::throw_internal(&ctx, "no registry"))?
+               .mounts
+               .borrow_mut()
+               .insert(id, (owner.clone(), handlers));
+            patches::mount(id, parent_id, before, parsed);
+            remover(&ctx, move |_| patches::unmount(id), None)
+         },
+      )?,
+   )?;
    let owner = plugin.to_owned();
    ui.set(
       "notify",
@@ -2519,6 +2620,165 @@ fn is_float_prop(name: &str) -> bool {
 }
 
 #[cfg(target_os = "android")]
+fn is_rect_prop(name: &str) -> bool {
+   matches!(
+      name,
+      "padding"
+         | "margin"
+         | "activePadding"
+         | "activeMargin"
+         | "rangeInsets"
+         | "scrollIndicatorInsets"
+   )
+}
+
+#[cfg(target_os = "android")]
+fn parse_rect<'js>(value: &Value<'js>) -> Option<phoenix_wire::Value> {
+   if let Some(num) = value.as_number() {
+      let v = num as f32;
+      return Some(phoenix_wire::Value::Rect([v, v, v, v]));
+   }
+   let arr = value.as_array()?;
+   if arr.len() != 4 {
+      return None;
+   }
+   let mut out = [0.0f32; 4];
+   for (i, slot) in out.iter_mut().enumerate() {
+      *slot = arr.get::<Value<'js>>(i).ok()?.as_number()? as f32;
+   }
+   Some(phoenix_wire::Value::Rect(out))
+}
+
+#[cfg(target_os = "android")]
+fn parse_mount_node<'js>(
+   ctx: &Ctx<'js>,
+   object: &Object<'js>,
+   handlers: &mut Vec<Function<'js>>,
+) -> rquickjs::Result<patches::MountNode> {
+   let kind_str = object
+      .get::<_, Option<String>>("kind")?
+      .unwrap_or_else(|| "view".to_owned());
+   let mut props = match object.get::<_, Option<Object<'js>>>("props")? {
+      Some(props_obj) => parse_props(ctx, &props_obj, None)?,
+      None => Vec::new(),
+   };
+   let on_press = match object.get::<_, Option<Function<'js>>>("onPress")? {
+      Some(cb) => {
+         #[expect(clippy::cast_possible_truncation, reason = "mounted trees have few callbacks")]
+         let idx = handlers.len() as u32;
+         handlers.push(cb);
+         // Automatically wire `on: ["press"]` if the caller didn't add it manually.
+         let has_press = props.iter().any(|(k, v)| {
+            *k == phoenix_ui::Prop::ON
+               && matches!(v, phoenix_wire::Value::Arr(arr) if arr.iter().any(|x| x.as_str() == Some("press")))
+         });
+         if !has_press {
+            let mut on = props
+               .iter()
+               .find(|(k, _)| *k == phoenix_ui::Prop::ON)
+               .and_then(|(_, v)| match v {
+                  phoenix_wire::Value::Arr(arr) => Some(arr.clone()),
+                  _ => None,
+               })
+               .unwrap_or_default();
+            on.push(phoenix_wire::Value::Str("press".to_owned()));
+            phoenix_ui::set_prop(&mut props, phoenix_ui::Prop::ON, Some(phoenix_wire::Value::Arr(on)));
+         }
+         Some(idx)
+      },
+      None => None,
+   };
+   let on_dismiss = match object.get::<_, Option<Function<'js>>>("onDismiss")? {
+      Some(cb) => {
+         #[expect(clippy::cast_possible_truncation, reason = "mounted trees have few callbacks")]
+         let idx = handlers.len() as u32;
+         handlers.push(cb);
+         Some(idx)
+      },
+      None => None,
+   };
+   let kids = match object.get::<_, Option<Vec<Object<'js>>>>("children")? {
+      Some(raw_kids) => raw_kids
+         .iter()
+         .map(|kid| parse_mount_node(ctx, kid, handlers))
+         .collect::<rquickjs::Result<Vec<_>>>()?,
+      None => Vec::new(),
+   };
+   Ok(patches::MountNode {
+      kind: kind_str.into(),
+      props,
+      kids,
+      on_press,
+      on_dismiss,
+   })
+}
+
+/// `phoenix.bridge`, raw access to Phoenix's host modules (`GuestHost.invoke`).
+#[cfg(target_os = "android")]
+fn bridge_object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+   let obj = Object::new(ctx.clone())?;
+   obj.set(
+      "invoke",
+      Function::new(
+         ctx.clone(),
+         |ctx: Ctx<'js>,
+          module: u16,
+          method: u16,
+          args: Opt<Value<'js>>,
+          body: Opt<String>| {
+            let wire_args = match args.0 {
+               Some(val) if !val.is_undefined() && !val.is_null() => {
+                  js_to_host_wire(&ctx, val)?
+               },
+               _ => phoenix_wire::Value::Obj(Vec::new()),
+            };
+            let call = phoenix_wire::HostCall {
+               module,
+               method,
+               args: wire_args,
+               body: body.0.map_or_else(Vec::new, String::into_bytes),
+            };
+            Ok::<_, rquickjs::Error>(crate::bridge::invoke(&call.encode()))
+         },
+      )?,
+   )?;
+   Ok(obj)
+}
+
+#[cfg(target_os = "android")]
+fn js_to_host_wire<'js>(
+   ctx: &Ctx<'js>,
+   value: Value<'js>,
+) -> rquickjs::Result<phoenix_wire::Value> {
+   if let Some(object) = value.as_object()
+      && !value.is_array()
+   {
+      let mut fields = Vec::new();
+      for entry in object.props::<String, Value<'js>>() {
+         let (name, field_value) = entry?;
+         if field_value.is_undefined() {
+            continue;
+         }
+         let key = if let Ok(num) = name.parse::<u16>() {
+            phoenix_wire::Key::new(num)
+         } else {
+            phoenix_ui::Prop::from_str(&name)
+               .map(phoenix_ui::Prop::key)
+               .map_err(|_| {
+                  Exception::throw_type(
+                     ctx,
+                     &format!("unknown host field key {name:?} (pass numeric hh.jb key or known prop name)"),
+                  )
+               })?
+         };
+         fields.push((key, js_to_host_wire(ctx, field_value)?));
+      }
+      return Ok(phoenix_wire::Value::Obj(fields));
+   }
+   js_to_wire(ctx, value)
+}
+
+#[cfg(target_os = "android")]
 fn parse_props<'js>(
    ctx: &Ctx<'js>,
    object: &Object<'js>,
@@ -2532,7 +2792,11 @@ fn parse_props<'js>(
       }
       let prop = phoenix_ui::Prop::from_str(&name)
          .map_err(|_| Exception::throw_type(ctx, &format!("unknown Phoenix prop {name:?}")))?;
-      let wire = if is_float_prop(&name)
+      let wire = if is_rect_prop(&name)
+         && let Some(rect) = parse_rect(&value)
+      {
+         rect
+      } else if is_float_prop(&name)
          && let Some(num) = value.as_number()
       {
          phoenix_wire::Value::F64(num)
@@ -2648,6 +2912,7 @@ fn json_parser_fn<'js>(ctx: &Ctx<'js>, source: String) -> rquickjs::Result<Funct
 fn node_info_object<'js>(ctx: &Ctx<'js>, info: &NodeInfo) -> rquickjs::Result<Object<'js>> {
    let obj = Object::new(ctx.clone())?;
    obj.set("id", info.id)?;
+   obj.set("kind", info.kind.clone())?;
    obj.set("accessibilityId", info.accessibility_id.clone())?;
    obj.set("parent", info.parent)?;
    obj.set("children", info.children.clone())?;
