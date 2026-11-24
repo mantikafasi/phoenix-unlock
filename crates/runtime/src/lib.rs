@@ -6,45 +6,46 @@
 //! a plugin's hook turns its event on.
 
 use std::{
-   path::{
-      Path,
-      PathBuf,
-   },
-   sync::{
-      Mutex,
-      OnceLock,
-   },
+   path::{Path, PathBuf},
+   sync::{Mutex, OnceLock},
 };
 
-use phoenix_hook::image::{
-   BuildId,
-   Image,
-};
+use phoenix_hook::image::{BuildId, Image};
 use phoenix_sigs::{
    LIBRARIES,
-   registry::{
-      self,
-      GatewayRegistry,
-   },
+   registry::{self, GatewayRegistry},
 };
 
-#[cfg(target_os = "android")] mod bridge;
+#[cfg(target_os = "android")]
+mod bridge;
 pub mod console;
-#[cfg(target_os = "android")] mod discord;
-#[cfg(target_os = "android")] mod fetch;
+#[cfg(target_os = "android")]
+mod discord;
+#[cfg(target_os = "android")]
+mod fetch;
 mod gateway;
-#[cfg(target_os = "android")] mod highlight;
+#[cfg(target_os = "android")]
+mod highlight;
 mod js;
-#[cfg(target_os = "android")] mod jvm;
+#[cfg(target_os = "android")]
+mod jvm;
 mod local;
-#[cfg(target_os = "android")] mod patches;
-#[cfg(target_os = "android")] mod picker;
-#[cfg(target_os = "android")] mod remote;
-#[cfg(target_os = "android")] mod settings;
-#[cfg(target_os = "android")] mod socket;
+#[cfg(target_os = "android")]
+mod patches;
+#[cfg(target_os = "android")]
+mod picker;
+#[cfg(target_os = "android")]
+mod remote;
+#[cfg(target_os = "android")]
+mod settings;
+#[cfg(target_os = "android")]
+mod socket;
 mod staff;
-#[cfg(target_os = "android")] mod store;
-#[cfg(target_os = "android")] mod update;
+#[cfg(target_os = "android")]
+mod store;
+pub mod themes;
+#[cfg(target_os = "android")]
+mod update;
 
 #[derive(Debug, flub::Error)]
 pub enum Error {
@@ -56,7 +57,7 @@ pub enum Error {
    NotStarted,
    #[error("{path}: {source}")]
    Io {
-      path:   PathBuf,
+      path: PathBuf,
       #[source]
       source: std::io::Error,
    },
@@ -66,9 +67,9 @@ pub enum Error {
    Registry(#[from] registry::Error),
    #[error("{event}: the registry slot held {found:#x}, the walk read {expected:#x}")]
    SwapConflict {
-      event:    String,
+      event: String,
       expected: usize,
-      found:    usize,
+      found: usize,
    },
    #[error(transparent)]
    Hook(#[from] phoenix_hook::Error),
@@ -83,39 +84,41 @@ pub enum Error {
    Fetch(#[from] fetch::FetchError),
    #[error("update Phoenix Unlock to {version} first, the site's plugins need it")]
    LoaderOutdated { version: String },
+   #[error("{message}")]
+   Theme { message: String },
 }
 
 struct State {
    image: Image<'static>,
-   home:  PathBuf,
-   js:    Mutex<js::Engine>,
+   home: PathBuf,
+   js: Mutex<js::Engine>,
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
 
 /// A plugin bundle, an esbuild IIFE that receives the `phoenix` API.
 pub struct Plugin {
-   pub name:   String,
+   pub name: String,
    pub source: String,
 }
 
 /// A plugin as the settings page shows it.
 #[derive(Clone, Debug)]
 pub struct PluginInfo {
-   pub name:      String,
-   pub enabled:   bool,
-   pub error:     Option<String>,
+   pub name: String,
+   pub enabled: bool,
+   pub error: Option<String>,
    pub installed: bool,
-   pub header:    Header,
-   pub settings:  Vec<Setting>,
+   pub header: Header,
+   pub settings: Vec<Setting>,
 }
 
 /// The `// @key value` lines a bundle starts with.
 #[derive(Clone, Debug, Default)]
 pub struct Header {
    pub description: Option<String>,
-   pub version:     Option<String>,
-   pub author:      Option<String>,
+   pub version: Option<String>,
+   pub author: Option<String>,
    /// `// @enabled false`, for plugins that stay off until the user turns
    /// them on.
    pub default_off: bool,
@@ -155,10 +158,10 @@ impl From<&str> for Header {
 /// A plugin setting as the user currently has it.
 #[derive(Clone, Debug)]
 pub struct Setting {
-   pub key:         String,
-   pub title:       String,
+   pub key: String,
+   pub title: String,
    pub description: Option<String>,
-   pub control:     Control,
+   pub control: Control,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -169,7 +172,7 @@ pub enum Control {
    Secret(String),
    Select {
       options: Vec<Choice>,
-      chosen:  String,
+      chosen: String,
    },
    Number(f64),
    Button,
@@ -334,10 +337,8 @@ pub fn evaluate(code: &str) {
 /// plugin of the same name. Returns the plugin's name.
 #[cfg(target_os = "android")]
 pub fn install(url: &str) -> Result<String, Error> {
-   let bad_url = || {
-      Error::PluginUrl {
-         url: url.to_owned(),
-      }
+   let bad_url = || Error::PluginUrl {
+      url: url.to_owned(),
    };
    let rest = url.strip_prefix("https://").ok_or_else(bad_url)?;
    let path = rest.split(['?', '#']).next().unwrap_or_default();
@@ -348,10 +349,8 @@ pub fn install(url: &str) -> Result<String, Error> {
       .ok_or_else(bad_url)?;
 
    let body = fetch::get(url)?;
-   let source = String::from_utf8(body).map_err(|_| {
-      Error::NotUtf8 {
-         url: url.to_owned(),
-      }
+   let source = String::from_utf8(body).map_err(|_| Error::NotUtf8 {
+      url: url.to_owned(),
    })?;
    save_source(name, source)?;
    Ok(name.to_owned())
@@ -372,15 +371,11 @@ fn plugin_name(file: &str) -> Option<&str> {
 /// Returns the plugin's name.
 #[cfg(target_os = "android")]
 pub fn install_file(file: &str, bytes: Vec<u8>) -> Result<String, Error> {
-   let name = plugin_name(file).ok_or_else(|| {
-      Error::PluginFile {
-         name: file.to_owned(),
-      }
+   let name = plugin_name(file).ok_or_else(|| Error::PluginFile {
+      name: file.to_owned(),
    })?;
-   let source = String::from_utf8(bytes).map_err(|_| {
-      Error::NotUtf8 {
-         url: file.to_owned(),
-      }
+   let source = String::from_utf8(bytes).map_err(|_| Error::NotUtf8 {
+      url: file.to_owned(),
    })?;
    save_source(name, source)?;
    Ok(name.to_owned())
@@ -430,8 +425,8 @@ pub fn reload(name: &str) {
 
 /// What [`start`] found and loaded.
 pub struct Started {
-   pub target:  String,
-   pub build:   Option<BuildId>,
+   pub target: String,
+   pub build: Option<BuildId>,
    pub plugins: Vec<String>,
 }
 
@@ -460,6 +455,7 @@ pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    STATE.set(state).map_err(|_| Error::AlreadyStarted)?;
    let state = STATE.get().expect("STATE was set above");
 
+   themes::load_at_boot();
    let plugins = js::load_plugins(state, bundled)?;
    #[cfg(target_os = "android")]
    {
@@ -468,6 +464,7 @@ pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
       }
       settings::start();
       patches::start();
+      themes::start();
       bridge::install(Box::new(socket::Socket));
    }
    Ok(Started {
@@ -502,10 +499,8 @@ impl State {
 }
 
 fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
-   move |source| {
-      Error::Io {
-         path: path.to_owned(),
-         source,
-      }
+   move |source| Error::Io {
+      path: path.to_owned(),
+      source,
    }
 }

@@ -1,45 +1,20 @@
 //! Builds, rerenders and closes phoenix's pages on the navigator.
 
 use phoenix_ui::{
-   Op,
-   Prop,
-   Props,
-   motion::{
-      self,
-      Spring,
-   },
-   prop,
-   templates,
+   Op, Prop, Props,
+   motion::{self, Spring},
+   prop, templates,
 };
 use phoenix_wire::Value;
 
 use crate::settings::{
-   Field,
-   Job,
-   Page,
-   PageKind,
-   Press,
-   Settings,
-   Slot,
-   TITLE,
-   code::{
-      code_sections,
-      code_spans,
-   },
-   console::{
-      console_sections,
-      log_lines,
-   },
-   pages::{
-      install_sections,
-      main_sections,
-   },
+   Field, Job, Page, PageKind, Press, Settings, Slot, TITLE,
+   code::{code_sections, code_spans},
+   console::{console_sections, log_lines},
+   pages::{install_sections, main_sections},
    plugin::plugin_sections,
-   tree::{
-      Tree,
-      same_shape,
-      text,
-   },
+   themes::{theme_detail_sections, themes_sections},
+   tree::{Tree, same_shape, text},
 };
 
 /// Ids Phoenix's captured page layout uses for the parts phoenix fills in.
@@ -97,7 +72,7 @@ impl Settings {
       }
       if !kids.is_empty() {
          ops.push(Op::Children {
-            id:  tree.id,
+            id: tree.id,
             ids: kids,
          });
       }
@@ -121,13 +96,16 @@ impl Settings {
       };
       let mut ids = screen.rust_pages.clone().unwrap_or_default();
       ids.extend(screen.stack.iter().map(|page| page.root));
-      vec![Op::Children { id: navigator, ids }, Op::Update {
-         id:    navigator,
-         props: vec![(
-            Prop::INDEX,
-            Value::I32(i32::try_from(self.page_index()).unwrap_or(i32::MAX)),
-         )],
-      }]
+      vec![
+         Op::Children { id: navigator, ids },
+         Op::Update {
+            id: navigator,
+            props: vec![(
+               Prop::INDEX,
+               Value::I32(i32::try_from(self.page_index()).unwrap_or(i32::MAX)),
+            )],
+         },
+      ]
    }
 
    fn slots(&self) -> impl Iterator<Item = (i32, Slot)> + '_ {
@@ -139,11 +117,9 @@ impl Settings {
    }
 
    pub fn field(&self, node: i32) -> Option<Field> {
-      self.slots().find_map(|(id, slot)| {
-         match slot {
-            Slot::Input(field) if id == node => Some(field),
-            _ => None,
-         }
+      self.slots().find_map(|(id, slot)| match slot {
+         Slot::Input(field) if id == node => Some(field),
+         _ => None,
       })
    }
 
@@ -217,18 +193,14 @@ impl Settings {
       match job {
          Job::Draft(field, draft) => {
             let ops = match field {
-               Field::Code(_) => {
-                  self
-                     .slots()
-                     .filter(|(_, slot)| *slot == Slot::Input(field))
-                     .map(|(id, _)| {
-                        Op::Update {
-                           id,
-                           props: vec![(prop!("valueSpans"), code_spans(&draft))],
-                        }
-                     })
-                     .collect()
-               },
+               Field::Code(_) => self
+                  .slots()
+                  .filter(|(_, slot)| *slot == Slot::Input(field))
+                  .map(|(id, _)| Op::Update {
+                     id,
+                     props: vec![(prop!("valueSpans"), code_spans(&draft))],
+                  })
+                  .collect(),
                _ => Vec::new(),
             };
             self.drafts.insert(field, draft);
@@ -240,13 +212,20 @@ impl Settings {
             ops.extend(self.clear_ops(Field::Eval));
             ops
          },
-         Job::Submit(Field::Code(_)) | Job::Press(Press::PickFile | Press::OpenSite) => Vec::new(),
+         Job::Submit(Field::Code(_))
+         | Job::Press(Press::PickFile | Press::PickThemeFile | Press::OpenSite) => Vec::new(),
          Job::Refresh
          | Job::Press(
-            Press::SaveCode(_) | Press::Reload(_) | Press::ApplyUpdate | Press::Listed(_),
+            Press::SaveCode(_)
+            | Press::Reload(_)
+            | Press::ApplyUpdate
+            | Press::Listed(_)
+            | Press::ClearTheme,
          )
          | Job::Picked(_)
-         | Job::Submit(Field::Install | Field::Setting(..)) => self.rerender_all(None),
+         | Job::Submit(Field::Install | Field::InstallTheme | Field::Setting(..)) => {
+            self.rerender_all(None)
+         },
          Job::Press(Press::OpenMain) => self.open_page(PageKind::Main),
          Job::Press(Press::OpenConsole) => {
             let mut ops = self.open_page(PageKind::Console);
@@ -258,16 +237,22 @@ impl Settings {
             self.install_status = None;
             self.open_page(PageKind::Install)
          },
+         Job::Press(Press::OpenThemes) => {
+            self.theme_status = None;
+            self.open_page(PageKind::Themes)
+         },
+         Job::Press(Press::OpenTheme(index)) => self.open_page(PageKind::Theme(index)),
          Job::Press(Press::EditCode(index)) => self.open_page(PageKind::Code(index)),
          Job::Press(
             press @ (Press::Toggle(_)
+            | Press::ToggleTheme(_)
             | Press::Setting(..)
             | Press::Choose(..)
             | Press::ToggleStaff
             | Press::ToggleRemoteShell),
          ) => self.rerender_all(Some(press)),
          Job::Press(Press::Back) => self.close_top(),
-         Job::Press(Press::Uninstall(_)) => {
+         Job::Press(Press::Uninstall(_) | Press::UninstallTheme(_)) => {
             let mut ops = self.close_top();
             ops.extend(self.rerender_all(None));
             ops
@@ -291,12 +276,18 @@ impl Settings {
       match kind {
          PageKind::Main => (TITLE.to_owned(), main_sections(&self.plugins)),
          PageKind::Console => ("Console".to_owned(), console_sections()),
-         PageKind::Install => {
-            (
-               "Install plugin".to_owned(),
-               install_sections(self.install_status.as_ref(), &self.plugins),
-            )
-         },
+         PageKind::Install => (
+            "Install plugin".to_owned(),
+            install_sections(self.install_status.as_ref(), &self.plugins),
+         ),
+         PageKind::Themes => (
+            "Themes".to_owned(),
+            themes_sections(self.theme_status.as_ref(), &self.themes),
+         ),
+         PageKind::Theme(index) => self.themes.get(index).map_or_else(
+            || ("Theme".to_owned(), Vec::new()),
+            |theme| (theme.name.clone(), theme_detail_sections(index, theme)),
+         ),
          PageKind::Code(index) => {
             let source = self.drafts.get(&Field::Code(index)).map(String::as_str);
             let name = self
@@ -305,12 +296,10 @@ impl Settings {
                .map_or("plugin", |plugin| plugin.name.as_str());
             ("Edit code".to_owned(), code_sections(index, name, source))
          },
-         PageKind::Plugin(index) => {
-            self.plugins.get(index).map_or_else(
-               || ("Plugin".to_owned(), Vec::new()),
-               |plugin| (plugin.name.clone(), plugin_sections(index, plugin)),
-            )
-         },
+         PageKind::Plugin(index) => self.plugins.get(index).map_or_else(
+            || ("Plugin".to_owned(), Vec::new()),
+            |plugin| (plugin.name.clone(), plugin_sections(index, plugin)),
+         ),
       }
    }
 
@@ -380,7 +369,7 @@ impl Settings {
          page.ids.retain(|id| !old.contains(id));
          page.ids.extend(ids);
          ops.push(Op::Children {
-            id:  page.content,
+            id: page.content,
             ids: roots,
          });
          ops.push(Op::Delete { ids: old.clone() });
@@ -412,7 +401,7 @@ impl Settings {
             .collect::<Props>();
          if !changed.is_empty() {
             ops.push(Op::Update {
-               id:    old.id,
+               id: old.id,
                props: changed,
             });
          }

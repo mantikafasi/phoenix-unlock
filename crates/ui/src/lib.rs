@@ -4,32 +4,19 @@
 //! A batch is a version byte followed by ops until the end of the buffer. Op
 //! values use the bridge's tagged format from `phoenix_wire`.
 
-use std::{
-   fmt,
-   str::FromStr,
-   sync::OnceLock,
-};
+use std::{fmt, str::FromStr, sync::OnceLock};
 
 use phoenix_wire::{
-   DecodeError as WireError,
-   Key,
-   Reader,
-   Value,
-   put_i32_len,
-   put_ints,
-   put_u16_len,
-   put_value,
+   DecodeError as WireError, Key, Reader, Value, put_i32_len, put_ints, put_u16_len, put_value,
 };
-use serde::{
-   Deserialize,
-   Serialize,
-};
+use serde::{Deserialize, Serialize};
 
 use crate::motion::Worklet;
 
 pub mod inspect;
 pub mod mirror;
 pub mod motion;
+pub mod themes;
 
 /// The prop and event name table (`lh/c2.a`, versionCode 356207). The index is
 /// the wire key.
@@ -55,6 +42,7 @@ impl Prop {
    pub const ACCESSIBILITY_CHECKED: Self = Self::named("accessibilityChecked");
    pub const ACCESSIBILITY_ID: Self = Self::named("accessibilityId");
    pub const ACCESSIBILITY_LABEL: Self = Self::named("accessibilityLabel");
+   pub const BACKGROUND: Self = Self::named("background");
    pub const CHANGE_TEXT: Self = Self::named("changeText");
    pub const COLOR: Self = Self::named("color");
    pub const FONT_FAMILY: Self = Self::named("fontFamily");
@@ -232,18 +220,18 @@ view_kinds! {
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Op {
    Create {
-      id:    i32,
-      kind:  ViewKind,
+      id: i32,
+      kind: ViewKind,
       #[serde(serialize_with = "inspect::props")]
       props: Props,
    },
    Update {
-      id:    i32,
+      id: i32,
       #[serde(serialize_with = "inspect::props")]
       props: Props,
    },
    Children {
-      id:  i32,
+      id: i32,
       ids: Vec<i32>,
    },
    Delete {
@@ -256,7 +244,7 @@ pub enum Op {
       id: Option<i32>,
    },
    ScrollTo {
-      id:    i32,
+      id: i32,
       #[serde(serialize_with = "inspect::value")]
       value: Value,
    },
@@ -266,7 +254,7 @@ pub enum Op {
       words: Vec<i32>,
    },
    ChildEdits {
-      id:    i32,
+      id: i32,
       edits: Vec<ChildEdit>,
    },
 }
@@ -276,8 +264,8 @@ pub enum Op {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ChildEdit {
    pub keep: i32,
-   pub del:  i32,
-   pub ins:  Vec<i32>,
+   pub del: i32,
+   pub ins: Vec<i32>,
 }
 
 #[derive(Debug, flub::Error)]
@@ -317,44 +305,32 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Op>, DecodeError> {
                props: read_props(&mut reader)?,
             }
          },
-         2 => {
-            Op::Update {
-               id:    reader.i32()?,
-               props: read_props(&mut reader)?,
-            }
+         2 => Op::Update {
+            id: reader.i32()?,
+            props: read_props(&mut reader)?,
          },
-         3 => {
-            Op::Children {
-               id:  reader.i32()?,
-               ids: reader.ints()?,
-            }
+         3 => Op::Children {
+            id: reader.i32()?,
+            ids: reader.ints()?,
          },
-         4 => {
-            Op::Delete {
-               ids: reader.ints()?,
-            }
+         4 => Op::Delete {
+            ids: reader.ints()?,
          },
          5 => Op::Root { id: reader.i32()? },
-         6 => {
-            Op::Focus {
-               id: if reader.u8()? == 0 {
-                  None
-               } else {
-                  Some(reader.i32()?)
-               },
-            }
+         6 => Op::Focus {
+            id: if reader.u8()? == 0 {
+               None
+            } else {
+               Some(reader.i32()?)
+            },
          },
-         7 => {
-            Op::ScrollTo {
-               id:    reader.i32()?,
-               value: reader.value()?,
-            }
+         7 => Op::ScrollTo {
+            id: reader.i32()?,
+            value: reader.value()?,
          },
          8 => Op::RequestFrame,
-         9 => {
-            Op::Motion {
-               words: reader.ints()?,
-            }
+         9 => Op::Motion {
+            words: reader.ints()?,
          },
          10 => {
             let id = reader.i32()?;
@@ -362,8 +338,8 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Op>, DecodeError> {
                .map(|_| {
                   Ok(ChildEdit {
                      keep: reader.i32()?,
-                     del:  reader.i32()?,
-                     ins:  reader.ints()?,
+                     del: reader.i32()?,
+                     ins: reader.ints()?,
                   })
                })
                .collect::<Result<_, WireError>>()?;
@@ -468,56 +444,56 @@ pub fn set_prop(props: &mut Props, key: Prop, value: Option<Value>) {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
-   pub kind:  ViewKind,
+   pub kind: ViewKind,
    pub props: Props,
-   pub kids:  Vec<Self>,
-   pub src:   Option<u32>,
+   pub kids: Vec<Self>,
+   pub src: Option<u32>,
 }
 
 /// Phoenix's own settings layouts, captured from versionCode 356207.
 #[derive(Debug)]
 pub struct Templates {
-   pub section:       Node,
-   pub header:        Node,
-   pub group:         Node,
-   pub switch_row:    Node,
-   pub divider:       Node,
-   pub button_row:    Node,
-   pub value_row:     Node,
-   pub input:         Node,
-   pub page:          Node,
-   pub track_off:     Props,
-   pub knob_off:      Props,
+   pub section: Node,
+   pub header: Node,
+   pub group: Node,
+   pub switch_row: Node,
+   pub divider: Node,
+   pub button_row: Node,
+   pub value_row: Node,
+   pub input: Node,
+   pub page: Node,
+   pub track_off: Props,
+   pub knob_off: Props,
    pub track_worklet: Worklet,
-   pub knob_worklet:  Worklet,
+   pub knob_worklet: Worklet,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawTemplates {
-   section:       RawNode,
-   header:        RawNode,
-   group:         RawNode,
-   switch_row:    RawNode,
-   divider:       RawNode,
-   button_row:    RawNode,
-   value_row:     RawNode,
-   input:         RawNode,
-   page:          RawNode,
-   track_off:     Vec<RawEntry>,
-   knob_off:      Vec<RawEntry>,
+   section: RawNode,
+   header: RawNode,
+   group: RawNode,
+   switch_row: RawNode,
+   divider: RawNode,
+   button_row: RawNode,
+   value_row: RawNode,
+   input: RawNode,
+   page: RawNode,
+   track_off: Vec<RawEntry>,
+   knob_off: Vec<RawEntry>,
    track_worklet: Vec<i32>,
-   knob_worklet:  Vec<i32>,
+   knob_worklet: Vec<i32>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawNode {
    #[serde(rename = "type")]
-   kind:  String,
+   kind: String,
    props: Vec<RawEntry>,
-   kids:  Vec<Self>,
-   src:   Option<u32>,
+   kids: Vec<Self>,
+   src: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -530,7 +506,7 @@ struct RawEntry {
 #[derive(Deserialize)]
 struct RawPatch {
    list: i32,
-   set:  Vec<(u16, i32)>,
+   set: Vec<(u16, i32)>,
 }
 
 #[derive(Deserialize)]
@@ -558,39 +534,31 @@ impl From<RawValue> for Value {
          RawValue::False => Self::Bool(false),
          RawValue::True => Self::Bool(true),
          RawValue::I32(int) => Self::I32(int),
-         RawValue::I64(text) => {
-            Self::I64(
-               text
-                  .parse()
-                  .unwrap_or_else(|err| panic!("templates.json: i64 {text:?}: {err}")),
-            )
-         },
+         RawValue::I64(text) => Self::I64(
+            text
+               .parse()
+               .unwrap_or_else(|err| panic!("templates.json: i64 {text:?}: {err}")),
+         ),
          RawValue::F64(float) => Self::F64(float),
          RawValue::Str(text) => Self::Str(text),
          RawValue::Arr(items) => Self::Arr(items.into_iter().map(Self::from).collect()),
-         RawValue::Obj(entries) => {
-            Self::Obj(
-               props(entries)
-                  .into_iter()
-                  .map(|(prop, value)| (prop.key(), value))
-                  .collect(),
-            )
-         },
+         RawValue::Obj(entries) => Self::Obj(
+            props(entries)
+               .into_iter()
+               .map(|(prop, value)| (prop.key(), value))
+               .collect(),
+         ),
          RawValue::Rect(rect) => Self::Rect(rect),
-         RawValue::Map(entries) => {
-            Self::Map(
-               entries
-                  .into_iter()
-                  .map(|entry| (entry.k, entry.v.into()))
-                  .collect(),
-            )
-         },
+         RawValue::Map(entries) => Self::Map(
+            entries
+               .into_iter()
+               .map(|entry| (entry.k, entry.v.into()))
+               .collect(),
+         ),
          RawValue::Words(words) => Self::Words(words),
-         RawValue::Wpatch(patch) => {
-            Self::WPatch {
-               list: patch.list,
-               set:  patch.set,
-            }
+         RawValue::Wpatch(patch) => Self::WPatch {
+            list: patch.list,
+            set: patch.set,
          },
       }
    }
@@ -612,10 +580,10 @@ fn props(entries: Vec<RawEntry>) -> Props {
 impl From<RawNode> for Node {
    fn from(raw: RawNode) -> Self {
       Self {
-         kind:  raw.kind.into(),
+         kind: raw.kind.into(),
          props: props(raw.props),
-         kids:  raw.kids.into_iter().map(Self::from).collect(),
-         src:   raw.src,
+         kids: raw.kids.into_iter().map(Self::from).collect(),
+         src: raw.src,
       }
    }
 }
@@ -627,20 +595,20 @@ pub fn templates() -> &'static Templates {
          .unwrap_or_else(|err| panic!("templates.json: {err}"));
 
       Templates {
-         section:       raw.section.into(),
-         header:        raw.header.into(),
-         group:         raw.group.into(),
-         switch_row:    raw.switch_row.into(),
-         divider:       raw.divider.into(),
-         button_row:    raw.button_row.into(),
-         value_row:     raw.value_row.into(),
-         input:         raw.input.into(),
-         page:          raw.page.into(),
-         track_off:     props(raw.track_off),
-         knob_off:      props(raw.knob_off),
+         section: raw.section.into(),
+         header: raw.header.into(),
+         group: raw.group.into(),
+         switch_row: raw.switch_row.into(),
+         divider: raw.divider.into(),
+         button_row: raw.button_row.into(),
+         value_row: raw.value_row.into(),
+         input: raw.input.into(),
+         page: raw.page.into(),
+         track_off: props(raw.track_off),
+         knob_off: props(raw.knob_off),
          track_worklet: Worklet::try_from(raw.track_worklet)
             .unwrap_or_else(|err| panic!("templates.json trackWorklet: {err}")),
-         knob_worklet:  Worklet::try_from(raw.knob_worklet)
+         knob_worklet: Worklet::try_from(raw.knob_worklet)
             .unwrap_or_else(|err| panic!("templates.json knobWorklet: {err}")),
       }
    })

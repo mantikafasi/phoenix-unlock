@@ -12,63 +12,26 @@
 //! never see phoenix's own calls.
 
 use std::{
-   ffi::{
-      CStr,
-      c_void,
-   },
+   ffi::{CStr, c_void},
    mem::offset_of,
-   panic::{
-      AssertUnwindSafe,
-      catch_unwind,
-   },
+   panic::{AssertUnwindSafe, catch_unwind},
    ptr,
    sync::{
-      Mutex,
-      OnceLock,
-      PoisonError,
-      RwLock,
-      atomic::{
-         AtomicBool,
-         AtomicPtr,
-         Ordering,
-      },
+      Mutex, OnceLock, PoisonError, RwLock,
+      atomic::{AtomicBool, AtomicPtr, Ordering},
    },
 };
 
 use jni_sys::{
-   _jmethodID,
-   _jobject,
-   JNI_FALSE,
-   JNI_OK,
-   JNI_TRUE,
-   JNI_VERSION_1_6,
-   JNIEnv,
-   JNINativeInterface__1_6,
-   JNINativeMethod,
-   jboolean,
-   jbyteArray,
-   jclass,
-   jlong,
-   jmethodID,
-   jobject,
-   jvalue,
+   _jmethodID, _jobject, JNI_FALSE, JNI_OK, JNI_TRUE, JNI_VERSION_1_6, JNIEnv,
+   JNINativeInterface__1_6, JNINativeMethod, jboolean, jbyteArray, jclass, jlong, jmethodID,
+   jobject, jvalue,
 };
 use phoenix_hook::image::swap_words;
 
 use crate::{
    discord,
-   jvm::{
-      SAVED,
-      Table,
-      clear_exception,
-      env,
-      jni,
-      new_bytes,
-      read_bytes,
-      read_string,
-      table,
-      vm,
-   },
+   jvm::{SAVED, Table, clear_exception, env, jni, new_bytes, read_bytes, read_string, table, vm},
    remote::Trace,
 };
 
@@ -457,6 +420,10 @@ unsafe extern "system" fn call_object_method_a(
                method: method_id,
             });
          }
+         if crate::themes::wants(&head) {
+            let frame = read_bytes(env, request, None);
+            crate::themes::observe_call(&frame);
+         }
          if discord::wants(&head) {
             let frame = read_bytes(env, request, None);
             match discord::intercept_call(&frame) {
@@ -635,9 +602,9 @@ unsafe fn bind_natives(env: *mut JNIEnv, guest_host: jobject) {
          return;
       };
       let entry = JNINativeMethod {
-         name:      c"nativeDispatch".as_ptr().cast_mut(),
+         name: c"nativeDispatch".as_ptr().cast_mut(),
          signature: c"(J[B)Z".as_ptr().cast_mut(),
-         fnPtr:     (native_dispatch as *const ()).cast_mut().cast(),
+         fnPtr: (native_dispatch as *const ()).cast_mut().cast(),
       };
       if jni!(env, RegisterNatives, runtime, &raw const entry, 1) != JNI_OK {
          clear_exception(env);

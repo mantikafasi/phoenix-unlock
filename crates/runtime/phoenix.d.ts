@@ -998,6 +998,100 @@ declare namespace Phoenix {
     readonly discord: Discord;
     /// Raw access to Phoenix's Android host modules (`GuestHost.invoke`).
     readonly bridge: Bridge;
+    /// Custom theme state (colors, fonts, icons, emoji) and installed `.json` themes.
+    readonly themes: Themes;
+  }
+
+  type ThemeBase = "dark" | "darker" | "light" | "midnight";
+
+  interface ThemeColorValues {
+    semantic: Partial<Record<ThemeBase, Record<string, string>>> & Record<string, Record<string, string>>;
+    raw: Record<string, string>;
+  }
+
+  interface ColorsSelection {
+    plugin: string;
+    group: string;
+    theme: string;
+    values: ThemeColorValues;
+  }
+
+  interface FontVariant {
+    path: string;
+    weight?: number;
+    italic?: boolean;
+    axes?: Record<string, number>;
+  }
+
+  interface FontSource {
+    plugin: string;
+    group: string;
+    pack: string;
+    variants: FontVariant[];
+  }
+
+  interface FontsSelection {
+    families: Record<string, FontSource>;
+  }
+
+  interface IconsSelection {
+    plugin: string;
+    group: string;
+    pack: string;
+    icons: Record<string, string>;
+    drawables: Record<string, string>;
+  }
+
+  interface EmojiSelection {
+    plugin: string;
+    group: string;
+    pack: string;
+    images?: string;
+    font?: string;
+  }
+
+  interface ThemesState {
+    format: number;
+    colors?: ColorsSelection;
+    fonts?: FontsSelection;
+    icons?: IconsSelection;
+    emoji?: EmojiSelection;
+  }
+
+  interface InstalledTheme {
+    id: string;
+    name: string;
+    description?: string;
+    authors: string[];
+    active: boolean;
+  }
+
+  interface SystemPalettes {
+    accent1: string[];
+    accent2: string[];
+    accent3: string[];
+    neutral1: string[];
+    neutral2: string[];
+  }
+
+  interface ThemeTokens {
+    raw: Record<string, string>;
+  }
+
+  interface Themes {
+    getState(): ThemesState;
+    setColors(selection: ColorsSelection | string | null): void;
+    setFonts(selection: FontsSelection | string | null): void;
+    setIcons(selection: IconsSelection | string | null): void;
+    setEmoji(selection: EmojiSelection | string | null): void;
+    base(): ThemeBase;
+    list(): InstalledTheme[];
+    apply(id: string): void;
+    clear(): void;
+    /// Android 12+ Material You tonal palettes (`accent1`..`neutral2`), or `null` when unavailable.
+    systemPalettes(): SystemPalettes | null;
+    /// Discord's default raw color token values (`RAW_NAME -> #rrggbb` / `#rrggbbaa`).
+    tokens(): ThemeTokens;
   }
 
   interface Bridge {

@@ -6,25 +6,10 @@ use phoenix_wire::Value;
 use crate::{
    PluginInfo,
    settings::{
-      COLOR_ACCENT,
-      COLOR_ERROR,
-      COLOR_STRING,
-      COLOR_WARN,
-      Field,
-      ICON_CONSOLE,
-      ICON_FILE,
-      ICON_PLUGIN,
-      ICON_RELOAD,
-      Press,
+      COLOR_ACCENT, COLOR_ERROR, COLOR_STRING, COLOR_WARN, Field, ICON_CONSOLE, ICON_FILE,
+      ICON_PLUGIN, ICON_RELOAD, ICON_THEME, Press,
       console::log_line,
-      rows::{
-         InputKind,
-         button_row,
-         section,
-         switch_row,
-         text_field,
-         value_row,
-      },
+      rows::{InputKind, button_row, section, switch_row, text_field, value_row},
       tree::Tree,
    },
    update::Catalog,
@@ -67,18 +52,25 @@ pub fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
       .into_iter()
       .chain([
          section("Plugins", rows),
-         section("", vec![
-            button_row("Install plugin", ICON_FILE, Some(Press::OpenInstall), true),
-            button_row("Console", ICON_CONSOLE, Some(Press::OpenConsole), true),
-         ]),
+         section(
+            "",
+            vec![
+               button_row("Install plugin", ICON_FILE, Some(Press::OpenInstall), true),
+               button_row("Themes", ICON_THEME, Some(Press::OpenThemes), true),
+               button_row("Console", ICON_CONSOLE, Some(Press::OpenConsole), true),
+            ],
+         ),
          debug_section(),
-         section("About", vec![
-            value_row("Version", crate::update::VERSION),
-            value_row("Runtime", "rquickjs"),
-            value_row("Gateway hooks", "registry pointer swap"),
-            value_row("Hook library", HOOK_LIBRARY),
-            value_row("Enabled", &format!("{enabled} of {}", plugins.len())),
-         ]),
+         section(
+            "About",
+            vec![
+               value_row("Version", crate::update::VERSION),
+               value_row("Runtime", "rquickjs"),
+               value_row("Gateway hooks", "registry pointer swap"),
+               value_row("Hook library", HOOK_LIBRARY),
+               value_row("Enabled", &format!("{enabled} of {}", plugins.len())),
+            ],
+         ),
       ])
       .collect()
 }
@@ -212,19 +204,25 @@ fn debug_section() -> Tree {
 pub fn install_sections(status: Option<&(String, i64)>, plugins: &[PluginInfo]) -> Vec<Tree> {
    let mut sections = vec![
       section("From Phoenix Unlock", listed_rows(plugins)),
-      section("From a URL", vec![text_field(
-         Field::Install,
-         Some(ICON_PLUGIN),
-         "https://example.com/plugin.js",
-         "",
-         InputKind::Text,
-      )]),
-      section("From a file", vec![button_row(
-         "Choose a .js file",
-         ICON_FILE,
-         Some(Press::PickFile),
-         false,
-      )]),
+      section(
+         "From a URL",
+         vec![text_field(
+            Field::Install,
+            Some(ICON_PLUGIN),
+            "https://example.com/plugin.js",
+            "",
+            InputKind::Text,
+         )],
+      ),
+      section(
+         "From a file",
+         vec![button_row(
+            "Choose a .js file",
+            ICON_FILE,
+            Some(Press::PickFile),
+            false,
+         )],
+      ),
    ];
    if let Some((message, color)) = status {
       let mut line = log_line(&[(message.clone(), *color)]);

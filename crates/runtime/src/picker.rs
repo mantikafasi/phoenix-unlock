@@ -57,6 +57,8 @@ pub type Picked = Result<Option<(String, Vec<u8>)>, String>;
 static CLASS: OnceLock<usize> = OnceLock::new();
 /// `phx.Updater` as a global reference (from the same in-memory dex).
 static UPDATER_CLASS: OnceLock<usize> = OnceLock::new();
+/// `phx.EmojiDraw` as a global reference (from the same in-memory dex).
+static EMOJI_DRAW_CLASS: OnceLock<usize> = OnceLock::new();
 /// Who waits for each open [`choose`] dialog.
 static CHOICES: Mutex<Option<HashMap<i32, Sender<i32>>>> = Mutex::new(None);
 
@@ -487,6 +489,76 @@ unsafe fn bind_updater(env: *mut JNIEnv, loader: jobject, load: jmethodID) {
    }
 }
 
+/// Loads `phx.EmojiDraw` from the dex's `loader`.
+unsafe fn bind_emoji_draw(env: *mut JNIEnv, loader: jobject, load: jmethodID) {
+   // SAFETY: forwarded from `class`, which holds live `loader` and `load`.
+   unsafe {
+      let name = jni!(env, NewStringUTF, c"phx.EmojiDraw".as_ptr());
+      let cls = jni!(
+         env,
+         CallObjectMethodA,
+         loader,
+         load,
+         [jvalue { l: name }].as_ptr()
+      );
+      if cls.is_null() || jni!(env, ExceptionCheck) {
+         let _ = jvm::take_exception(env);
+         return;
+      }
+      let global = jni!(env, NewGlobalRef, cls) as usize;
+      let _ = EMOJI_DRAW_CLASS.set(global);
+   }
+}
+
+/// Renders a Unicode emoji sequence (dash-separated hex codepoints) to `out_path`
+/// using `"system"` or a custom font file path, via `phx.EmojiDraw.draw`.
+pub(crate) fn draw_emoji(codepoints: &str, font: &str, out_path: &str) -> Option<String> {
+   let env = jvm::env()?;
+   // SAFETY: `env` is this thread's JNIEnv, and PushLocalFrame frees all local refs.
+   unsafe {
+      if jni!(env, PushLocalFrame, 32) != 0 {
+         jvm::clear_exception(env);
+         return None;
+      }
+      let result = (|| {
+         if EMOJI_DRAW_CLASS.get().is_none() {
+            let _ = class(env);
+         }
+         let cls = (*EMOJI_DRAW_CLASS.get()?) as jclass;
+         let method = jni!(
+            env,
+            GetStaticMethodID,
+            cls,
+            c"draw".as_ptr(),
+            c"(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;".as_ptr()
+         );
+         if method.is_null() || jni!(env, ExceptionCheck) {
+            jvm::clear_exception(env);
+            return None;
+         }
+         let args = [
+            jvalue {
+               l: jstring_of(env, codepoints),
+            },
+            jvalue {
+               l: jstring_of(env, font),
+            },
+            jvalue {
+               l: jstring_of(env, out_path),
+            },
+         ];
+         let out = jni!(env, CallStaticObjectMethodA, cls, method, args.as_ptr());
+         if out.is_null() || jni!(env, ExceptionCheck) {
+            jvm::clear_exception(env);
+            return None;
+         }
+         jvm::read_string(env, out)
+      })();
+      jni!(env, PopLocalFrame, ptr::null_mut());
+      result
+   }
+}
+
 /// Loads `phx.Picker` once and binds its native callback.
 unsafe fn class(env: *mut JNIEnv) -> Result<jclass, String> {
    if let Some(&class) = CLASS.get() {
@@ -566,6 +638,7 @@ unsafe fn class(env: *mut JNIEnv) -> Result<jclass, String> {
          return Err(failure(env, "could not bind phx.Picker's natives"));
       }
       bind_updater(env, loader, load);
+      bind_emoji_draw(env, loader, load);
       let global = jni!(env, NewGlobalRef, class) as usize;
       Ok(*CLASS.get_or_init(|| global) as jclass)
    }

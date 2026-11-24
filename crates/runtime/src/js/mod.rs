@@ -1,71 +1,52 @@
-#[cfg(target_os = "android")] mod background;
-#[cfg(target_os = "android")] mod bridge;
+#[cfg(target_os = "android")]
+mod background;
+#[cfg(target_os = "android")]
+mod bridge;
 mod hooks;
-#[cfg(target_os = "android")] mod http;
-#[cfg(target_os = "android")] mod intercept;
+#[cfg(target_os = "android")]
+mod http;
+#[cfg(target_os = "android")]
+mod intercept;
 mod messages;
-#[cfg(target_os = "android")] mod mount;
-#[cfg(target_os = "android")] mod page;
+#[cfg(target_os = "android")]
+mod mount;
+#[cfg(target_os = "android")]
+mod page;
 mod settings;
 mod storage;
-#[cfg(target_os = "android")] mod ui;
-#[cfg(target_os = "android")] mod view;
-#[cfg(target_os = "android")] mod wire;
+mod themes;
+#[cfg(target_os = "android")]
+mod ui;
+#[cfg(target_os = "android")]
+mod view;
+#[cfg(target_os = "android")]
+mod wire;
 
 use std::{
    borrow::Cow,
    cell::RefCell,
-   collections::{
-      BTreeMap,
-      BTreeSet,
-      HashMap,
-   },
+   collections::{BTreeMap, BTreeSet, HashMap},
    fs,
    io::ErrorKind,
 };
 
 use log::Level;
-use phoenix_sigs::registry::{
-   EventId,
-   GatewayRegistry,
-};
-#[cfg(target_os = "android")] use rquickjs::function::Opt;
+use phoenix_sigs::registry::{EventId, GatewayRegistry};
+#[cfg(target_os = "android")]
+use rquickjs::function::Opt;
 use rquickjs::{
-   CatchResultExt,
-   CaughtError,
-   Context,
-   Ctx,
-   Exception,
-   Function,
-   JsLifetime,
-   Object,
-   Runtime,
-   Value,
-   function::Rest,
+   CatchResultExt, CaughtError, Context, Ctx, Exception, Function, JsLifetime, Object, Runtime,
+   Value, function::Rest,
 };
 
 use crate::{
-   Chosen,
-   Error,
-   Header,
-   Plugin,
-   PluginInfo,
-   STATE,
-   Setting,
-   State,
-   gateway,
-   io_error,
+   Chosen, Error, Header, Plugin, PluginInfo, STATE, Setting, State, gateway, io_error,
    js::{
-      hooks::{
-         Hook,
-         add_gateway_api,
-      },
+      hooks::{Hook, add_gateway_api},
       messages::messages_object,
-      settings::{
-         Definition,
-         settings_object,
-      },
+      settings::{Definition, settings_object},
       storage::storage,
+      themes::themes_object,
    },
 };
 #[cfg(target_os = "android")]
@@ -73,19 +54,13 @@ use crate::{
    discord,
    js::{
       bridge::bridge_object,
-      http::{
-         discord_object,
-         start_fetch,
-      },
+      http::{discord_object, start_fetch},
       messages::patch_api,
       storage::stores_object,
       ui::Callbacks,
       view::EventHook,
    },
-   patches::{
-      self,
-      ContributionId,
-   },
+   patches::{self, ContributionId},
 };
 
 pub struct Engine {
@@ -95,9 +70,9 @@ pub struct Engine {
 }
 
 struct Loaded {
-   source:    String,
-   enabled:   bool,
-   error:     Option<String>,
+   source: String,
+   enabled: bool,
+   error: Option<String>,
    /// Read from `home/plugins`, so the user can delete it.
    installed: bool,
 }
@@ -113,13 +88,13 @@ const fn default_true() -> bool {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Choices<'a> {
    #[serde(default)]
-   disabled:     BTreeSet<String>,
+   disabled: BTreeSet<String>,
    #[serde(default)]
-   enabled:      BTreeSet<String>,
+   enabled: BTreeSet<String>,
    #[serde(default)]
-   settings:     Cow<'a, ChosenMap>,
+   settings: Cow<'a, ChosenMap>,
    #[serde(default = "default_true")]
-   staff:        bool,
+   staff: bool,
    #[serde(default)]
    remote_shell: bool,
 }
@@ -127,10 +102,10 @@ struct Choices<'a> {
 impl Default for Choices<'_> {
    fn default() -> Self {
       Self {
-         disabled:     BTreeSet::new(),
-         enabled:      BTreeSet::new(),
-         settings:     Cow::Owned(BTreeMap::new()),
-         staff:        true,
+         disabled: BTreeSet::new(),
+         enabled: BTreeSet::new(),
+         settings: Cow::Owned(BTreeMap::new()),
+         staff: true,
          remote_shell: false,
       }
    }
@@ -146,54 +121,54 @@ pub enum Before {
 /// stay JS values owned by the runtime, and the only thing plugins can reach is
 /// their own `phoenix` object.
 struct Registry<'js> {
-   gateway:        Object<'js>,
-   handles:        Vec<(EventId, Object<'js>)>,
-   hooks:          RefCell<HashMap<EventId, Vec<Hook<'js>>>>,
-   defined:        RefCell<BTreeMap<String, Vec<Definition<'js>>>>,
+   gateway: Object<'js>,
+   handles: Vec<(EventId, Object<'js>)>,
+   hooks: RefCell<HashMap<EventId, Vec<Hook<'js>>>>,
+   defined: RefCell<BTreeMap<String, Vec<Definition<'js>>>>,
    /// Kept across unloads, so a reloaded plugin sees what the user chose.
-   chosen:         RefCell<ChosenMap>,
+   chosen: RefCell<ChosenMap>,
    /// `phoenix.onUnload` callbacks, run when the plugin is turned off,
    /// reloaded or removed.
-   unloads:        RefCell<HashMap<String, Vec<Function<'js>>>>,
+   unloads: RefCell<HashMap<String, Vec<Function<'js>>>>,
    /// The resolve and reject of each promise a worker thread will settle, by
    /// id.
    #[cfg(target_os = "android")]
-   pending:        RefCell<HashMap<u64, (Function<'js>, Function<'js>)>>,
+   pending: RefCell<HashMap<u64, (Function<'js>, Function<'js>)>>,
    #[cfg(target_os = "android")]
-   ui:             RefCell<HashMap<ContributionId, Callbacks<'js>>>,
+   ui: RefCell<HashMap<ContributionId, Callbacks<'js>>>,
    /// Slash commands by lowercase name, with the plugin that registered each.
    #[cfg(target_os = "android")]
-   commands:       RefCell<HashMap<String, (String, Function<'js>)>>,
+   commands: RefCell<HashMap<String, (String, Function<'js>)>>,
    /// `phoenix.messages.onSend` interceptors in registration order, by id.
    #[cfg(target_os = "android")]
-   interceptors:   RefCell<Vec<(u64, String, Function<'js>)>>,
+   interceptors: RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.discord.onRequest` interceptors, by id.
    #[cfg(target_os = "android")]
-   request_hooks:  RefCell<HashMap<u64, (String, Function<'js>)>>,
+   request_hooks: RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.discord.onResponse` interceptors, by id.
    #[cfg(target_os = "android")]
    response_hooks: RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.messages.onEmojiPick` handlers in registration order, by id.
    #[cfg(target_os = "android")]
-   pickers:        RefCell<Vec<(u64, String, Function<'js>)>>,
+   pickers: RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.onEvent` handlers, by id.
    #[cfg(target_os = "android")]
-   event_hooks:    RefCell<Vec<EventHook<'js>>>,
+   event_hooks: RefCell<Vec<EventHook<'js>>>,
    /// `phoenix.ui.onNode` watchers, by id.
    #[cfg(target_os = "android")]
-   node_watchers:  RefCell<HashMap<u64, (String, Function<'js>)>>,
+   node_watchers: RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// Open full-screen plugin pages (`phoenix.ui.openPage`) and their button
    /// callbacks, by page id.
    #[cfg(target_os = "android")]
-   open_pages:     RefCell<HashMap<u32, (String, Vec<Function<'js>>)>>,
+   open_pages: RefCell<HashMap<u32, (String, Vec<Function<'js>>)>>,
    /// Active in-app notification banner tap callbacks (`phoenix.ui.notify`), by
    /// banner id.
    #[cfg(target_os = "android")]
-   banners:        RefCell<HashMap<u32, (String, Function<'js>)>>,
+   banners: RefCell<HashMap<u32, (String, Function<'js>)>>,
    /// Active raw JS-mounted subtrees (`phoenix.ui.mount`) and their callbacks,
    /// by mount id.
    #[cfg(target_os = "android")]
-   mounts:         RefCell<HashMap<u32, (String, Vec<Function<'js>>)>>,
+   mounts: RefCell<HashMap<u32, (String, Vec<Function<'js>>)>>,
 }
 
 // SAFETY: every field is bound to 'js, and Changed swaps exactly that lifetime.
@@ -257,10 +232,10 @@ impl Engine {
                         .as_ref()
                         .and_then(|chosen| chosen.get(name)?.get(&definition.key));
                      Setting {
-                        key:         definition.key.clone(),
-                        title:       definition.title.clone(),
+                        key: definition.key.clone(),
+                        title: definition.title.clone(),
                         description: definition.description.clone(),
-                        control:     definition.kind.current(picked),
+                        control: definition.kind.current(picked),
                      }
                   })
                   .collect();
@@ -430,12 +405,15 @@ impl Engine {
          loaded.installed = true;
          loaded.enabled
       } else {
-         self.plugins.insert(name.to_owned(), Loaded {
-            source,
-            enabled: true,
-            error: None,
-            installed: true,
-         });
+         self.plugins.insert(
+            name.to_owned(),
+            Loaded {
+               source,
+               enabled: true,
+               error: None,
+               installed: true,
+            },
+         );
          true
       };
       if enabled {
@@ -516,11 +494,10 @@ impl Engine {
             }
             match ctx.json_stringify(result.clone())? {
                Some(json) => json.to_string(),
-               None => {
-                  ctx.globals()
-                     .get::<_, Function<'_>>("String")?
-                     .call((result,))
-               },
+               None => ctx
+                  .globals()
+                  .get::<_, Function<'_>>("String")?
+                  .call((result,)),
             }
          };
          run().catch(&ctx).map_err(js_error)
@@ -632,6 +609,7 @@ fn api<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    api.set("log", log_object(ctx, plugin)?)?;
    api.set("storage", storage(ctx, plugin)?)?;
    api.set("settings", settings_object(ctx, plugin)?)?;
+   api.set("themes", themes_object(ctx)?)?;
    let name = plugin.to_owned();
    api.set(
       "onUnload",
@@ -704,12 +682,10 @@ fn log_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
 pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<String>, Error> {
    let choices_path = state.choices_path();
    let choices = match fs::read(&choices_path) {
-      Ok(bytes) => {
-         serde_json::from_slice::<Choices>(&bytes).unwrap_or_else(|err| {
-            log::error!("{}: {err}", choices_path.display());
-            Choices::default()
-         })
-      },
+      Ok(bytes) => serde_json::from_slice::<Choices>(&bytes).unwrap_or_else(|err| {
+         log::error!("{}: {err}", choices_path.display());
+         Choices::default()
+      }),
       Err(err) if err.kind() == ErrorKind::NotFound => Choices::default(),
       Err(err) => return Err(io_error(&choices_path)(err)),
    };
@@ -723,11 +699,9 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
       .map(|plugin| (plugin.name, (plugin.source, false)))
       .collect::<BTreeMap<String, (String, bool)>>();
    let paths = match fs::read_dir(&dir) {
-      Ok(entries) => {
-         entries
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(io_error(&dir))?
-      },
+      Ok(entries) => entries
+         .collect::<Result<Vec<_>, _>>()
+         .map_err(io_error(&dir))?,
       Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
       Err(err) => return Err(io_error(&dir)(err)),
    };
@@ -760,12 +734,15 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
          } else {
             !choices.disabled.contains(&name)
          };
-         (name, Loaded {
-            source,
-            enabled,
-            error: None,
-            installed,
-         })
+         (
+            name,
+            Loaded {
+               source,
+               enabled,
+               error: None,
+               installed,
+            },
+         )
       })
       .collect();
    let enabled = engine

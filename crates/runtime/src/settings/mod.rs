@@ -14,54 +14,28 @@ mod pages;
 mod plugin;
 mod render;
 mod rows;
+mod themes;
 mod tree;
 
 use std::{
-   collections::{
-      HashMap,
-      HashSet,
-   },
+   collections::{HashMap, HashSet},
    sync::{
-      LazyLock,
-      Mutex,
-      MutexGuard,
-      OnceLock,
-      PoisonError,
-      atomic::{
-         AtomicBool,
-         Ordering,
-      },
-      mpsc::{
-         self,
-         Sender,
-      },
+      LazyLock, Mutex, MutexGuard, OnceLock, PoisonError,
+      atomic::{AtomicBool, Ordering},
+      mpsc::{self, Sender},
    },
    thread,
 };
 
-use phoenix_ui::{
-   Op,
-   Props,
-   encode,
-};
+use phoenix_ui::{Op, Props, encode};
 
 use crate::{
    PluginInfo,
-   bridge::{
-      self,
-      Action,
-      Sink,
-   },
+   bridge::{self, Action, Sink},
    settings::{
       actions::act,
-      batch::{
-         filter_dispatch,
-         rewrite_ops,
-      },
-      tree::{
-         SlotPool,
-         Tree,
-      },
+      batch::{filter_dispatch, rewrite_ops},
+      tree::{SlotPool, Tree},
    },
 };
 
@@ -77,6 +51,7 @@ const ICON_RELOAD: &str = "res://ic_mana_puzzle_piece_retry";
 const ICON_UNINSTALL: &str = "res://ic_mana_puzzle_piece_minus";
 const ICON_CONSOLE: &str = "res://ic_mana_angle_brackets";
 const ICON_FILE: &str = "res://ic_mana_image_file_up";
+const ICON_THEME: &str = "res://ic_mana_paintbrush_thick";
 /// Text colors, ARGB, for Discord's dark theme.
 const COLOR_TEXT: i64 = 0xFFF6_F6F7;
 const COLOR_MUTED: i64 = 0xFF94_9BA4;
@@ -96,11 +71,17 @@ enum Press {
    OpenMain,
    OpenConsole,
    OpenInstall,
+   OpenThemes,
+   OpenTheme(usize),
    OpenPlugin(usize),
    /// A plugin's code page, and saving what it holds.
    EditCode(usize),
    SaveCode(usize),
    PickFile,
+   PickThemeFile,
+   ToggleTheme(usize),
+   UninstallTheme(usize),
+   ClearTheme,
    /// Installs or uninstalls a plugin the site lists, by its index in
    /// [`crate::update::catalog`].
    Listed(usize),
@@ -125,8 +106,16 @@ enum PageKind {
    Main,
    Console,
    Install,
+   Themes,
+   Theme(usize),
    Plugin(usize),
    Code(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickTarget {
+   Plugin,
+   Theme,
 }
 
 /// What the UI thread hands to the worker. UI ops must not be sent from the
@@ -148,6 +137,7 @@ enum Job {
 enum Field {
    Eval,
    Install,
+   InstallTheme,
    /// A text or number setting, indexed like [`Press::Setting`].
    Setting(usize, usize),
    /// A plugin's code, by its index in [`crate::plugins`].
@@ -164,70 +154,77 @@ enum Slot {
 /// The "Phoenix Unlocker" row in the Settings list.
 struct Entry {
    root: i32,
-   ids:  Vec<i32>,
+   ids: Vec<i32>,
 }
 
 struct Page {
-   root:     i32,
-   ids:      Vec<i32>,
-   kind:     PageKind,
-   content:  i32,
+   root: i32,
+   ids: Vec<i32>,
+   kind: PageKind,
+   content: i32,
    sections: Vec<i32>,
-   slots:    Vec<(i32, Slot)>,
+   slots: Vec<(i32, Slot)>,
    /// The built sections, to update in place when a rerender keeps their shape.
-   trees:    Vec<Tree>,
+   trees: Vec<Tree>,
 }
 
 /// The open Settings screen and what phoenix added to it.
 struct Screen {
-   list:       i32,
+   list: i32,
    /// Rust's own rows in the list and pages on the navigator, kept current
    /// from its batches.
-   rust_rows:  Option<Vec<i32>>,
-   search:     Option<i32>,
-   navigator:  Option<i32>,
+   rust_rows: Option<Vec<i32>>,
+   search: Option<i32>,
+   navigator: Option<i32>,
    rust_pages: Option<Vec<i32>>,
-   header:     Option<Props>,
-   entry:      Option<Entry>,
-   stack:      Vec<Page>,
+   header: Option<Props>,
+   entry: Option<Entry>,
+   stack: Vec<Page>,
 }
 
 struct Settings {
-   next_id:        i32,
-   slots:          SlotPool,
+   next_id: i32,
+   slots: SlotPool,
    /// Motion words for nodes built since the last batch went out. They run
    /// after the batch attaches those nodes.
-   motion:         Vec<i32>,
-   navigators:     HashSet<i32>,
-   screen:         Option<Screen>,
-   handlers:       HashMap<i32, Press>,
-   plugins:        Vec<PluginInfo>,
-   drafts:         HashMap<Field, String>,
+   motion: Vec<i32>,
+   navigators: HashSet<i32>,
+   screen: Option<Screen>,
+   handlers: HashMap<i32, Press>,
+   plugins: Vec<PluginInfo>,
+   themes: Vec<crate::themes::InstalledTheme>,
+   drafts: HashMap<Field, String>,
    /// The line nodes in each console log box, replaced on every refresh.
-   log_rows:       HashMap<i32, Vec<i32>>,
+   log_rows: HashMap<i32, Vec<i32>>,
    /// A counter for `forceValue`, which the host applies when it changes.
-   force_seq:      i64,
+   force_seq: i64,
    /// What the last install did, shown on the install page.
    install_status: Option<(String, i64)>,
+   /// What the last theme install or action did, shown on the themes page.
+   theme_status: Option<(String, i64)>,
+   pick_target: PickTarget,
 }
 
 static SETTINGS: LazyLock<Mutex<Settings>> = LazyLock::new(|| {
    Mutex::new(Settings {
-      next_id:        FIRST_ID,
-      slots:          SlotPool {
-         next:  SLOT_END,
-         free:  Vec::new(),
+      next_id: FIRST_ID,
+      slots: SlotPool {
+         next: SLOT_END,
+         free: Vec::new(),
          owned: HashMap::new(),
       },
-      motion:         Vec::new(),
-      navigators:     HashSet::new(),
-      screen:         None,
-      handlers:       HashMap::new(),
-      plugins:        Vec::new(),
-      drafts:         HashMap::new(),
-      log_rows:       HashMap::new(),
-      force_seq:      1 << 40,
+      motion: Vec::new(),
+      navigators: HashSet::new(),
+      screen: None,
+      handlers: HashMap::new(),
+      plugins: Vec::new(),
+      themes: Vec::new(),
+      drafts: HashMap::new(),
+      log_rows: HashMap::new(),
+      force_seq: 1 << 40,
       install_status: None,
+      theme_status: None,
+      pick_target: PickTarget::Plugin,
    })
 });
 
@@ -262,15 +259,19 @@ pub fn start() {
    thread::spawn(move || {
       for job in receiver {
          act(&job);
-         let plugins = matches!(
+         let refresh_lists = matches!(
             job,
             Job::Press(_) | Job::Submit(_) | Job::Picked(_) | Job::Refresh
-         )
-         .then(crate::plugins);
+         );
+         let plugins = refresh_lists.then(crate::plugins);
+         let themes = refresh_lists.then(crate::themes::list_installed);
          let ops = {
             let mut state = settings();
             if let Some(plugins) = plugins {
                state.plugins = plugins;
+            }
+            if let Some(themes) = themes {
+               state.themes = themes;
             }
             let mut ops = state.run(job);
             if !state.motion.is_empty() {

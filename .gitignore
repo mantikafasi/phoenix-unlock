@@ -30,6 +30,7 @@
 !crates/runtime/phoenix.d.ts
 !crates/ui/src/props.in
 !crates/ui/src/templates.json
+!crates/ui/src/themes/tokens.json
 !crates/patcher/keys/
 !crates/patcher/keys/README.md
 !crates/patcher/keys/lineage

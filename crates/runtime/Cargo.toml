@@ -10,6 +10,7 @@ flub         = { workspace = true }
 log          = { workspace = true }
 phoenix-hook = { workspace = true }
 phoenix-sigs = { workspace = true }
+phoenix-ui   = { workspace = true }
 rquickjs     = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
@@ -23,7 +24,6 @@ crc32fast    = { workspace = true }
 jni-sys      = { workspace = true }
 libc         = { workspace = true }
 memchr       = { workspace = true }
-phoenix-ui   = { workspace = true }
 phoenix-wire = { workspace = true }
 
 [lints]

@@ -3,24 +3,20 @@
 use std::sync::atomic::Ordering;
 
 use crate::{
-   Chosen,
-   Control,
-   PluginInfo,
+   Chosen, Control, PluginInfo,
    settings::{
-      COLOR_ERROR,
-      COLOR_STRING,
-      Field,
-      Job,
-      LOG_QUEUED,
-      Press,
-      TITLE,
-      settings,
+      COLOR_ERROR, COLOR_STRING, Field, Job, LOG_QUEUED, PickTarget, Press, TITLE, settings,
    },
+   themes::InstalledTheme,
    update::Catalog,
 };
 
 fn plugin(index: usize) -> Option<PluginInfo> {
    settings().plugins.get(index).cloned()
+}
+
+fn theme(index: usize) -> Option<InstalledTheme> {
+   settings().themes.get(index).cloned()
 }
 
 /// Makes the runtime calls `job` asks for. They take the engine lock, so they
@@ -32,12 +28,23 @@ pub fn act(job: &Job) {
       Job::Submit(Field::Code(_)) | Job::NavigateTo(_) | Job::Draft(..) | Job::Refresh => {},
       Job::Submit(field) => submit(field),
       Job::Picked(ref picked) => {
-         match picked {
-            Ok(Some((file, bytes))) => installed(crate::install_file(file, bytes.clone()), file),
-            Ok(None) => {},
-            Err(err) => {
+         let target = settings().pick_target;
+         match (target, picked) {
+            (PickTarget::Plugin, Ok(Some((file, bytes)))) => {
+               installed(crate::install_file(file, bytes.clone()), file);
+            },
+            (PickTarget::Theme, Ok(Some((file, bytes)))) => {
+               theme_installed(crate::themes::install_file(file, bytes), file);
+            },
+            (_, Ok(None)) => {},
+            (PickTarget::Plugin, Err(err)) => {
                log::error!("file picker: {err}");
                settings().install_status =
+                  Some((format!("The file picker failed: {err}"), COLOR_ERROR));
+            },
+            (PickTarget::Theme, Err(err)) => {
+               log::error!("file picker: {err}");
+               settings().theme_status =
                   Some((format!("The file picker failed: {err}"), COLOR_ERROR));
             },
          }
@@ -55,6 +62,9 @@ fn submit(field: Field) {
       Field::Eval if !input.is_empty() => crate::evaluate(input),
       Field::Install if !input.is_empty() => {
          installed(crate::install(input), input);
+      },
+      Field::InstallTheme if !input.is_empty() => {
+         theme_installed(crate::themes::install_url(input), input);
       },
       Field::Setting(index, at) => {
          let Some(plugin) = plugin(index) else {
@@ -80,18 +90,67 @@ fn submit(field: Field) {
          };
          crate::set_setting(&plugin.name, &setting.key, value);
       },
-      Field::Eval | Field::Install | Field::Code(_) => {},
+      Field::Eval | Field::Install | Field::InstallTheme | Field::Code(_) => {},
    }
 }
 
 fn press(pressed: Press) {
    match pressed {
       Press::PickFile => {
+         settings().pick_target = PickTarget::Plugin;
          if let Err(err) = crate::picker::pick() {
             log::error!("file picker: {err}");
             settings().install_status =
                Some((format!("The file picker failed: {err}"), COLOR_ERROR));
          }
+      },
+      Press::PickThemeFile => {
+         settings().pick_target = PickTarget::Theme;
+         if let Err(err) = crate::picker::pick() {
+            log::error!("file picker: {err}");
+            settings().theme_status = Some((format!("The file picker failed: {err}"), COLOR_ERROR));
+         }
+      },
+      Press::ToggleTheme(index) => {
+         if let Some(theme) = theme(index) {
+            if theme.active {
+               crate::themes::set_colors(None);
+               settings().theme_status = Some((format!("Disabled {}.", theme.name), COLOR_STRING));
+            } else {
+               match crate::themes::apply_installed(&theme.id) {
+                  Ok(()) => {
+                     settings().theme_status =
+                        Some((format!("Applied {}.", theme.name), COLOR_STRING));
+                  },
+                  Err(err) => {
+                     log::error!("applying theme {} failed: {err}", theme.id);
+                     settings().theme_status = Some((
+                        format!("Failed to apply {}: {err}", theme.name),
+                        COLOR_ERROR,
+                     ));
+                  },
+               }
+            }
+         }
+      },
+      Press::UninstallTheme(index) => {
+         if let Some(theme) = theme(index) {
+            match crate::themes::uninstall(&theme.id) {
+               Ok(()) => {
+                  log::info!("uninstalled theme {}", theme.id);
+                  settings().theme_status =
+                     Some((format!("Uninstalled {}.", theme.name), COLOR_STRING));
+               },
+               Err(err) => {
+                  log::error!("uninstalling theme {} failed: {err}", theme.id);
+                  settings().theme_status = Some((format!("Uninstall failed: {err}"), COLOR_ERROR));
+               },
+            }
+         }
+      },
+      Press::ClearTheme => {
+         crate::themes::clear_all();
+         settings().theme_status = Some(("Cleared active theme.".to_owned(), COLOR_STRING));
       },
       // The editor starts from the plugin's code, kept as the field's draft.
       Press::EditCode(index) => {
@@ -175,7 +234,12 @@ fn press(pressed: Press) {
          crate::set_remote_shell_enabled(!crate::remote_shell_enabled());
       },
       Press::OpenInstall => crate::update::fetch_catalog(),
-      Press::OpenMain | Press::OpenConsole | Press::OpenPlugin(_) | Press::Back => {},
+      Press::OpenMain
+      | Press::OpenConsole
+      | Press::OpenThemes
+      | Press::OpenTheme(_)
+      | Press::OpenPlugin(_)
+      | Press::Back => {},
    }
 }
 
@@ -221,4 +285,18 @@ fn installed(result: Result<String, crate::Error>, from: &str) {
       },
    };
    settings().install_status = Some(status);
+}
+
+fn theme_installed(result: Result<String, crate::Error>, from: &str) {
+   let status = match result {
+      Ok(name) => {
+         log::info!("installed theme {name} from {from}");
+         (format!("Installed and applied {name}."), COLOR_STRING)
+      },
+      Err(err) => {
+         log::error!("theme install failed: {err}");
+         (format!("Theme install failed: {err}"), COLOR_ERROR)
+      },
+   };
+   settings().theme_status = Some(status);
 }
