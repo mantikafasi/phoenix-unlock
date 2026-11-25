@@ -6,23 +6,24 @@ const { gateway } = phoenix;
 
 const TRACKERS = [
   /^utm_/,
-  /^(fbclid|gclid|dclid|gbraid|wbraid|msclkid|yclid|twclid|ttclid|igshid|igsh|mc_eid|mc_cid)$/,
+  /^(ref_src|ref_url|fbclid|gclid|dclid|gbraid|wbraid|msclkid|yclid|twclid|ttclid|igshid|igsh|mc_eid|mc_cid)$/,
   /^(_hsenc|_hsmi|mkt_tok|oly_anon_id|oly_enc_id|vero_id|wickedid|__s)$/,
 ];
 
-// Short parameter names can carry functional values on unrelated sites.
-const SHORT_PARAM_HOSTS = /(^|\.)(twitter\.com|x\.com|tiktok\.com)$/;
-const TWITTER_HOSTS = /(^|\.)(twitter\.com|x\.com)$/;
-const YOUTUBE_HOSTS = /(^|\.)(youtube\.com|youtu\.be)$/;
-const SPOTIFY_HOSTS = /(^|\.)spotify\.com$/;
+// Short parameter names are tracking only on these hosts. Elsewhere they are
+// often real parameters, such as a YouTube start time.
+const SOCIAL = /(^|\.)(twitter\.com|x\.com|tiktok\.com)$/;
+const YOUTUBE = /(^|\.)(youtube\.com|youtu\.be)$/;
+const SCOPED = new Map([
+  ["s", SOCIAL],
+  ["t", SOCIAL],
+  ["feature", YOUTUBE],
+  ["pp", YOUTUBE],
+  ["si", /(^|\.)(youtube\.com|youtu\.be|spotify\.com|soundcloud\.com)$/],
+]);
 
-const isTracker = (key: string, host: string) => {
-  if (TRACKERS.some((tracker) => tracker.test(key))) return true;
-  if (key === "s" || key === "t") return SHORT_PARAM_HOSTS.test(host);
-  if (key === "ref_src" || key === "ref_url") return TWITTER_HOSTS.test(host);
-  if (key === "si") return YOUTUBE_HOSTS.test(host) || SPOTIFY_HOSTS.test(host);
-  return (key === "feature" || key === "pp") && YOUTUBE_HOSTS.test(host);
-};
+const isTracker = (key: string, host: string) =>
+  SCOPED.get(key)?.test(host) ?? TRACKERS.some((tracker) => tracker.test(key));
 
 const clean = (url: string) => {
   const query = url.indexOf("?");
@@ -33,6 +34,7 @@ const clean = (url: string) => {
   const host = authority.slice(authority.lastIndexOf("@") + 1).split(":")[0].toLowerCase().replace(/\.$/, "");
   const pairs = url.slice(query + 1, end).split("&");
   const kept = pairs.filter((pair) => {
+    if (!pair) return false;
     let key: string;
     try {
       key = decodeURIComponent(pair.split("=")[0]);
@@ -42,7 +44,7 @@ const clean = (url: string) => {
     return !isTracker(key, host);
   });
   if (kept.length === pairs.length) return url;
-  return url.slice(0, query) + (kept.some(Boolean) ? `?${kept.join("&")}` : "") + url.slice(end);
+  return url.slice(0, query) + (kept.length ? `?${kept.join("&")}` : "") + url.slice(end);
 };
 
 const cleanLinks = (text: string) => text.replace(/https?:\/\/(?:[^\s<>()`|]|\([^\s<>()`|]*\))+/gi, (url) => {
