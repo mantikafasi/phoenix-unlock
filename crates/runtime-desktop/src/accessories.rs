@@ -299,7 +299,7 @@ fn install_body_tint(image: &Image<'static>, render_row: usize) {
    BODY_MSG_ID_OFFSET.store(msg_id_off, Ordering::Release);
    ROW_COLORS_OFFSET.store(colors_off, Ordering::Release);
 
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).row;
+   let pro = body.prologue;
    // SAFETY: runs from `prepare` before Discord threads execute;
    // `build_body_detour` matches `build_message_body`'s verified 6-argument ABI.
    let trampoline = match unsafe {
@@ -316,8 +316,8 @@ fn install_body_tint(image: &Image<'static>, render_row: usize) {
          return;
       },
    };
-   // SAFETY: `trampoline` replays the 17-byte prologue and jumps to `body_fn +
-   // 17`.
+   // SAFETY: `trampoline` replays the prologue the locator matched and jumps
+   // past it in `body_fn`.
    let orig = unsafe { std::mem::transmute::<usize, BuildMessageBodyFn>(trampoline) };
    let _ = ORIG_BUILD_BODY.set(orig);
    log::info!(

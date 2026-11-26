@@ -1543,6 +1543,9 @@ pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
 /// `build_message_body`, and where its message and row colors sit.
 pub struct MessageBody {
    pub func:              usize,
+   /// What `func` opens with, for hooking it: the row prologue, or the frame
+   /// one where its frame fits in a page (Windows 2208), with no `__chkstk`.
+   pub prologue:          Prologue,
    pub msg_id_offset:     usize,
    pub row_colors_offset: usize,
 }
@@ -1560,12 +1563,13 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
    let mut found = lea_refs(image, anchor)
       .into_iter()
       .filter_map(|lea| Some(image.function_bounds(lea)?.0))
-      .filter(|&func| prologues(image).row.at(image, func))
+      .filter(|&func| body_prologue(image, func).is_some())
       .filter(|&func| callers(image, func).contains(&render_row))
       .collect::<Vec<_>>();
    found.sort_unstable();
    found.dedup();
    let func = one("message body builder", &found)?;
+   let prologue = body_prologue(image, func).ok_or("message body prologue changed")?;
    let head = image
       .read(func, 0x120)
       .ok_or("message body builder is unmapped")?;
@@ -1593,6 +1597,7 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
       .ok_or("message body row colors not found")?;
    Ok(MessageBody {
       func,
+      prologue,
       msg_id_offset,
       row_colors_offset,
    })
@@ -1674,6 +1679,23 @@ fn slot_of(operand: &str, base: &str) -> Option<usize> {
       || disp.parse().ok(),
       |hex| usize::from_str_radix(hex, 16).ok(),
    )
+}
+
+/// [`slot_of`], also below the base, like `[rbp-50h]`.
+fn frame_disp(operand: &str, base: &str) -> Option<isize> {
+   if let Some(slot) = slot_of(operand, base) {
+      return isize::try_from(slot).ok();
+   }
+   let disp = operand
+      .strip_prefix('[')?
+      .strip_suffix(']')?
+      .strip_prefix(base)?
+      .strip_prefix('-')?;
+   let below: isize = disp.strip_suffix('h').map_or_else(
+      || disp.parse().ok(),
+      |hex| isize::from_str_radix(hex, 16).ok(),
+   )?;
+   Some(-below)
 }
 
 /// The callee of the call `line` decodes: `call rel32`, or through a pointer
@@ -2223,10 +2245,22 @@ fn header_builder(image: &Image<'_>, func: usize, anchor: usize) -> Found<(usize
       .iter()
       .position(|line| line.target == Some(anchor))
       .ok_or("header app tag load not decoded")?;
-   let slot = lines[template.saturating_sub(8)..template]
-      .iter()
+   // The id's address is the format argument: `lea rax,[frame+slot]` right
+   // before, or a register set earlier by `lea reg,[frame+slot]` and stored
+   // into the arguments (Win64 2208's third builder keeps it in `r14`).
+   let frame_lea = |line: &phoenix_hook::x86::Line, to: &str| {
+      slot_of(line.text.strip_prefix(&format!("lea {to},"))?, &base)
+   };
+   let slot = (template.saturating_sub(8)..template)
       .rev()
-      .find_map(|line| slot_of(line.text.strip_prefix("lea rax,")?, &base))
+      .find_map(|at| {
+         if let Some(slot) = frame_lea(&lines[at], "rax") {
+            return Some(slot);
+         }
+         let (_, from) = lines[at].text.strip_prefix("mov [")?.split_once("],")?;
+         let set = (0..at).rev().find(|&j| written(&lines[j]) == Some(from))?;
+         frame_lea(&lines[set], from)
+      })
       .ok_or("header message id slot not found")?;
    let mut adds = Vec::new();
    for at in 1..lines.len() {
@@ -2262,9 +2296,46 @@ fn header_builder(image: &Image<'_>, func: usize, anchor: usize) -> Found<(usize
    Ok((slot, adds))
 }
 
-fn node_svg(image: &Image<'_>, body: usize) -> Found<NodeSvg> {
+/// `(push_svg, color)` from `lea out,[frame+leaf]; ...; call svg_new`, then
+/// `mov dword ptr [frame+color],1` and the call pushing the leaf, with `color`
+/// counted from the leaf.
+fn leaf_push(
+   image: &Image<'_>,
+   svg_new: usize,
+   lines: &[phoenix_hook::x86::Line],
+) -> Option<(usize, usize)> {
    let abi = Abi::of(image);
    let base = Frame::of(abi).base();
+   let leaf_arg = format!("lea {},", reg_name(abi.arg(0)));
+   lines
+      .iter()
+      .enumerate()
+      .filter(|(_, line)| callee(image, line) == Some(svg_new))
+      .find_map(|(at, _)| {
+         let leaf = lines[at.saturating_sub(8)..at]
+            .iter()
+            .rev()
+            .find_map(|line| frame_disp(line.text.strip_prefix(&leaf_arg)?, &base))?;
+         let after = &lines[at + 1..(at + 24).min(lines.len())];
+         let push = after.iter().find(|line| line.text.starts_with("call "))?;
+         let tag = after
+            .iter()
+            .take_while(|line| line.addr < push.addr)
+            .find_map(|line| {
+               frame_disp(
+                  line
+                     .text
+                     .strip_prefix("mov dword ptr ")?
+                     .strip_suffix(",1")?,
+                  &base,
+               )
+            })?;
+         Some((callee(image, push)?, usize::try_from(tag - leaf).ok()?))
+      })
+}
+
+fn node_svg(image: &Image<'_>, body: usize) -> Found<NodeSvg> {
+   let abi = Abi::of(image);
    let mut svg_news = image
       .find_bytes(NODE_SVG)
       .into_iter()
@@ -2297,38 +2368,27 @@ fn node_svg(image: &Image<'_>, body: usize) -> Found<NodeSvg> {
    svg_news.dedup();
    let svg_new = one("node svg_new", &svg_news)?;
 
-   // In the body: `lea out,[frame+leaf]; ...; call svg_new`, then
-   // `mov dword ptr [frame+color],1` and the call pushing the leaf.
-   let leaf_arg = format!("lea {},", reg_name(abi.arg(0)));
+   // The body draws the leaf, or calls the function that does (Win64 2208).
    let lines = phoenix_hook::x86::disasm(
       function_code(image, body, "message body")?,
       body,
       usize::MAX,
    );
-   let (push_svg, svg_color) = lines
-      .iter()
-      .enumerate()
-      .filter(|(_, line)| callee(image, line) == Some(svg_new))
-      .find_map(|(at, _)| {
-         let leaf = lines[at.saturating_sub(8)..at]
+   let drawers = callers(image, svg_new);
+   let (push_svg, svg_color) = leaf_push(image, svg_new, &lines)
+      .or_else(|| {
+         lines
             .iter()
-            .rev()
-            .find_map(|line| slot_of(line.text.strip_prefix(&leaf_arg)?, &base))?;
-         let after = &lines[at + 1..(at + 24).min(lines.len())];
-         let push = after.iter().find(|line| line.text.starts_with("call "))?;
-         let tag = after
-            .iter()
-            .take_while(|line| line.addr < push.addr)
-            .find_map(|line| {
-               slot_of(
-                  line
-                     .text
-                     .strip_prefix("mov dword ptr ")?
-                     .strip_suffix(",1")?,
-                  &base,
+            .filter_map(|line| callee(image, line))
+            .filter(|func| drawers.contains(func))
+            .find_map(|func| {
+               let code = function_code(image, func, "").ok()?;
+               leaf_push(
+                  image,
+                  svg_new,
+                  &phoenix_hook::x86::disasm(code, func, usize::MAX),
                )
-            })?;
-         Some((callee(image, push)?, tag.checked_sub(leaf)?))
+            })
       })
       .ok_or("node SVG leaf push not found in the message body")?;
    if !(4..0x30).contains(&svg_color) {
@@ -2500,6 +2560,14 @@ pub fn asset_load(image: &Image<'_>) -> Found<usize> {
    loaders.sort_unstable();
    loaders.dedup();
    one("asset loader", &loaders)
+}
+
+/// The prologue `build_message_body` opens with, if it is one it can have.
+fn body_prologue(image: &Image<'_>, func: usize) -> Option<Prologue> {
+   let known = prologues(image);
+   [known.row, known.frame]
+      .into_iter()
+      .find(|prologue| prologue.at(image, func))
 }
 
 /// `Store::delete_message`, the client's optimistic delete. It shares the map
@@ -3094,15 +3162,14 @@ pub fn modal(image: &Image<'_>, div_into_any: usize, div: &DivLayout) -> Found<M
 
    // `Div::id` is the first call after `lea` of `"game-server-shop-carousel"`,
    // checking `ElementId::None` in `Interactivity` (`cmp byte ptr [rcx +
-   // disp32], 0xff`).
-   let carousel = one(
-      "game-server-shop-carousel",
-      &image.find_bytes(b"game-server-shop-carousel"),
-   )?;
+   // disp32], 0xff`). Windows 2208 keeps two copies of the string, so the
+   // loads of every copy are candidates and the `Div::id` argument picks one.
    // `Div::id(div, id)` takes the id string as its third argument.
    let abi = Abi::of(image);
-   let carousel_leas: Vec<usize> = leas_of(carousel)
+   let carousel_leas: Vec<usize> = image
+      .find_bytes(b"game-server-shop-carousel")
       .into_iter()
+      .flat_map(leas_of)
       .filter(|&lea| image.read(lea, 3) == Some(&lea_rip(abi.arg(2))[..]))
       .collect();
    let carousel_lea = one("game-server-shop-carousel load", &carousel_leas)?;
@@ -3724,10 +3791,7 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
    // panic string (may appear in multiple CGUs).
    // COFF merges the panic's verb into the type name's literal, ELF loads the
    // bare name.
-   let read_panic = match abi {
-      Abi::Win64 => READ_PANIC,
-      Abi::SysV => &READ_PANIC[b"read".len()..],
-   };
+   let read_panic = &READ_PANIC[b"read".len()..];
    let leas = string_leas(image, &[read_panic, TEXT_INPUT_TYPE, TEXT_AREA_TYPE]);
    let read_panics = image.find_bytes(read_panic);
    if read_panics.is_empty() {
