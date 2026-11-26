@@ -81,6 +81,7 @@ use crate::{
       self,
       Notice,
    },
+   rail,
    shortcuts,
    sidebar,
    toolbar,
@@ -1557,6 +1558,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       })?,
    )?;
 
+   let column_owner = plugin.to_owned();
+   ui.set(
+      "folderColumn",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+         folder_column(&ctx, &column_owner)
+      })?,
+   )?;
+
    let page_owner = plugin.to_owned();
    ui.set(
       "openPage",
@@ -1853,6 +1862,30 @@ fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result
 #[cfg(not(target_arch = "x86_64"))]
 fn hide_count<'js>(ctx: &Ctx<'js>, _plugin: &str, _name: &str) -> rquickjs::Result<Function<'js>> {
    noop_handle(ctx)
+}
+
+/// Shows the open folders' servers in a column beside the rail until the
+/// returned remover runs.
+fn folder_column<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function<'js>> {
+   static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+   let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+   let registry = ctx
+      .userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .folder_columns
+      .borrow_mut()
+      .push((id, plugin.to_owned()));
+   rail::enable(true);
+   drop(registry);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut columns = registry.folder_columns.borrow_mut();
+         columns.retain(|(existing, _)| *existing != id);
+         rail::enable(!columns.is_empty());
+      }
+   })
 }
 
 pub fn on_send<'js>(

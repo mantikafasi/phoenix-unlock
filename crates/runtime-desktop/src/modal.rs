@@ -2146,6 +2146,17 @@ fn div_with_id(msym: &ModalSymbols, mut div: RawDiv, id: &str) -> RawDiv {
    out
 }
 
+/// Gives `div` an element id, which GPUI needs to keep its scroll offset.
+/// False when `Div::id` was not found.
+pub fn set_id(div: &mut RawDiv, id: &str) -> bool {
+   let Some(msym) = MODAL_SYM.get() else {
+      return false;
+   };
+   let old = std::mem::replace(div, RawDiv::zeroed());
+   *div = div_with_id(msym, old, id);
+   true
+}
+
 fn make_modal_button(
    id: &str,
    label: &str,

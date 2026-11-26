@@ -34,6 +34,7 @@ use crate::{
       DesktopMember,
    },
    members::Place,
+   rail,
    shortcuts,
    sidebar,
    toolbar,
@@ -71,6 +72,8 @@ pub struct Desktop<'js> {
    /// `phoenix.ui.hideCount` holds by id and plugin.
    #[cfg(target_arch = "x86_64")]
    pub hidden_counts:  RefCell<Vec<(u64, String, Count)>>,
+   /// `phoenix.ui.folderColumn` handles by id and plugin.
+   pub folder_columns: RefCell<Vec<(u64, String)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -190,6 +193,10 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       hidden.retain(|(_, plugin, _)| plugin != name);
       counts::hide(hidden.iter().map(|&(.., count)| count));
    }
+
+   let mut columns = registry.folder_columns.borrow_mut();
+   columns.retain(|(_, plugin)| plugin != name);
+   rail::enable(!columns.is_empty());
 
    themes::unload(name);
 }
