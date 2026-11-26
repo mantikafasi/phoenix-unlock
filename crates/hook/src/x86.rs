@@ -250,6 +250,264 @@ impl Constants {
    }
 }
 
+/// What a function does with the struct its `index`th argument points at.
+///
+/// Like [`sret_stores`], control flow is followed linearly, so a use after the
+/// pointer's register is reused is missed and never misread. Unlike it,
+/// decoding runs past each `ret` to the end of `code`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ArgUse {
+   /// The end of the furthest read or write through the pointer.
+   pub extent:     usize,
+   /// Each call, with the struct offset each of the first four argument
+   /// registers stands for: `lea reg, [ptr+offset]`, or a slot `reg` points
+   /// at that a 16-byte move filled from `[ptr+offset]`.
+   pub calls:      Vec<[Option<usize>; 4]>,
+   /// `rep movsb` copies out of the struct.
+   pub copies:     Vec<StructCopy>,
+   /// Offsets whose value indexes a jump table.
+   pub dispatches: Vec<usize>,
+}
+
+/// A `rep movsb` out of the struct [`arg_use`] follows.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StructCopy {
+   pub offset:      usize,
+   pub len:         usize,
+   /// How many calls come before it.
+   pub after_calls: usize,
+}
+
+/// What a register holds, as the struct offset it relates to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Holds {
+   /// A pointer to the field at this offset.
+   Pointer(usize),
+   /// The value of the field at this offset.
+   Value(usize),
+   /// A pointer to a slot copied from the field at this offset.
+   Slot(usize),
+}
+
+/// The registers [`arg_use`] follows, and what it found so far.
+struct ArgTracker {
+   held:     Vec<(Register, Holds)>,
+   constant: Vec<(Register, u64)>,
+   found:    ArgUse,
+}
+
+impl ArgTracker {
+   /// Larger displacements are globals or stack slots, not struct fields.
+   const FIELD_LIMIT: u64 = 0x1000;
+
+   fn holds(&self, register: Register) -> Option<Holds> {
+      let register = register.full_register();
+      self
+         .held
+         .iter()
+         .find(|(held, _)| *held == register)
+         .map(|&(_, holds)| holds)
+   }
+
+   fn pointer(&self, register: Register) -> Option<usize> {
+      match self.holds(register)? {
+         Holds::Pointer(offset) => Some(offset),
+         _ => None,
+      }
+   }
+
+   fn value(&self, register: Register) -> Option<usize> {
+      match self.holds(register)? {
+         Holds::Value(offset) => Some(offset),
+         _ => None,
+      }
+   }
+
+   /// The struct offset `[base+displacement]` reaches, when `base` points
+   /// into it.
+   fn field(&self, base: Register, displacement: u64) -> Option<usize> {
+      (displacement < Self::FIELD_LIMIT)
+         .then(|| Some(self.pointer(base)? + addr(displacement)))
+         .flatten()
+   }
+
+   /// The struct offset of `instruction`'s memory operand, and which operand
+   /// it is.
+   fn memory_field(&self, instruction: &Instruction) -> Option<(u32, usize)> {
+      use iced_x86::OpKind;
+      let operand =
+         (0..instruction.op_count()).find(|&op| instruction.op_kind(op) == OpKind::Memory)?;
+      (instruction.memory_index() == Register::None)
+         .then(|| {
+            self.field(
+               instruction.memory_base(),
+               instruction.memory_displacement64(),
+            )
+         })
+         .flatten()
+         .map(|offset| (operand, offset))
+   }
+
+   fn call(&mut self, abi: Abi) {
+      let stands_for = |register| {
+         match self.holds(register)? {
+            Holds::Pointer(offset) | Holds::Slot(offset) => Some(offset),
+            Holds::Value(_) => None,
+         }
+      };
+      let args = [0, 1, 2, 3].map(|arg| stands_for(abi.arg(arg)));
+      self.found.calls.push(args);
+      self
+         .held
+         .retain(|(register, _)| !abi.volatile().contains(register));
+      self
+         .constant
+         .retain(|(register, _)| !abi.volatile().contains(register));
+   }
+
+   /// What `instruction` makes its first operand hold, and the copies and
+   /// dispatches it shows.
+   fn step(&mut self, instruction: &Instruction) -> Option<(Register, Holds)> {
+      use iced_x86::{
+         Code,
+         Mnemonic,
+         OpKind,
+      };
+      let target = (instruction.op0_kind() == OpKind::Register)
+         .then(|| instruction.op0_register().full_register());
+      let sixteen = matches!(
+         instruction.mnemonic(),
+         Mnemonic::Movups | Mnemonic::Movaps | Mnemonic::Movdqu | Mnemonic::Movdqa
+      );
+      match (
+         instruction.mnemonic(),
+         self.memory_field(instruction),
+         target,
+      ) {
+         (Mnemonic::Lea, Some((1, offset)), Some(target)) => Some((target, Holds::Pointer(offset))),
+         (Mnemonic::Mov, Some((1, offset)), Some(target))
+            if instruction.code() == Code::Mov_r64_rm64 =>
+         {
+            Some((target, Holds::Value(offset)))
+         },
+         (Mnemonic::Mov, None, Some(target))
+            if matches!(instruction.code(), Code::Mov_r64_rm64 | Code::Mov_rm64_r64)
+               && instruction.op1_kind() == OpKind::Register =>
+         {
+            Some((target, self.holds(instruction.op1_register())?))
+         },
+         (_, Some((1, offset)), Some(target)) if sixteen => Some((target, Holds::Value(offset))),
+         (..)
+            if sixteen
+               && instruction.op0_kind() == OpKind::Memory
+               && instruction.memory_displacement64() == 0
+               && instruction.memory_index() == Register::None =>
+         {
+            let offset = self.value(instruction.op1_register())?;
+            Some((
+               instruction.memory_base().full_register(),
+               Holds::Slot(offset),
+            ))
+         },
+         (Mnemonic::Movsxd, ..) => {
+            let offset = self.value(instruction.memory_index())?;
+            self.found.dispatches.push(offset);
+            None
+         },
+         (Mnemonic::Movsb, ..) if instruction.has_rep_prefix() => {
+            let offset = self.pointer(Register::RSI)?;
+            let &(_, len) = self
+               .constant
+               .iter()
+               .find(|(register, _)| *register == Register::RCX)?;
+            self.found.copies.push(StructCopy {
+               offset,
+               len: addr(len),
+               after_calls: self.found.calls.len(),
+            });
+            None
+         },
+         _ => None,
+      }
+   }
+}
+
+/// Reads [`ArgUse`] for the struct the `index`th argument points at in `code`
+/// at `ip`.
+#[must_use]
+pub fn arg_use(abi: Abi, index: usize, code: &[u8], ip: usize) -> ArgUse {
+   use iced_x86::{
+      InstructionInfoFactory,
+      Mnemonic,
+      OpAccess,
+      OpKind,
+   };
+
+   let mut decoder = Decoder::with_ip(64, code, ip as u64, DecoderOptions::NONE);
+   let mut factory = InstructionInfoFactory::new();
+   let mut constants = Constants::default();
+   let mut tracker = ArgTracker {
+      held:     vec![(abi.arg(index), Holds::Pointer(0))],
+      constant: Vec::new(),
+      found:    ArgUse::default(),
+   };
+   while decoder.can_decode() {
+      let instruction = decoder.decode();
+      if instruction.is_invalid() {
+         break;
+      }
+      if instruction.mnemonic() == Mnemonic::Call {
+         tracker.call(abi);
+         continue;
+      }
+      let info = factory.info(&instruction);
+      for memory in info.used_memory() {
+         if memory.index() == Register::None
+            && let Some(offset) = tracker.field(memory.base(), memory.displacement())
+         {
+            tracker.found.extent = tracker
+               .found
+               .extent
+               .max(offset + memory.memory_size().size());
+         }
+      }
+      let new = tracker.step(&instruction);
+      let loaded = constants.loaded(&instruction);
+      let written = info
+         .used_registers()
+         .iter()
+         .filter(|used| {
+            matches!(
+               used.access(),
+               OpAccess::Write
+                  | OpAccess::CondWrite
+                  | OpAccess::ReadWrite
+                  | OpAccess::ReadCondWrite
+            )
+         })
+         .map(|used| used.register().full_register())
+         .collect::<Vec<_>>();
+      tracker
+         .held
+         .retain(|(register, _)| !written.contains(register));
+      tracker
+         .constant
+         .retain(|(register, _)| !written.contains(register));
+      if let Some(new) = new {
+         tracker.held.retain(|(register, _)| *register != new.0);
+         tracker.held.push(new);
+      }
+      if let Some(value) = loaded
+         && instruction.op0_kind() == OpKind::Register
+      {
+         tracker
+            .constant
+            .push((instruction.op0_register().full_register(), value));
+      }
+   }
+   tracker.found
+}
+
 /// The `(offset, size)` stores a function makes through its hidden return
 /// pointer, the first argument register on entry.
 ///
@@ -429,7 +687,8 @@ pub fn debug_fields(abi: Abi, code: &[u8], ip: usize) -> Vec<DebugField> {
             }
          },
          (Mnemonic::Add, Some(_)) if to_this => {
-            // A register, a negative or an overflowing step loses track of `self`.
+            // A register, a negative or an overflowing step loses track of
+            // `self`.
             if let Some(sum) = ins
                .try_immediate(1)
                .ok()
@@ -945,6 +1204,46 @@ mod tests {
          (8, 8),
          (0, 0x40)
       ]);
+   }
+
+   #[test]
+   fn arg_use_reads_send_in_the_linux_build_from_2026_11_23() {
+      // Pieces of `ReqwestTransport::send` from the build whose request grew
+      // past 0xF0 bytes.
+      let code = [
+         0x48, 0x89, 0xF3, // mov rbx, rsi
+         0xE8, 0x00, 0x00, 0x00, 0x00, // call
+         0x48, 0x8B, 0x83, 0x08, 0x01, 0x00, 0x00, // mov rax, [rbx+0x108]
+         0x48, 0x8D, 0x94, 0x24, 0x80, 0x09, 0x00, 0x00, // lea rdx, [rsp+0x980]
+         0x48, 0x89, 0x42, 0x10, // mov [rdx+0x10], rax
+         0x0F, 0x10, 0x83, 0xF8, 0x00, 0x00, 0x00, // movups xmm0, [rbx+0xF8]
+         0x0F, 0x29, 0x02, // movaps [rdx], xmm0
+         0x48, 0x8D, 0x8B, 0xB0, 0x00, 0x00, 0x00, // lea rcx, [rbx+0xB0]
+         0xE8, 0x00, 0x00, 0x00, 0x00, // call: the request from method and URL
+         0x6A, 0x60, // push 0x60
+         0x59, // pop rcx
+         0x48, 0x89, 0xD7, // mov rdi, rdx
+         0x48, 0x89, 0xDE, // mov rsi, rbx
+         0xF3, 0xA4, // rep movsb: the headers
+         0x48, 0x8B, 0x43, 0x78, // mov rax, [rbx+0x78]
+         0x49, 0x63, 0x04, 0x87, // movsxd rax, [r15+rax*4]: the body's tag
+         0xC3, // ret
+         0x40, 0x8A, 0xAB, 0x62, 0x01, 0x00, 0x00, // mov bpl, [rbx+0x162]: past the ret
+      ];
+      let used = arg_use(Abi::SysV, 1, &code, 0x1000);
+      assert_eq!(used.extent, 0x163);
+      assert_eq!(used.calls, [[None, Some(0), None, None], [
+         None,
+         None,
+         Some(0xF8),
+         Some(0xB0)
+      ]]);
+      assert_eq!(used.copies, [StructCopy {
+         offset:      0,
+         len:         0x60,
+         after_calls: 2,
+      }]);
+      assert_eq!(used.dispatches, [0x78]);
    }
 
    #[test]

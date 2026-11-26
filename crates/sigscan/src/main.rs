@@ -131,8 +131,16 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                prologues
                   .frame
                   .at(image, http.send_fn)
-                  .then(|| at(http.send_fn))
+                  .then(|| format!("{} request {:x?}", at(http.send_fn), http.request))
                   .ok_or_else(|| "send prologue changed".to_owned())
+            }),
+         );
+         report(
+            "http responses",
+            http.as_ref().map_err(Clone::clone).and_then(|http| {
+               (http.poll_result <= phoenix_sigs::http::POLL_RESULT_SIZE)
+                  .then(|| at(http.poll_fn))
+                  .ok_or_else(|| format!("poll writes {:#x} bytes of its result", http.poll_result))
             }),
          );
          report(

@@ -23,6 +23,28 @@ use crate::Found;
 /// host-file body.
 const HOST_FILE_ANCHOR: &[u8] = b"a host file body needs the host's transport";
 
+/// The size of `http::HeaderMap`, which `send`'s request starts with.
+pub const HEADER_MAP_SIZE: usize = 0x60;
+/// The size of the request's body enum.
+pub const BODY_SIZE: usize = 0x38;
+/// The size of a `String`, and of an `http::Method`.
+pub const STRING_SIZE: usize = 0x18;
+/// The size of the `Poll<Result<Response>>` the runtime reads `poll`'s result
+/// as.
+pub const POLL_RESULT_SIZE: usize = 0x80;
+
+/// Where `send`'s request keeps the fields the runtime reads, after the
+/// `http::HeaderMap` it starts with. Builds move them as fields are added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLayout {
+   /// The body enum's tag, followed by its `Bytes`.
+   pub body:   usize,
+   /// The URL `String`.
+   pub url:    usize,
+   /// The `http::Method`.
+   pub method: usize,
+}
+
 /// Located vtable slots and host allocator entry points for Desktop Phoenix's
 /// `libdiscord/crates/http` transport.
 #[derive(Debug, Clone)]
@@ -32,10 +54,15 @@ pub struct DesktopHttpTransport {
    pub send_slots:   Vec<usize>,
    /// Original `ReqwestTransport::send` function address.
    pub send_fn:      usize,
+   /// Where `send`'s request keeps its fields.
+   pub request:      RequestLayout,
    /// All `.rdata` vtable slots holding `SendFuture::poll`.
    pub poll_slots:   Vec<usize>,
    /// Original `SendFuture::poll` function address.
    pub poll_fn:      usize,
+   /// How many bytes of its result `poll` writes, as far as it can be
+   /// followed. A build past [`POLL_RESULT_SIZE`] changed the response.
+   pub poll_result:  usize,
    /// Host's `__rust_alloc(size, align)` if located.
    pub host_alloc:   Option<usize>,
    /// Host's `__rust_dealloc(ptr, size, align)` if located.
@@ -60,6 +87,13 @@ impl DesktopHttpTransport {
       let (send_fn, send_end) = image
          .function_bounds(lea)
          .ok_or("ReqwestTransport::send has no unwind entry")?;
+      let request = request_layout(
+         abi,
+         image
+            .read(send_fn, send_end - send_fn)
+            .ok_or("send is unreadable")?,
+         send_fn,
+      )?;
 
       // 2. Every `dyn Transport` vtable slot in `.rdata` pointing to `send_fn`.
       let send_slots = find_vtable_method_slots(image, send_fn, 1..=0x2000);
@@ -67,18 +101,27 @@ impl DesktopHttpTransport {
          return Err("no Transport vtable holds ReqwestTransport::send".to_owned());
       }
 
-      // 3. The `Box::pin` of the async state machine returns `(ptr, poll_vtable)`,
-      //    from `send_fn` itself or a small helper it calls.
+      // 3. The `Box::pin` of the async state machine returns `(ptr,
+      //    poll_vtable)`, from `send_fn` itself or a small helper it calls.
       let (poll_fn, poll_vtable, box_future) = find_poll_vtable(image, send_fn, send_end)?;
       let mut poll_slots = find_vtable_method_slots(image, poll_fn, 0x100..=0x4000);
+      // shortcut: a result pointer `poll` keeps on the stack is not
+      // followed, so this only catches a build that writes past the layout
+      // through a register, as the one from 2026-11-23 does.
+      let poll_result = image
+         .function_bounds(poll_fn)
+         .and_then(|(start, end)| image.read(start, end - start).map(|code| (start, code)))
+         .map_or(0, |(start, code)| {
+            phoenix_hook::x86::arg_use(abi, 0, code, start).extent
+         });
       let direct_slot = poll_vtable + 24;
       if !poll_slots.contains(&direct_slot) {
          poll_slots.push(direct_slot);
       }
 
       // 4. The host's own `__rust_alloc` and `__rust_dealloc`, so response body
-      //    growth stays allocator-compatible. Both hand the same global allocator
-      //    static to its implementation.
+      //    growth stays allocator-compatible. Both hand the same global
+      //    allocator static to its implementation.
       let host_alloc = box_future.and_then(|box_future| find_host_alloc(image, abi, box_future));
       let host_dealloc = find_host_dealloc(image, abi, send_fn, send_end)
          .or_else(|| host_alloc.and_then(|alloc| dealloc_beside(image, abi, alloc)));
@@ -95,12 +138,61 @@ impl DesktopHttpTransport {
       Ok(Self {
          send_slots,
          send_fn,
+         request,
          poll_slots,
          poll_fn,
+         poll_result,
          host_alloc,
          host_dealloc,
       })
    }
+}
+
+/// Reads where `send` at `ip` keeps its request's fields. It moves the
+/// headers out whole right after the call that starts the `reqwest` request
+/// from the method and URL, and dispatches on the body's tag through a jump
+/// table.
+fn request_layout(abi: Abi, code: &[u8], ip: usize) -> Found<RequestLayout> {
+   let used = phoenix_hook::x86::arg_use(abi, 1, code, ip);
+   let copy = used
+      .copies
+      .iter()
+      .find(|copy| copy.offset == 0 && copy.len == HEADER_MAP_SIZE)
+      .ok_or("send never moves the request's headers out")?;
+   let call = copy
+      .after_calls
+      .checked_sub(1)
+      .and_then(|at| used.calls.get(at))
+      .ok_or("no call before the headers move")?;
+   let (Some(method), Some(url)) = (call[2], call[3]) else {
+      return Err(format!(
+         "the request call takes {call:?}, not a method and URL"
+      ));
+   };
+   let mut dispatches = used.dispatches.clone();
+   dispatches.sort_unstable();
+   dispatches.dedup();
+   let [body] = dispatches[..] else {
+      return Err(format!("{dispatches:#x?} could each be the body's tag"));
+   };
+   // The runtime takes a reference to each field, so they must not overlap.
+   let mut fields = [
+      (0, HEADER_MAP_SIZE),
+      (body, BODY_SIZE),
+      (url, STRING_SIZE),
+      (method, STRING_SIZE),
+   ];
+   fields.sort_unstable();
+   if fields
+      .windows(2)
+      .any(|pair| pair[0].0 + pair[0].1 > pair[1].0)
+      || fields.iter().any(|&(offset, _)| offset % 8 != 0)
+   {
+      return Err(format!(
+         "body {body:#x}, url {url:#x} and method {method:#x} overlap"
+      ));
+   }
+   Ok(RequestLayout { body, url, method })
 }
 
 /// Finds all `.rdata` vtable method-0 slots (`vtable + 24`) holding `method_fn`
@@ -376,4 +468,52 @@ fn lea_arg0(abi: Abi, code: &[u8], ip: usize) -> impl Iterator<Item = (usize, us
       let disp = i32::from_le_bytes(code.get(pos + 3..pos + 7)?.try_into().ok()?);
       Some((ip + pos, (ip + pos + 7).checked_add_signed(disp as isize)?))
    })
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   /// The client call and headers move of `send` in the Linux build from
+   /// 2026-11-23, around a body tag dispatch.
+   const SEND: &[u8] = &[
+      0x48, 0x89, 0xF3, // mov rbx, rsi
+      0x48, 0x8B, 0x83, 0x08, 0x01, 0x00, 0x00, // mov rax, [rbx+0x108]
+      0x48, 0x8D, 0x94, 0x24, 0x80, 0x09, 0x00, 0x00, // lea rdx, [rsp+0x980]
+      0x48, 0x89, 0x42, 0x10, // mov [rdx+0x10], rax
+      0x0F, 0x10, 0x83, 0xF8, 0x00, 0x00, 0x00, // movups xmm0, [rbx+0xF8]
+      0x0F, 0x29, 0x02, // movaps [rdx], xmm0
+      0x48, 0x8D, 0x8B, 0xB0, 0x00, 0x00, 0x00, // lea rcx, [rbx+0xB0]
+      0xE8, 0x00, 0x00, 0x00, 0x00, // call
+      0x6A, 0x60, // push 0x60
+      0x59, // pop rcx
+      0x48, 0x89, 0xDE, // mov rsi, rbx
+      0xF3, 0xA4, // rep movsb
+      0x48, 0x8B, 0x43, 0x78, // mov rax, [rbx+0x78]
+      0x49, 0x63, 0x04, 0x87, // movsxd rax, [r15+rax*4]
+   ];
+
+   #[test]
+   fn reads_the_request_layout_from_send() {
+      assert_eq!(
+         request_layout(Abi::SysV, SEND, 0x1000),
+         Ok(RequestLayout {
+            body:   0x78,
+            url:    0xB0,
+            method: 0xF8,
+         })
+      );
+   }
+
+   #[test]
+   fn refuses_overlapping_fields() {
+      // The body's tag read from inside the headers instead.
+      let mut send = SEND.to_vec();
+      let tag = send
+         .windows(4)
+         .position(|code| code == [0x48, 0x8B, 0x43, 0x78])
+         .expect("SEND reads the tag");
+      send[tag + 3] = 0x58;
+      assert!(request_layout(Abi::SysV, &send, 0x1000).is_err());
+   }
 }
