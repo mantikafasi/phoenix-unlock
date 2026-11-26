@@ -43,7 +43,10 @@ mod windows {
       },
       fs,
       io,
-      os::windows::ffi::OsStrExt,
+      os::windows::ffi::{
+         OsStrExt,
+         OsStringExt,
+      },
       path::{
          Path,
          PathBuf,
@@ -184,7 +187,6 @@ mod windows {
 
    /// The UTF-16 text in `entry` from byte `at`, up to its NUL.
    fn entry_text(entry: &[u8], at: usize) -> OsString {
-      use std::os::windows::ffi::OsStringExt;
       let units: Vec<u16> = entry[at..]
          .as_chunks::<2>()
          .0
@@ -273,6 +275,30 @@ mod windows {
       text.as_ref().encode_wide().chain([0]).collect()
    }
 
+   fn append_quoted(command: &mut Vec<u16>, arg: &OsStr) {
+      const QUOTE: u16 = b'"' as u16;
+      const SLASH: u16 = b'\\' as u16;
+      command.push(QUOTE);
+      let mut slashes = 0;
+      for unit in arg.encode_wide() {
+         if unit == SLASH {
+            slashes += 1;
+            continue;
+         }
+         // Windows treats backslashes before a quote as escapes.
+         let count = if unit == QUOTE {
+            slashes * 2 + 1
+         } else {
+            slashes
+         };
+         command.extend(std::iter::repeat_n(SLASH, count));
+         command.push(unit);
+         slashes = 0;
+      }
+      command.extend(std::iter::repeat_n(SLASH, slashes * 2));
+      command.push(QUOTE);
+   }
+
    fn check(ok: bool) -> io::Result<()> {
       if ok {
          Ok(())
@@ -281,7 +307,6 @@ mod windows {
       }
    }
 
-   #[expect(clippy::too_many_lines, reason = "launcher entrypoint")]
    pub fn run() -> misstep::Result<()> {
       let local = PathBuf::from(env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unset")?);
       let home = local.join("Sunbird");
@@ -316,12 +341,18 @@ mod windows {
       {
          no_runtime = true;
       }
-      let dll = match explicit {
+      let launcher = if explicit.is_some() {
+         env::current_exe()?
+      } else {
+         home.join("sunbird.exe")
+      };
+      let dll = match &explicit {
          Some(path) => PathBuf::from(path),
          None => install(&local, &home)?,
       };
       let dll = dll.canonicalize()?;
-      let args: Vec<OsString> = args.skip_while(|arg| arg == "--").collect();
+      args.next_if(|arg| arg == "--");
+      let args: Vec<OsString> = args.collect();
 
       // A second Discord hands off to the running one and exits, so Sunbird
       // would never run in the Discord the user sees.
@@ -364,17 +395,44 @@ mod windows {
          }
       }
 
-      let mut command = OsString::from(format!("\"{}\"", exe.display()));
-      for arg in &args {
-         command.push(" ");
-         command.push(arg);
-      }
-      let mut command = wide(command);
+      set_restart_env(&launcher, explicit.as_ref().map(|_| dll.as_path()), no_runtime);
+      launch(&exe, &app, &dll, &args)
+   }
+
+   fn set_restart_env(launcher: &Path, explicit_dll: Option<&Path>, no_runtime: bool) {
+      let mut restart_args = Vec::new();
       if no_runtime {
-         // SAFETY: `phoenix-inject` is single-threaded; `Discord.exe` inherits
-         // the flag and opens only the access gate without starting Sunbird.
-         unsafe { env::set_var("SUNBIRD_GATE_ONLY", "1") };
+         restart_args.extend("--no-runtime ".encode_utf16());
       }
+      if let Some(dll) = explicit_dll {
+         append_quoted(&mut restart_args, dll.as_os_str());
+         restart_args.push(u16::from(b' '));
+      }
+      restart_args.extend("--".encode_utf16());
+      // SAFETY: the launcher is single-threaded. Discord and its restart helper
+      // inherit these settings with the rest of the environment.
+      unsafe {
+         env::set_var("SUNBIRD_RESTART_EXE", launcher);
+         env::set_var("SUNBIRD_RESTART_ARGS", OsString::from_wide(&restart_args));
+         if no_runtime {
+            env::set_var("SUNBIRD_GATE_ONLY", "1");
+         }
+      }
+   }
+
+   fn launch(
+      exe: &Path,
+      app: &Path,
+      dll: &Path,
+      args: &[OsString],
+   ) -> misstep::Result<()> {
+      let mut command = Vec::new();
+      append_quoted(&mut command, exe.as_os_str());
+      for arg in args {
+         command.push(u16::from(b' '));
+         append_quoted(&mut command, arg);
+      }
+      command.push(0);
 
       // STARTUPINFOW is 104 bytes on x64 and only `cb` must be set.
       let mut startup = [0u64; 13];
@@ -389,20 +447,20 @@ mod windows {
       // NUL-terminated.
       check(unsafe {
          CreateProcessW(
-            wide(&exe).as_ptr(),
+            wide(exe).as_ptr(),
             command.as_mut_ptr(),
             ptr::null(),
             ptr::null(),
             0,
             CREATE_SUSPENDED,
             ptr::null(),
-            wide(&app).as_ptr(),
+            wide(app).as_ptr(),
             startup.as_ptr().cast(),
             &raw mut info,
          ) != 0
       })?;
 
-      let queued = queue_load(&info, &wide(&dll));
+      let queued = queue_load(&info, &wide(dll));
       if queued.is_err() {
          // SAFETY: `info.process` is the suspended child created above.
          unsafe { TerminateProcess(info.process, 1) };
@@ -586,6 +644,20 @@ mod windows {
 
    #[cfg(test)]
    mod tests {
+      #[test]
+      fn quotes_windows_arguments_for_restart() {
+         for (arg, quoted) in [
+            ("", r#""""#),
+            ("two words", r#""two words""#),
+            (r"C:\a b\", r#""C:\a b\\""#),
+            (r#"a\"b"#, r#""a\\\"b""#),
+         ] {
+            let mut command = Vec::new();
+            super::append_quoted(&mut command, arg.as_ref());
+            assert_eq!(String::from_utf16(&command).unwrap(), quoted);
+         }
+      }
+
       #[test]
       fn reads_the_loader_version() {
          let manifest = "{\n  \"loader\": \"2026.11.23.2353-b51d77c\",\n  \"plugins\": {}\n}";
