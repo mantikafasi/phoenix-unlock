@@ -15,6 +15,9 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(windows)] mod http;
+#[cfg(windows)] mod shortcuts;
+
 #[cfg(windows)]
 fn main() {
    misstep::install_panic_hook();
@@ -47,6 +50,8 @@ mod windows {
       },
       process::Command,
       ptr,
+      thread,
+      time::Duration,
    };
 
    use misstep::{
@@ -122,9 +127,6 @@ mod windows {
       fn MessageBoxW(window: Handle, text: *const u16, caption: *const u16, kind: u32) -> i32;
    }
 
-   /// `CREATE_NO_WINDOW`, so `curl` and PowerShell don't flash a console.
-   const NO_WINDOW: u32 = 0x0800_0000;
-
    /// Where the site serves `version.json` and the loaders. `SUNBIRD_SITE`
    /// points it at a local server for testing; anything else must be https,
    /// since what it serves is loaded into Discord.
@@ -146,14 +148,6 @@ mod windows {
                   .strip_prefix(local)
                   .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
             })
-   }
-
-   /// A program in System32, by full path: `Command` looks beside this
-   /// launcher first, which is the Downloads folder on the first run.
-   fn system32(program: &str) -> PathBuf {
-      PathBuf::from(env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
-         .join("System32")
-         .join(program)
    }
 
    /// Shows `text` in a message box, since the launcher has no console.
@@ -192,8 +186,10 @@ mod windows {
    fn entry_text(entry: &[u8], at: usize) -> OsString {
       use std::os::windows::ffi::OsStringExt;
       let units: Vec<u16> = entry[at..]
-         .chunks_exact(2)
-         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+         .as_chunks::<2>()
+         .0
+         .iter()
+         .map(|pair| u16::from_le_bytes(*pair))
          .take_while(|&unit| unit != 0)
          .collect();
       OsString::from_wide(&units)
@@ -223,7 +219,7 @@ mod windows {
             let process = unsafe { OpenProcess(PROCESS_ACCESS, 0, pid) };
             if !process.is_null() {
                let mut path = [0u16; 1024];
-               let mut len = path.len() as u32;
+               let mut len = u32::try_from(path.len()).unwrap_or(1024);
                // SAFETY: `path` holds `len` units.
                let named = unsafe {
                   QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &raw mut len)
@@ -268,7 +264,7 @@ mod windows {
       found
    }
 
-   fn as_bytes(words: &[u64]) -> &[u8] {
+   const fn as_bytes(words: &[u64]) -> &[u8] {
       // SAFETY: any `u64`s are valid bytes, and the length covers them.
       unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), size_of_val(words)) }
    }
@@ -285,6 +281,7 @@ mod windows {
       }
    }
 
+   #[expect(clippy::too_many_lines, reason = "launcher entrypoint")]
    pub fn run() -> misstep::Result<()> {
       let local = PathBuf::from(env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unset")?);
       let home = local.join("Sunbird");
@@ -484,7 +481,7 @@ mod windows {
       // Missing shortcuts never stop Discord from starting, and a shortcut the
       // user deleted stays deleted until they run the installer again.
       if copied {
-         let _ = shortcuts(local, &launcher, false);
+         let _ = crate::shortcuts::sync(local, &launcher, false);
       }
       Ok(dll)
    }
@@ -501,7 +498,7 @@ mod windows {
    /// which Windows lets us rename but not overwrite.
    fn update(home: &Path, dll: &Path) -> misstep::Result<()> {
       let site = site()?;
-      let manifest = curl(&site, 10, &[&format!("{site}/version.json")])?;
+      let manifest = crate::http::text(&format!("{site}/version.json"), Duration::from_secs(10))?;
       let version = loader_version(&manifest).context("version.json has no loader")?;
       let stamp = home.join("version.txt");
       if dll.is_file() && fs::read_to_string(&stamp).is_ok_and(|have| have.trim() == version) {
@@ -511,26 +508,22 @@ mod windows {
       let fresh = home.join(format!("phoenix.dll.{}.new", std::process::id()));
       // Discord waits on this download. With a DLL to fall back on, a slow one
       // gives up sooner; a first install has nothing else, so it keeps trying.
-      let (max_secs, retries) = if dll.is_file() { (60, "0") } else { (180, "2") };
-      if let Err(err) = curl(&site, max_secs, &[
-         "--retry",
-         retries,
-         "--retry-delay",
-         "2",
-         "--speed-limit",
-         "1024",
-         "--speed-time",
-         "30",
-         "-o",
-         &fresh.to_string_lossy(),
-         &format!("{site}/plugins/phoenix-windows-x86_64.dll"),
-      ]) {
+      let attempts = if dll.is_file() { 1 } else { 3 };
+      let url = format!("{site}/plugins/phoenix-windows-x86_64.dll");
+      let mut downloaded = crate::http::download(&url, &fresh, Duration::from_secs(60));
+      for _ in 1..attempts {
+         if downloaded.is_ok() {
+            break;
+         }
+         thread::sleep(Duration::from_secs(2));
+         downloaded = crate::http::download(&url, &fresh, Duration::from_secs(60));
+      }
+      if let Err(err) = downloaded {
          let _ = fs::remove_file(&fresh);
          return Err(err);
       }
-      // `curl -f` only rejects an HTTP error, so a captive portal or a wrong
-      // deploy still writes its body here; swapping that in would leave
-      // Discord without a working DLL.
+      // A captive portal or a wrong deploy still writes its body here;
+      // swapping that in would leave Discord without a working DLL.
       if !is_loader(&fresh) {
          let _ = fs::remove_file(&fresh);
          misstep::bail!("the downloaded phoenix.dll is not a Windows loader");
@@ -568,52 +561,6 @@ mod windows {
       })
    }
 
-   /// Runs Windows' own `curl.exe` and returns what it printed. Only
-   /// `site`'s scheme is allowed, and redirects never leave https.
-   fn curl(site: &str, max_secs: u32, args: &[&str]) -> misstep::Result<String> {
-      use std::os::windows::process::CommandExt;
-      let proto = if site.starts_with("https://") {
-         "=https"
-      } else {
-         "=http"
-      };
-      let connect_secs = max_secs.min(15).to_string();
-      let max_secs = max_secs.to_string();
-      let run = |revoke: &[&str]| {
-         Command::new(system32("curl.exe"))
-            .args([
-               "-fsSL",
-               "--proto",
-               proto,
-               "--proto-redir",
-               "=https",
-               "--connect-timeout",
-               &connect_secs,
-            ])
-            .args(revoke)
-            .args(["--max-time", &max_secs])
-            .args(args)
-            .creation_flags(NO_WINDOW)
-            .output()
-            .context("running curl.exe")
-      };
-      let mut out = run(&["--ssl-revoke-best-effort"])?;
-      // Windows 10 1809's curl.exe (7.55, as in LTSC 2019) predates the flag,
-      // so it runs again without, checking revocation strictly instead.
-      if !out.status.success()
-         && String::from_utf8_lossy(&out.stderr).contains("--ssl-revoke-best-effort")
-      {
-         out = run(&[])?;
-      }
-      if !out.status.success() {
-         let stderr = String::from_utf8_lossy(&out.stderr);
-         let detail = stderr.trim();
-         let detail = detail.strip_prefix("curl:").map_or(detail, str::trim_start);
-         misstep::bail!("curl: {detail}");
-      }
-      Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-   }
-
    /// `"loader": "<version>"` from `version.json`.
    fn loader_version(manifest: &str) -> Option<&str> {
       let rest = &manifest[manifest.find("\"loader\"")? + 8..];
@@ -621,42 +568,10 @@ mod windows {
       rest.get(..rest.find('"')?)
    }
 
-   /// The Start Menu and Desktop shortcuts, and a Start Menu one for access
-   /// gate only, for when the runtime crashes on a Discord build it doesn't
-   /// know yet. Made through PowerShell's `WScript.Shell`, so
-   /// OneDrive-redirected desktops resolve. Adds them when missing, or removes
-   /// them. Paths reach the script through the environment, never inside its
-   /// text.
-   fn shortcuts(local: &Path, launcher: &Path, remove: bool) -> misstep::Result<()> {
-      use std::os::windows::process::CommandExt;
-      let script = format!(
-         "$w = New-Object -ComObject WScript.Shell; $programs = \
-          [Environment]::GetFolderPath('Programs'); $sunbird = @('Sunbird', '', 'Discord with \
-          Sunbird'); foreach ($l in @((@($programs) + $sunbird), \
-          (@([Environment]::GetFolderPath('Desktop')) + $sunbird), @($programs, 'Sunbird (access \
-          gate only)', '--no-runtime', 'Discord past the access gate, without plugins'))) {{ $p = \
-          Join-Path $l[0] ($l[1] + '.lnk'); if (${remove}) {{ Remove-Item -LiteralPath $p \
-          -ErrorAction SilentlyContinue; continue }}; if (Test-Path -LiteralPath $p) {{ continue \
-          }}; $s = $w.CreateShortcut($p); $s.TargetPath = $env:SB_TARGET; $s.Arguments = $l[2]; \
-          $s.IconLocation = $env:SB_ICON + ',0'; $s.Description = $l[3]; $s.Save() }}"
-      );
-      let status = Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"))
-         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-         .env("SB_TARGET", launcher)
-         .env("SB_ICON", local.join(r"DiscordPhoenix\app\Discord.exe"))
-         .creation_flags(NO_WINDOW)
-         .status()
-         .context("running powershell.exe")?;
-      if !status.success() {
-         misstep::bail!("creating the Sunbird shortcuts failed");
-      }
-      Ok(())
-   }
-
    /// Removes the shortcuts and `home`. Files a running Discord or launcher
    /// still holds stay until they exit, and the user is told so.
    fn uninstall(local: &Path, home: &Path) {
-      let _ = shortcuts(local, &home.join("sunbird.exe"), true);
+      let _ = crate::shortcuts::sync(local, &home.join("sunbird.exe"), true);
       match fs::remove_dir_all(home) {
          Err(err) if err.kind() != io::ErrorKind::NotFound => {
             alert(&format!(

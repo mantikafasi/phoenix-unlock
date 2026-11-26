@@ -35,6 +35,18 @@ jobs:
     name: iOS
     uses: ./.github/workflows/ios.yml # zizmor: ignore[self-repository]
 
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+      - env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo +stable-x86_64-pc-windows-msvc build --locked --release -p phoenix-loader -p phoenix-inject
+
   actions:
     name: Actions Lint
     uses: manic-systems/workflows/.github/workflows/actions-lint.yml@02fcd089a850e25bc6eff55f74db80c12b54391e # v2.3.4
@@ -45,6 +57,7 @@ jobs:
     needs:
       - checks
       - ios
+      - windows
       - actions
     runs-on: ubuntu-latest
     steps:

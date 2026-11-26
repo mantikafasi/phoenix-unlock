@@ -18,7 +18,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            toolchain: stable-x86_64-pc-windows-gnu
+            toolchain: stable-x86_64-pc-windows-msvc
             files: |
               target/release/phoenix.dll
               target/release/phoenix-inject.exe
@@ -37,7 +37,9 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
-      - run: cargo +${{ matrix.toolchain }} build --locked --release -p phoenix-loader ${{ runner.os == 'Windows' && '-p phoenix-inject' || '' }}
+      - env:
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+        run: cargo +${{ matrix.toolchain }} build --locked --release -p phoenix-loader ${{ runner.os == 'Windows' && '-p phoenix-inject' || '' }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-${{ runner.os }}
