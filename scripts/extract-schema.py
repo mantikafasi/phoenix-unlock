@@ -133,7 +133,11 @@ def table_holding(inits: dict[str, list[str]], markers: set[str]) -> list[str]:
 
 def extract_accessibility_ids(repo_root: Path) -> list[str]:
     patterns = set()
-    scan_dirs = [repo_root / "crates" / "runtime" / "src", repo_root / "plugins"]
+    scan_dirs = [
+        repo_root / "crates" / "runtime" / "src",
+        repo_root / "crates" / "runtime-mobile" / "src",
+        repo_root / "plugins",
+    ]
     aid_re = re.compile(
         r'"((?:composer\.[a-z0-9._:-]+|message\.[a-z0-9._:-]+|search\.[a-z0-9._:-]+|settings\.[a-z0-9._:-]+|profile-[a-z0-9._:-]+|expression\.[a-z0-9._:-]+|phoenix\.[a-z0-9._:{}-]+|main-tabs|suggestions|composer|send|Record Voice Message))"'
     )
@@ -150,7 +154,7 @@ def extract_accessibility_ids(repo_root: Path) -> list[str]:
 
 
 def load_props_in(repo_root: Path) -> list[str]:
-    return re.findall(r'"([^"]+)"', (repo_root / "crates" / "ui" / "src" / "props.in").read_text("utf-8"))
+    return re.findall(r'"([^"]+)"', (repo_root / "crates" / "ui-mobile" / "src" / "props.in").read_text("utf-8"))
 
 
 WIRE_TYPE_HINTS: dict[str, list[str]] = {
