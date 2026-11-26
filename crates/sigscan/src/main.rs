@@ -217,6 +217,16 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                "va scaler lookup",
                desktop::va_scaler_lookup(image).map(|skip| at(skip.at)),
             );
+            report(
+               "linux primary display",
+               desktop::linux_primary_display(image).map(|found| {
+                  format!(
+                     "{} (displays {})",
+                     at(found.primary_display),
+                     at(found.displays)
+                  )
+               }),
+            );
          }
          report(
             "staff flag",

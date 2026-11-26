@@ -3620,6 +3620,40 @@ pub fn va_scaler_lookup(image: &Image<'_>) -> Found<VaScalerSkip> {
    one("VA scaler lookup", &skips)
 }
 
+/// GPUI's `LinuxPlatform::primary_display` and `displays`, the slot before
+/// it in the `Platform` vtable.
+#[derive(Debug, Clone, Copy)]
+pub struct LinuxPrimaryDisplay {
+   pub primary_display: usize,
+   pub displays:        usize,
+}
+
+pub const LINUX_PRIMARY_DISPLAY_PROLOGUE: Prologue = Prologue {
+   pattern: Pattern::new("41 57 41 56 53 48 83 EC ?? 48 B8 FF FF FF FF FF FF FF 7F"),
+   len:     19,
+};
+
+pub fn linux_primary_display(image: &Image<'_>) -> Found<LinuxPrimaryDisplay> {
+   const PRIMARY: Pattern = Pattern::new(
+      "41 57 41 56 53 48 83 EC ?? 48 B8 FF FF FF FF FF FF FF 7F 48 8B 4F ?? 48 39 C1 0F 83 ?? ?? \
+       ?? ?? 48 89 FB 48 8D 51 01 48 89 57 ?? 83 7F ?? 02 0F 85",
+   );
+   let primary_display = one("Linux primary_display", &image.scan(PRIMARY))?;
+   let code_at = |slot: usize| image.read_usize(slot).filter(|&func| image.is_code(func));
+   // Skips the `.rela.dyn` addend `sigscan` also sees.
+   let slots: Vec<usize> = image
+      .pointers_to(primary_display)
+      .into_iter()
+      .filter(|&slot| slot >= 8 && code_at(slot - 8).is_some() && code_at(slot + 8).is_some())
+      .collect();
+   let slot = one("Linux primary_display vtable slot", &slots)?;
+   let displays = code_at(slot - 8).ok_or("Linux displays vtable slot did not decode")?;
+   Ok(LinuxPrimaryDisplay {
+      primary_display,
+      displays,
+   })
+}
+
 /// GPUI's `Zed::Window` `WndProc` checks `wParam == *(rc + disp32)` for
 /// `WM_USER+5` (`0x405`, `WM_GPUI_FORCE_UPDATE_WINDOW`), a Win32 message.
 fn window_validation(image: &Image<'_>) -> Found<usize> {
