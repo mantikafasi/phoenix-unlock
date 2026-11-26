@@ -886,6 +886,12 @@ fn api<'js>(
    api.set("discord", discord_object(ctx, plugin, permissions)?)?;
    let granted = Arc::clone(permissions);
    api.set(
+      "sleep",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, ms: f64| {
+         background::start_sleep(&ctx, ms)
+      })?,
+   )?;
+   api.set(
       "fetch",
       Function::new(
          ctx.clone(),

@@ -26,6 +26,7 @@ mod headers;
 mod health;
 mod icons;
 mod js;
+mod limits;
 mod members;
 mod message;
 mod modal;
@@ -278,6 +279,7 @@ pub fn prepare() -> Result<(), Error> {
    feature("toolbar", || toolbar::install(&image));
    feature("badges", || badges::install(&image, &ix));
    feature("emoji", || emoji::install(&image, &ix));
+   feature("limits", || limits::install(&image));
    #[cfg(windows)]
    feature("gpui_theme", || gpui_theme::install(&image));
    feature("os_redraw", || <os::Os as os::DesktopOs>::install(&image));

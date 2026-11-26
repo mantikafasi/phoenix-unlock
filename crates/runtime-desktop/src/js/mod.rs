@@ -28,6 +28,7 @@ use crate::{
    context_menu,
    double_click,
    emoji,
+   limits,
    js::ui::{
       DesktopAccessory,
       DesktopAction,
@@ -58,6 +59,8 @@ pub struct Desktop<'js> {
    /// `phoenix.messages.onEmojiPick` handlers by id and plugin. Desktop has
    /// no picker presses to give them, only the unlock they turn on.
    pub emoji_pickers:  RefCell<Vec<(u64, String)>>,
+   /// `phoenix.messages.allowLongMessages` holds by id and plugin.
+   pub long_pastes:    RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.onEvent("rowDoubleTap")` handlers by id and plugin.
    pub double_taps:    RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.hide` holds by id and plugin.
@@ -190,6 +193,11 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       hidden.retain(|(_, plugin, _)| plugin != name);
       counts::hide(hidden.iter().map(|&(.., count)| count));
    }
+
+   let mut pastes = registry.long_pastes.borrow_mut();
+   pastes.retain(|(_, plugin)| plugin != name);
+   limits::allow(!pastes.is_empty());
+   drop(pastes);
 
    themes::unload(name);
 }

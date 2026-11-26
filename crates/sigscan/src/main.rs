@@ -327,6 +327,16 @@ fn check(
          report("settings layer", desktop::settings_layer(image).map(at));
          report("animation frame", desktop::animation_frame(image).map(at));
          report("notification gate", desktop::notification_gate(image).map(at));
+         report(
+            "paste limit",
+            desktop::paste_limit(image)
+               .map(|limit| format!("{}, counts with {}", at(limit.func), at(limit.count_fn))),
+         );
+         report(
+            "message limit",
+            desktop::message_limit(image)
+               .map(|limit| format!("nitro {}, base {}", at(limit.nitro), at(limit.base))),
+         );
          if abi == x86::Abi::SysV {
             report(
                "wayland frame",

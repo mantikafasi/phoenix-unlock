@@ -1040,6 +1040,10 @@ declare namespace Phoenix {
     /// Reaches the hosts on the plugin's `// @fetch` lines, like `// @fetch api.example.com
     /// *.example.org`, and throws for any other.
     fetch(url: string, init?: FetchInit): Promise<FetchResponse>;
+    /// Resolves after `ms` milliseconds, without blocking anything else. Values below 0 or not
+    /// finite resolve at once, and anything over ten minutes waits ten minutes. QuickJS has no
+    /// `setTimeout`, so `await phoenix.sleep(ms)` is how a plugin waits.
+    sleep(ms: number): Promise<void>;
     /// Discord's API through the app's own HTTP client, with the app's session headers. Paths are
     /// relative to the API base, like `/users/@me`. Rejects until the app has made a request of its
     /// own. Requests, `me`, `authorize` and interceptors reach only the routes on the plugin's
@@ -1248,6 +1252,12 @@ declare namespace Phoenix {
     /// Reactions and the rest keep the lock, and nothing else about Nitro changes. Desktop has no
     /// picker presses to report: the handler is never called there, only the unlock applies.
     onEmojiPick(handler: (emojiId: string, ctx: UiContext) => string | void): Remover;
+    /// Desktop only: while held, Phoenix no longer stops long text. A paste of more than 4000
+    /// characters lands in the message box instead of becoming a `message.txt` upload, and a
+    /// message past the 2000 (4000 with Nitro) limit is sent to `onSend` without the "too long"
+    /// modal, so a plugin can split it. Phoenix's own counter then no longer shows a negative
+    /// remainder. Release it to put the limits back. On a phone this does nothing.
+    allowLongMessages(): Remover;
   }
 
   /// `channelId` is the open channel, `reply` posts a local message there.

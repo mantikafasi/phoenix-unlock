@@ -68,6 +68,7 @@ use crate::{
    double_click,
    emoji,
    icons,
+   limits,
    js::Desktop,
    members::Place,
    modal::{
@@ -1482,6 +1483,11 @@ pub fn desktop_patch_api<'js>(
          move |ctx: Ctx<'js>, _function: Opt<Value<'js>>| on_emoji_pick(&ctx, &name),
       )?,
    )?;
+   let name = plugin.to_owned();
+   messages.set(
+      "allowLongMessages",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| allow_long_messages(&ctx, &name))?,
+   )?;
    let commands = Object::new(ctx.clone())?;
    commands.set(
       "register",
@@ -1856,6 +1862,30 @@ fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result
 #[cfg(not(target_arch = "x86_64"))]
 fn hide_count<'js>(ctx: &Ctx<'js>, _plugin: &str, _name: &str) -> rquickjs::Result<Function<'js>> {
    noop_handle(ctx)
+}
+
+/// Keeps Phoenix's length limits out of the way while the plugin holds this,
+/// until the returned function is called or the plugin goes away.
+fn allow_long_messages<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function<'js>> {
+   static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+   let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+   let registry = ctx
+      .userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .long_pastes
+      .borrow_mut()
+      .push((id, plugin.to_owned()));
+   limits::allow(true);
+   drop(registry);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut holds = registry.long_pastes.borrow_mut();
+         holds.retain(|(existing, _)| *existing != id);
+         limits::allow(!holds.is_empty());
+      }
+   })
 }
 
 pub fn on_send<'js>(

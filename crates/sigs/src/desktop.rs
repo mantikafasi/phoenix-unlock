@@ -831,6 +831,68 @@ pub struct PendingCounts {
    pub friend_requests: usize,
 }
 
+/// Phoenix's long-paste check, `bool f(text) = char_count(text) >= 4001`: past
+/// 4000 characters a paste becomes a `message.txt` upload and never reaches
+/// the message box.
+#[derive(Clone, Copy, Debug)]
+pub struct PasteLimit {
+   pub func:     usize,
+   /// Where the function ends, so the whole body can be replaced.
+   pub len:      usize,
+   /// The character count it compares, called with the same arguments.
+   pub count_fn: usize,
+}
+
+/// `sub rsp, 28h; call count; cmp rax, 0FA1h; setae al; add rsp, 28h; ret`.
+///
+/// Win64 only: the System V build has not been looked at, so it stays off.
+pub fn paste_limit(image: &Image<'_>) -> Found<PasteLimit> {
+   const LEN: usize = 23;
+   if Abi::of(image) != Abi::Win64 {
+      return Err("the paste limit is only located on Win64 builds".to_owned());
+   }
+   let pattern =
+      Pattern::new("48 83 EC 28 E8 ?? ?? ?? ?? 48 3D A1 0F 00 00 0F 93 C0 48 83 C4 28 C3");
+   let func = one("paste limit", &image.scan(pattern))?;
+   let call = image
+      .read(func + 4, 5)
+      .ok_or_else(|| format!("paste limit at {func:#x} is unmapped"))?;
+   let (_, count_fn) = call_target(image, call, func + 4)
+      .ok_or_else(|| format!("paste limit at {func:#x} calls nothing"))?;
+   Ok(PasteLimit {
+      func,
+      len: LEN,
+      count_fn,
+   })
+}
+
+/// Where Phoenix picks a message's length limit, from the account's perks:
+/// 4000 characters with Nitro, else 2000. Both the send check and the counter
+/// read it, so it is the one place the limit lives.
+#[derive(Clone, Copy, Debug)]
+pub struct MessageLimit {
+   /// The 4000's `mov edx, imm32` immediate.
+   pub nitro: usize,
+   /// The 2000's `mov ecx, imm32` immediate.
+   pub base:  usize,
+}
+
+/// `mov edx, 0FA0h; mov ecx, 7D0h; cmovne ecx, edx`, which turns the premium
+/// flag into the limit. Win64 only, like [`paste_limit`].
+pub fn message_limit(image: &Image<'_>) -> Found<MessageLimit> {
+   if Abi::of(image) != Abi::Win64 {
+      return Err("the message limit is only located on Win64 builds".to_owned());
+   }
+   let at = one(
+      "message limit",
+      &image.scan(Pattern::new("BA A0 0F 00 00 B9 D0 07 00 00 0F 45 CA")),
+   )?;
+   Ok(MessageLimit {
+      nitro: at + 1,
+      base:  at + 6,
+   })
+}
+
 /// The DM list draws both badges through one builder, each call just after the
 /// `lea` of its id. The friends count comes from the call whose `eax` the
 /// count argument was copied from.

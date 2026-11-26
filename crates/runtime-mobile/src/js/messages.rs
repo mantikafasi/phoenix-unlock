@@ -174,6 +174,12 @@ pub fn patch_api<'js>(
          move |ctx: Ctx<'js>, function: Function<'js>| on_emoji_pick(&ctx, &name, function),
       )?,
    )?;
+   // Only Desktop Phoenix needs its length limits held back, so this is a
+   // remover for plugins shared with Desktop.
+   messages.set(
+      "allowLongMessages",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>| remover(&ctx, |_| {}, None))?,
+   )?;
    api.set("ui", ui_object(ctx, plugin, permissions.ui_tree())?)?;
    api.set("commands", commands_object(ctx, plugin)?)
 }
