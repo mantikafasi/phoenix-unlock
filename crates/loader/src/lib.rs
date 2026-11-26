@@ -319,16 +319,29 @@ mod linux {
    /// preload reaches it and every process it starts.
    const CLIENT: &str = "discord-phoenix";
 
-   /// Whether this process is the client. Takes this library out of
-   /// `LD_PRELOAD` so the client's children (`discord_media`, the CEF helper,
-   /// `xdg-open`) never load it, except with drover on, where `discord_media`
-   /// needs its send hooks and each child takes it out for its own children.
+   /// Set by a client that keeps the preload for drover, so the processes it
+   /// starts know to take this library out for their own children.
+   const BELOW_CLIENT: &str = "SUNBIRD_BELOW_CLIENT";
+
+   /// Whether this process is the client. The client takes this library out
+   /// of `LD_PRELOAD` so its children (`discord_media`, the CEF helper,
+   /// `xdg-open`) never load it. With drover on it keeps it, since
+   /// `discord_media` may carry voice, and each child takes it out instead.
+   /// The processes the `AppImage` runs before the client keep it either way.
    pub fn claim() -> bool {
       let client = std::fs::read_link("/proc/self/exe")
          .is_ok_and(|exe| exe.file_name() == Some(OsStr::new(CLIENT)));
-      if !(client && phoenix_drover::enabled())
-         && let Some(path) = super::unix::library_path()
-      {
+      let drop = if client {
+         !phoenix_drover::enabled()
+      } else {
+         env::var_os(BELOW_CLIENT).is_some()
+      };
+      if client && !drop {
+         // SAFETY: constructors run before `main`, while the loader is the
+         // only thread.
+         unsafe { env::set_var(BELOW_CLIENT, "1") };
+      }
+      if drop && let Some(path) = super::unix::library_path() {
          unpreload(Path::new(OsStr::from_bytes(path.to_bytes())));
       }
       client
