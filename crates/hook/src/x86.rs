@@ -330,6 +330,202 @@ pub fn sret_stores(abi: Abi, code: &[u8], ip: usize) -> Vec<(usize, usize)> {
    stores
 }
 
+/// What a register holds, relative to the pointer [`pointer_uses`] follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+   /// The pointer plus this offset.
+   At(usize),
+   /// The value read from the pointer at this offset.
+   Field(usize),
+   /// The address of memory that starts with a copy of the bytes at this
+   /// offset.
+   CopyOf(usize),
+   /// A constant.
+   Constant(u64),
+}
+
+/// An instruction [`pointer_uses`] reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerUse {
+   /// `movsxd r, [table + index*4]`, a jump table indexed by the field at
+   /// this offset.
+   Dispatch { at: usize, field: usize },
+   /// A call, and what its first four argument registers held.
+   Call {
+      at:   usize,
+      args: [Option<Held>; 4],
+   },
+   /// `rep movsb`, and what its destination, source and count held.
+   Copy {
+      at:     usize,
+      dest:   Option<Held>,
+      source: Option<Held>,
+      count:  Option<Held>,
+   },
+   /// A store of `size` bytes at this offset from the pointer.
+   Store {
+      at:     usize,
+      offset: usize,
+      size:   usize,
+   },
+}
+
+/// The calls, jump tables, block copies and stores in a function, with what
+/// each takes from or writes to the pointer `pointer` holds on entry.
+///
+/// The pointer is followed through register copies, `lea`, stack spills and
+/// their reloads, and a field copied through an XMM register to `[r]` makes
+/// `r` point at that copy. Calls clobber the ABI's volatile registers and
+/// every XMM register. Control flow is followed linearly past `ret` and jumps,
+/// so a function's cold blocks count too.
+#[must_use]
+#[expect(clippy::too_many_lines, reason = "one match arm per instruction shape")]
+pub fn pointer_uses(abi: Abi, code: &[u8], ip: usize, pointer: Register) -> Vec<PointerUse> {
+   use std::collections::HashMap;
+
+   use iced_x86::{
+      InstructionInfoFactory,
+      Mnemonic,
+      OpAccess,
+      OpKind,
+   };
+
+   let mut decoder = Decoder::with_ip(64, code, ip as u64, DecoderOptions::NONE);
+   let mut factory = InstructionInfoFactory::new();
+   let mut constants = Constants::default();
+   let mut held = HashMap::from([(pointer.full_register(), Held::At(0))]);
+   // Stack slots the pointer was spilled to, by base and displacement.
+   let mut spilled: HashMap<(Register, u64), Held> = HashMap::new();
+   let mut uses = Vec::new();
+   while decoder.can_decode() {
+      let instruction = decoder.decode();
+      if instruction.is_invalid() {
+         break;
+      }
+      let at = addr(instruction.ip());
+      let get = |held: &HashMap<Register, Held>, register: Register| {
+         held.get(&register.full_register()).copied()
+      };
+      let memory = (0..instruction.op_count()).any(|op| instruction.op_kind(op) == OpKind::Memory);
+      let (base, index, disp) = (
+         instruction.memory_base(),
+         instruction.memory_index(),
+         instruction.memory_displacement64(),
+      );
+      let simple = memory && index == Register::None && base != Register::None;
+      let slot = (simple && matches!(base, Register::RSP | Register::RBP)).then_some((base, disp));
+      // The pointer offset the memory operand addresses.
+      let field = match get(&held, base) {
+         Some(Held::At(offset)) if simple => {
+            isize::try_from(disp.cast_signed())
+               .ok()
+               .and_then(|disp| offset.checked_add_signed(disp))
+         },
+         _ => None,
+      };
+
+      match instruction.mnemonic() {
+         Mnemonic::Call => {
+            uses.push(PointerUse::Call {
+               at,
+               args: [0, 1, 2, 3].map(|arg| get(&held, abi.arg(arg))),
+            });
+            held.retain(|register, _| !abi.volatile().contains(register) && !register.is_zmm());
+            constants = Constants::default();
+            continue;
+         },
+         Mnemonic::Movsxd if memory && instruction.memory_index_scale() == 4 => {
+            if let Some(Held::Field(field)) = get(&held, index) {
+               uses.push(PointerUse::Dispatch { at, field });
+            }
+         },
+         Mnemonic::Movsb if instruction.has_rep_prefix() => {
+            uses.push(PointerUse::Copy {
+               at,
+               dest: get(&held, Register::RDI),
+               source: get(&held, Register::RSI),
+               count: get(&held, Register::RCX),
+            });
+         },
+         _ => {},
+      }
+
+      let moves = matches!(
+         instruction.mnemonic(),
+         Mnemonic::Mov | Mnemonic::Movups | Mnemonic::Movaps | Mnemonic::Movdqu | Mnemonic::Movdqa
+      );
+      let constant = constants.loaded(&instruction);
+      let source = |op: u32| {
+         match instruction.op_kind(op) {
+            OpKind::Register => get(&held, instruction.op_register(op)),
+            OpKind::Memory => {
+               slot
+                  .and_then(|slot| spilled.get(&slot).copied())
+                  .or_else(|| field.map(Held::Field))
+            },
+            _ => None,
+         }
+      };
+      let mut written_now = None;
+      if instruction.op0_kind() == OpKind::Register {
+         let dest = instruction.op0_register().full_register();
+         written_now = match instruction.mnemonic() {
+            Mnemonic::Lea => field.map(|offset| (dest, Held::At(offset))),
+            _ if constant.is_some() => constant.map(|value| (dest, Held::Constant(value))),
+            _ if moves => source(1).map(|value| (dest, value)),
+            _ => None,
+         };
+      } else if moves && instruction.op0_kind() == OpKind::Memory {
+         let value = source(1);
+         if let Some(slot) = slot {
+            match value {
+               Some(Held::At(offset)) => spilled.insert(slot, Held::At(offset)),
+               _ => spilled.remove(&slot),
+            };
+         } else if let Some(Held::Field(offset)) = value
+            && simple
+            && disp == 0
+            && get(&held, base).is_none()
+         {
+            written_now = Some((base.full_register(), Held::CopyOf(offset)));
+         }
+      }
+
+      let info = factory.info(&instruction);
+      for used in info.used_memory() {
+         let writes = matches!(used.access(), OpAccess::Write | OpAccess::ReadWrite);
+         if writes
+            && used.index() == Register::None
+            && let Some(Held::At(offset)) = get(&held, used.base())
+            && let Some(offset) = isize::try_from(used.displacement().cast_signed())
+               .ok()
+               .and_then(|disp| offset.checked_add_signed(disp))
+         {
+            uses.push(PointerUse::Store {
+               at,
+               offset,
+               size: used.memory_size().size(),
+            });
+         }
+         if writes && !moves && matches!(used.base(), Register::RSP | Register::RBP) {
+            spilled.remove(&(used.base(), used.displacement()));
+         }
+      }
+      for used in info.used_registers() {
+         if !matches!(
+            used.access(),
+            OpAccess::Read | OpAccess::CondRead | OpAccess::None
+         ) {
+            held.remove(&used.register().full_register());
+         }
+      }
+      if let Some((register, value)) = written_now {
+         held.insert(register, value);
+      }
+   }
+   uses
+}
+
 /// One `DebugStruct::field(name, &self.field)` call in a derived `Debug::fmt`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DebugField {
@@ -924,6 +1120,45 @@ fn stub(observer: Observer, ctx: usize, trampoline: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
    use super::*;
+
+   #[test]
+   fn pointer_uses_follow_spills_leas_and_copies() {
+      let code = [
+         0x48, 0x89, 0x55, 0x10, // mov [rbp+0x10], rdx
+         0x48, 0x8B, 0x55, 0x10, // mov rdx, [rbp+0x10]
+         0x48, 0x8D, 0x5A, 0x60, // lea rbx, [rdx+0x60]
+         0x48, 0x8B, 0x03, // mov rax, [rbx]
+         0x48, 0x63, 0x04, 0x81, // movsxd rax, [rcx+rax*4]
+         0x48, 0x8B, 0x4D, 0x10, // mov rcx, [rbp+0x10]
+         0x0F, 0x10, 0x81, 0xC0, 0x00, 0x00, 0x00, // movups xmm0, [rcx+0xc0]
+         0x4C, 0x8D, 0x45, 0x40, // lea r8, [rbp+0x40]
+         0x41, 0x0F, 0x29, 0x00, // movaps [r8], xmm0
+         0x4C, 0x8D, 0x89, 0x98, 0x00, 0x00, 0x00, // lea r9, [rcx+0x98]
+         0xE8, 0x00, 0x00, 0x00, 0x00, // call
+         0x6A, 0x60, // push 0x60
+         0x59, // pop rcx
+         0x48, 0x8B, 0x75, 0x10, // mov rsi, [rbp+0x10]
+         0xF3, 0xA4, // rep movsb
+      ];
+      let uses = pointer_uses(Abi::Win64, &code, 0x1000, Register::RDX);
+      assert!(uses.contains(&PointerUse::Dispatch {
+         at:    0x100F,
+         field: 0x60,
+      }));
+      assert!(uses.iter().any(|used| {
+         matches!(used, PointerUse::Call {
+            args: [_, _, Some(Held::CopyOf(0xC0)), Some(Held::At(0x98))],
+            ..
+         })
+      }));
+      assert!(uses.iter().any(|used| {
+         matches!(used, PointerUse::Copy {
+            source: Some(Held::At(0)),
+            count: Some(Held::Constant(0x60)),
+            ..
+         })
+      }));
+   }
 
    #[test]
    fn sret_stores_follow_the_return_pointer() {
