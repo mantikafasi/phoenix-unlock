@@ -10,6 +10,7 @@ mod context_menu;
 mod discord;
 mod emoji;
 mod fetch;
+mod gateway_send;
 mod gpui;
 mod headers;
 mod icons;
@@ -127,6 +128,7 @@ pub fn prepare() -> Result<(), Error> {
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {
       discord::install(&image);
+      gateway_send::install(&image);
       accessories::install_optimistic_delete(&image);
    }
    // The index is tens of MB and nothing reads it after startup.
@@ -155,6 +157,7 @@ pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    let image = phoenix_runtime::target()?;
    let registry = phoenix_runtime::hook(&image)?;
    discord::install(&image);
+   gateway_send::install(&image);
    phoenix_runtime::start_hooked(&Desktop, image, registry, home, bundled)
 }
 
