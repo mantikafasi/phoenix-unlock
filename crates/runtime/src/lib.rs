@@ -440,15 +440,22 @@ pub fn source(name: &str) -> Option<String> {
    engine()?.source(name)
 }
 
-/// Deletes a plugin installed into `home/plugins` and unloads it.
-pub fn uninstall(name: &str) -> Result<(), Error> {
+/// What an uninstall left in the plugin's place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Uninstalled {
+   Removed,
+   /// The plugin had replaced a bundled one, which runs again as the user
+   /// had it.
+   RestoredBundled,
+}
+
+/// Deletes a plugin installed into `home/plugins` and unloads it, putting
+/// back the bundled plugin it replaced.
+pub fn uninstall(name: &str) -> Result<Uninstalled, Error> {
    let state = STATE.get().ok_or(Error::NotStarted)?;
    let file = state.plugins_dir().join(format!("{name}.js"));
    std::fs::remove_file(&file).map_err(io_error(&file))?;
-   if let Some(mut engine) = engine() {
-      engine.uninstall(name);
-   }
-   Ok(())
+   Ok(engine().map_or(Uninstalled::Removed, |mut engine| engine.uninstall(name)))
 }
 
 /// Evaluates an enabled plugin again with its hooks cleared.

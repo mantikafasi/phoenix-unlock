@@ -82,10 +82,23 @@ pub struct Engine {
 
 struct Loaded {
    source:    String,
+   /// The bundled source an installed copy replaced, put back when the copy
+   /// is uninstalled.
+   bundled:   Option<String>,
    enabled:   bool,
    error:     Option<String>,
    /// Read from `home/plugins`, so the user can delete it.
    installed: bool,
+}
+
+impl Loaded {
+   fn install(&mut self, source: String) {
+      let old = std::mem::replace(&mut self.source, source);
+      if !self.installed {
+         self.bundled = Some(old);
+      }
+      self.installed = true;
+   }
 }
 
 type ChosenMap = BTreeMap<String, BTreeMap<String, Chosen>>;
@@ -347,12 +360,12 @@ impl Engine {
    /// it off.
    pub fn install(&mut self, name: &str, source: String) {
       let enabled = if let Some(loaded) = self.plugins.get_mut(name) {
-         loaded.source = source;
-         loaded.installed = true;
+         loaded.install(source);
          loaded.enabled
       } else {
          self.plugins.insert(name.to_owned(), Loaded {
             source,
+            bundled: None,
             enabled: true,
             error: None,
             installed: true,
@@ -365,17 +378,32 @@ impl Engine {
       }
    }
 
-   /// Drops `name` and what the user chose for it. A bundled plugin it
-   /// replaced comes back at the next start.
-   pub fn uninstall(&mut self, name: &str) {
+   /// Drops `name` and what the user chose for it, or, when it replaced a
+   /// bundled plugin, puts that one back with the same switch and settings.
+   pub fn uninstall(&mut self, name: &str) -> crate::Uninstalled {
       self.unload(name);
-      self.plugins.remove(name);
-      self.context.with(|ctx| {
-         if let Some(registry) = ctx.userdata::<Registry<'_>>() {
-            registry.chosen.borrow_mut().remove(name);
-         }
+      let restored = self.plugins.get_mut(name).and_then(|loaded| {
+         loaded.source = loaded.bundled.take()?;
+         loaded.installed = false;
+         loaded.error = None;
+         Some(loaded.enabled)
       });
+      let outcome = if let Some(enabled) = restored {
+         if enabled {
+            self.eval(name);
+         }
+         crate::Uninstalled::RestoredBundled
+      } else {
+         self.plugins.remove(name);
+         self.context.with(|ctx| {
+            if let Some(registry) = ctx.userdata::<Registry<'_>>() {
+               registry.chosen.borrow_mut().remove(name);
+            }
+         });
+         crate::Uninstalled::Removed
+      };
       self.save_choices();
+      outcome
    }
 
    pub fn reload(&mut self, name: &str) {
@@ -614,10 +642,18 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
    }
 
    let dir = state.plugins_dir();
-   let mut sources = bundled
+   let mut plugins = bundled
       .into_iter()
-      .map(|plugin| (plugin.name, (plugin.source, false)))
-      .collect::<BTreeMap<String, (String, bool)>>();
+      .map(|plugin| {
+         (plugin.name, Loaded {
+            source:    plugin.source,
+            bundled:   None,
+            enabled:   false,
+            error:     None,
+            installed: false,
+         })
+      })
+      .collect::<BTreeMap<String, Loaded>>();
    let paths = match fs::read_dir(&dir) {
       Ok(entries) => {
          entries
@@ -636,7 +672,25 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
          continue;
       };
       let source = fs::read_to_string(&path).map_err(io_error(&path))?;
-      sources.insert(name.to_owned(), (source, true));
+      match plugins.get_mut(name) {
+         Some(loaded) => loaded.install(source),
+         None => {
+            plugins.insert(name.to_owned(), Loaded {
+               source,
+               bundled: None,
+               enabled: false,
+               error: None,
+               installed: true,
+            });
+         },
+      }
+   }
+   for (name, loaded) in &mut plugins {
+      loaded.enabled = if Header::from(loaded.source.as_str()).default_off {
+         choices.enabled.contains(name)
+      } else {
+         !choices.disabled.contains(name)
+      };
    }
 
    let mut engine = state
@@ -648,22 +702,7 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
          *registry.chosen.borrow_mut() = choices.settings.into_owned();
       }
    });
-   engine.plugins = sources
-      .into_iter()
-      .map(|(name, (source, installed))| {
-         let enabled = if Header::from(source.as_str()).default_off {
-            choices.enabled.contains(&name)
-         } else {
-            !choices.disabled.contains(&name)
-         };
-         (name, Loaded {
-            source,
-            enabled,
-            error: None,
-            installed,
-         })
-      })
-      .collect();
+   engine.plugins = plugins;
    let enabled = engine
       .plugins
       .iter()

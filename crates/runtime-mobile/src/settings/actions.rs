@@ -120,7 +120,7 @@ fn press(pressed: Press) {
       Press::Uninstall(index) => {
          if let Some(plugin) = plugin(index) {
             match phoenix_runtime::uninstall(&plugin.name) {
-               Ok(()) => log::info!("uninstalled {}", plugin.name),
+               Ok(outcome) => log::info!("{}", uninstalled(&plugin.name, outcome)),
                Err(err) => log::error!("uninstall failed: {err}"),
             }
          }
@@ -200,10 +200,22 @@ fn listed(index: usize) {
       Some(info) if !info.installed => phoenix_runtime::set_enabled(&info.name, !info.enabled),
       Some(info) => {
          settings().install_status = Some(match phoenix_runtime::uninstall(&info.name) {
-            Ok(()) => (format!("Uninstalled {}.", info.name), COLOR_STRING),
+            Ok(outcome) => {
+               (
+                  format!("{}.", uninstalled(&info.name, outcome)),
+                  COLOR_STRING,
+               )
+            },
             Err(err) => (format!("Uninstall failed: {err}"), COLOR_ERROR),
          });
       },
+   }
+}
+
+fn uninstalled(name: &str, outcome: phoenix_runtime::Uninstalled) -> String {
+   match outcome {
+      phoenix_runtime::Uninstalled::Removed => format!("Uninstalled {name}"),
+      phoenix_runtime::Uninstalled::RestoredBundled => format!("Restored the bundled {name}"),
    }
 }
 
