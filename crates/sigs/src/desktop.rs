@@ -110,6 +110,8 @@ pub struct Prologues {
    pub media_fetch:     Prologue,
    /// The asset loader, [`asset_load`].
    pub asset_load:      Prologue,
+   /// `AnyView::request_layout`, whose frame fits an 8-bit `sub rsp`.
+   pub small_frame:     Prologue,
    /// `getEmojiUnavailableReason`, a leaf: its first four instructions on
    /// Win64, five on System V, up to the `jne`.
    pub emoji_check:     Prologue,
@@ -157,6 +159,10 @@ impl Prologues {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
+               small_frame:     Prologue {
+                  pattern: Pattern::new("55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC ??"),
+                  len:     16,
+               },
                emoji_check:     Prologue {
                   pattern: Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02"),
                   len:     14,
@@ -194,6 +200,10 @@ impl Prologues {
                // Four pushes and `sub rsp, imm32`.
                asset_load:      Prologue {
                   pattern: Pattern::new("41 57 41 56 41 54 53 48 81 EC ?? ?? ?? ??"),
+                  len:     14,
+               },
+               small_frame:     Prologue {
+                  pattern: Pattern::new("55 41 57 41 56 41 55 41 54 53 48 83 EC ??"),
                   len:     14,
                },
                emoji_check:     Prologue {
@@ -1488,6 +1498,7 @@ pub struct StyleOffsets {
    pub background:      usize,
    pub border_color:    usize,
    pub overflow_x:      usize,
+   pub overflow_y:      usize,
    pub position:        usize,
    pub flex_wrap:       usize,
    pub display:         usize,
@@ -1646,6 +1657,7 @@ pub(crate) fn style_from_fields(
       background: get("background")?,
       border_color: get("border_color")?,
       overflow_x: get("overflow.x")?,
+      overflow_y: get("overflow.y")?,
       position: get("position")?,
       flex_wrap: get("flex_wrap")?,
       display: get("display")?,
@@ -1678,6 +1690,7 @@ pub(crate) fn style_from_fields(
       (style.background, 0x48),
       (style.border_color, 20),
       (style.overflow_x, 1),
+      (style.overflow_y, 1),
       (style.position, 1),
       (style.flex_wrap, 1),
       (style.display, 1),
@@ -5532,6 +5545,660 @@ pub fn icon_names(image: &Image<'_>) -> Found<Vec<String>> {
       return Err(format!("icon table holds {} names", names.len()));
    }
    Ok(names)
+}
+
+/// The server rail: its view's render, which returns the rail's `Div`, the item
+/// renderer that draws one entry of it, and the fields of `Rail` they read.
+#[derive(Clone, Copy, Debug)]
+pub struct Rail {
+   /// `Rail::render(&mut self, &mut Window, &mut Context<Rail>) -> Div`.
+   pub render:       usize,
+   /// The `into_any_element` its one caller boxes the result with, through
+   /// [`through_thunks`], which is `Div`'s when the render returns a `Div`.
+   pub render_into:  usize,
+   /// `(sret, &Rail, index, 0, 0, &mut Window, &mut Context<Rail>) ->
+   /// AnyElement`, which draws entry `index`: home, a server, a folder with
+   /// its servers when open.
+   pub item:         usize,
+   /// `Vec` of 16-byte entries, a `u32` kind first: pointer and length.
+   pub items:        (usize, usize),
+   /// `Vec` of tiles a tile entry indexes: pointer, length, element size.
+   pub tiles:        (usize, usize, usize),
+   /// Where a folder tile keeps its `u64` id. Server tiles hold `u64::MAX`
+   /// in their first word.
+   pub folder_id:    usize,
+   /// Where a folder tile keeps the length of its `[u64]` of server ids,
+   /// after their pointer.
+   pub folder_len:   usize,
+   /// `HashSet<u64>` of the open folders' ids, its raw table's
+   /// `[ctrl, bucket_mask, growth_left, items]` first.
+   pub open_folders: usize,
+}
+
+/// Kind of a tile entry, the case that reads [`Rail::tiles`].
+pub const RAIL_TILE: u32 = 9;
+
+/// `[base+disp]` in a disassembled operand, as `(base, disp)`.
+fn mem_operand(text: &str) -> Option<(&str, usize)> {
+   let open = text.find('[')?;
+   let close = open + text[open..].find(']')?;
+   let (base, disp) = text[open + 1..close].split_once('+')?;
+   Some((
+      base,
+      usize::from_str_radix(disp.strip_suffix('h')?, 16).ok()?,
+   ))
+}
+
+/// `func` behind any `jmp` thunks in front of it.
+#[must_use]
+pub fn through_thunks(image: &Image<'_>, mut func: usize) -> usize {
+   for _ in 0..4 {
+      match image
+         .read(func, 6)
+         .and_then(|code| jump_target(image, code, func))
+      {
+         Some(next) if image.is_code(next) => func = next,
+         _ => break,
+      }
+   }
+   func
+}
+
+/// Whether `func` calls `callee`, directly, through an import slot or through
+/// thunks.
+#[must_use]
+pub fn calls(image: &Image<'_>, func: usize, callee: usize) -> bool {
+   let Ok(code) = function_code(image, func, "caller") else {
+      return false;
+   };
+   let callee = through_thunks(image, callee);
+   phoenix_hook::x86::disasm(code, func, usize::MAX)
+      .iter()
+      .any(|line| {
+         let Some(target) = line.target.filter(|_| line.text.starts_with("call ")) else {
+            return false;
+         };
+         let target = if line.text.contains('[') {
+            match image.read_usize(target) {
+               Some(slot) => slot,
+               None => return false,
+            }
+         } else {
+            target
+         };
+         through_thunks(image, target) == callee
+      })
+}
+
+/// Whether `a` and `b` are one generic instantiated twice, each copy with its
+/// own vtables and callees: equal instructions but for their addresses.
+#[must_use]
+pub fn same_generic(image: &Image<'_>, a: usize, b: usize) -> bool {
+   let shape = |func: usize| -> Option<Vec<(usize, String)>> {
+      let code = function_code(image, func, "function").ok()?;
+      let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
+      Some(
+         lines
+            .into_iter()
+            .map(|line| {
+               let text = match line.target {
+                  Some(_) => line.text.split(' ').next().unwrap_or_default().to_owned(),
+                  None => line.text,
+               };
+               (line.len, text)
+            })
+            .collect(),
+      )
+   };
+   let (a, b) = (through_thunks(image, a), through_thunks(image, b));
+   a == b || shape(a).is_some_and(|a| shape(b).is_some_and(|b| a == b))
+}
+
+fn unique<T: Ord>(mut found: Vec<T>) -> Vec<T> {
+   found.sort_unstable();
+   found.dedup();
+   found
+}
+
+/// An immediate like `48h` or `1`.
+fn imm_operand(text: &str) -> Option<usize> {
+   text.strip_suffix('h').map_or_else(
+      || text.parse().ok(),
+      |hex| usize::from_str_radix(hex, 16).ok(),
+   )
+}
+
+/// The one function that loads the `rail-list` element id, the one that
+/// loads both `rail-folder` and `folder-items`, and the fields the second
+/// reads.
+pub fn rail(image: &Image<'_>) -> Found<Rail> {
+   let functions = |text: &[u8]| -> HashSet<usize> {
+      image
+         .find_bytes(text)
+         .into_iter()
+         .flat_map(|anchor| lea_refs(image, anchor))
+         .filter_map(|lea| Some(image.function_bounds(lea)?.0))
+         .collect()
+   };
+   let folder = functions(b"rail-folder");
+   let items = functions(b"folder-items");
+   let item = one(
+      "rail item renderer",
+      &folder.intersection(&items).copied().collect::<Vec<_>>(),
+   )?;
+   let render = one(
+      "rail render",
+      &functions(b"rail-list").into_iter().collect::<Vec<_>>(),
+   )?;
+   let frame = prologues(image).frame;
+   if !frame.at(image, item) || !frame.at(image, render) {
+      return Err("rail prologues changed".to_owned());
+   }
+
+   let caller = one(
+      "rail render caller",
+      &call_index(image).sites(render).collect::<Vec<_>>(),
+   )?;
+   let (_, render_into) = calls_in(image, caller + 5, 0x40)
+      .first()
+      .copied()
+      .ok_or("no call after the rail render")?;
+   let render_into = through_thunks(image, render_into);
+
+   let code = function_code(image, item, "rail item renderer")?;
+   let lines = phoenix_hook::x86::disasm(code, item, usize::MAX);
+   let abi = Abi::of(image);
+   let name = |reg: Register| format!("{reg:?}").to_lowercase();
+   let (rail_reg, index_reg) = (name(abi.arg(1)), name(abi.arg(2)));
+   let ops = |text: &str| -> Option<(String, String, String)> {
+      let (op, rest) = text.split_once(' ')?;
+      let (a, b) = rest.split_once(',').unwrap_or((rest, ""));
+      Some((op.to_owned(), a.to_owned(), b.to_owned()))
+   };
+   let decoded: Vec<(String, String, String)> = lines
+      .iter()
+      .map(|line| ops(&line.text).unwrap_or_default())
+      .collect();
+
+   // `cmp index,[rail+len]`, then `mov reg,[rail+ptr]`.
+   let len_at = decoded
+      .iter()
+      .position(|(op, a, b)| {
+         op == "cmp" && *a == index_reg && mem_operand(b).is_some_and(|(r, _)| r == rail_reg)
+      })
+      .ok_or("rail item bounds check not found")?;
+   let items_len = mem_operand(&decoded[len_at].2).map_or(0, |(_, d)| d);
+   let items_ptr = decoded[len_at..]
+      .iter()
+      .take(8)
+      .find_map(|(op, _, b)| {
+         (op == "mov")
+            .then(|| mem_operand(b))
+            .flatten()
+            .filter(|(r, _)| *r == rail_reg)
+      })
+      .map(|(_, d)| d)
+      .ok_or("rail items pointer not found")?;
+
+   let tiles = rail_tiles(&decoded)?;
+
+   // `lea arg0,[rail+set]`, `mov al,1`, then `lea arg1,[rsp+id]` before the
+   // call that asks whether the folder is open.
+   let (arg0, arg1) = (name(abi.arg(0)), name(abi.arg(1)));
+   let lookups = (0..decoded.len())
+      .filter_map(|at| {
+         let (op, a, b) = &decoded[at];
+         if op != "lea"
+            || *a != arg0
+            || decoded.get(at + 1)? != &("mov".into(), "al".into(), "1".into())
+         {
+            return None;
+         }
+         let set = mem_operand(b)?.1;
+         let slot = decoded.get(at + 2..at + 6)?.iter().find_map(|(op, a, b)| {
+            (op == "lea" && *a == arg1)
+               .then(|| mem_operand(b))
+               .flatten()
+         })?;
+         (slot.0 == "rsp").then_some((set, slot.1))
+      })
+      .collect::<Vec<_>>();
+   let (open_folders, id_slot) = one("rail open folders lookup", &unique(lookups))?;
+
+   let folder_id = rail_folder_id(&decoded, id_slot)?;
+
+   if folder_id + 8 > tiles.2 || folder_id % 8 != 0 {
+      return Err(format!("rail folder id {folder_id:#x} outside its tile"));
+   }
+   let folder_len = rail_folder_len(image, render, tiles)?;
+
+   Ok(Rail {
+      render,
+      render_into,
+      item,
+      items: (items_ptr, items_len),
+      tiles,
+      folder_id,
+      folder_len,
+      open_folders,
+   })
+}
+
+/// `imul t,i,size`, `add t,[r+ptr]`, `cmp i,[r+len]` in the item renderer.
+fn rail_tiles(decoded: &[(String, String, String)]) -> Found<(usize, usize, usize)> {
+   let tiles = (0..decoded.len())
+      .filter_map(|at| {
+         let (op, dst, src) = &decoded[at];
+         if op != "imul" {
+            return None;
+         }
+         let (index, size) = src.split_once(',')?;
+         let size = imm_operand(size)?;
+         let next = decoded.get(at + 1..at + 6)?;
+         let ptr = next
+            .iter()
+            .find_map(|(op, a, b)| (op == "add" && a == dst).then(|| mem_operand(b)).flatten())?;
+         let len = next.iter().find_map(|(op, a, b)| {
+            (op == "cmp" && a == index)
+               .then(|| mem_operand(b))
+               .flatten()
+         })?;
+         (ptr.0 == len.0).then_some((ptr.1, len.1, size))
+      })
+      .collect::<Vec<_>>();
+   one("rail tiles", &unique(tiles))
+}
+
+/// Where a folder tile keeps its id. The id slot is filled from the tile's
+/// copy right after the check that
+/// the tile is not a server: `cmp qword ptr [rsp+tile],-1` .. `mov
+/// r,[rsp+tile+id]`, `mov [rsp+slot],r`.
+fn rail_folder_id(decoded: &[(String, String, String)], id_slot: usize) -> Found<usize> {
+   let slot_text = format!("[rsp+{id_slot:X}h]");
+   let ids = (1..decoded.len())
+      .filter_map(|at| {
+         let (op, a, b) = &decoded[at];
+         if op != "mov" || *a != slot_text {
+            return None;
+         }
+         let (load_op, load_dst, load_src) = &decoded[at - 1];
+         let (_, from) = mem_operand(load_src).filter(|(r, _)| *r == "rsp")?;
+         if load_op != "mov" || load_dst != b {
+            return None;
+         }
+         let tile = decoded[at.saturating_sub(8)..at]
+            .iter()
+            .rev()
+            .find_map(|(op, a, b)| {
+               (op == "cmp" && b == "0FFFFFFFFFFFFFFFFh" && a.starts_with("qword ptr"))
+                  .then(|| mem_operand(a))
+                  .flatten()
+                  .filter(|(r, _)| *r == "rsp")
+            })?;
+         from.checked_sub(tile.1)
+      })
+      .collect::<Vec<_>>();
+   one("rail folder id", &unique(ids))
+}
+
+/// The render lists the shown servers from each folder tile's slice:
+/// `imul t,i,size`, `add t,[rail+tiles]`, then `mov p,[t+ptr]`,
+/// `mov n,[t+ptr+8]`, `lea e,[p+n*8]`.
+fn rail_folder_len(image: &Image<'_>, render: usize, tiles: (usize, usize, usize)) -> Found<usize> {
+   let code = function_code(image, render, "rail render")?;
+   let lines = phoenix_hook::x86::disasm(code, render, usize::MAX);
+   let field = |text: &str| -> Option<(String, usize)> {
+      let inner = text.strip_prefix('[')?.strip_suffix(']')?;
+      let (base, disp) = inner.split_once('+')?;
+      Some((base.to_owned(), imm_operand(disp)?))
+   };
+   let ops: Vec<(&str, &str, &str)> = lines
+      .iter()
+      .map(|line| {
+         let (op, rest) = line.text.split_once(' ').unwrap_or((&line.text, ""));
+         let (a, b) = rest.split_once(',').unwrap_or((rest, ""));
+         (op, a, b)
+      })
+      .collect();
+   let lens = (2..ops.len())
+      .filter_map(|at| {
+         let (op, _, sum) = ops[at];
+         let (ptr_reg, len_reg) = sum
+            .strip_prefix('[')?
+            .strip_suffix("*8]")?
+            .split_once('+')?;
+         let ((op1, a1, b1), (op2, a2, b2)) = (ops[at - 2], ops[at - 1]);
+         if op != "lea" || op1 != "mov" || op2 != "mov" || a1 != ptr_reg || a2 != len_reg {
+            return None;
+         }
+         let ((tile, ptr), (len_base, len)) = (field(b1)?, field(b2)?);
+         if tile != len_base || ptr + 8 != len || len + 8 > tiles.2 {
+            return None;
+         }
+         let from = ops[at.saturating_sub(24)..at - 2].iter();
+         let sized = from.clone().any(|(op, a, b)| {
+            *op == "imul" && *a == tile && b.ends_with(&format!(",{:X}h", tiles.2))
+         });
+         let based = from.clone().any(|(op, a, b)| {
+            *op == "add" && *a == tile && field(b).is_some_and(|(_, at)| at == tiles.0)
+         });
+         (sized && based).then_some(len)
+      })
+      .collect::<Vec<_>>();
+   one("rail folder length", &unique(lens))
+}
+
+/// The rail's virtual list, kept in [`Rail`] as a pointer to a `RefCell`d
+/// state, and the method that forgets every item height it has measured.
+#[derive(Clone, Copy, Debug)]
+pub struct RailList {
+   /// Offset of the list's state pointer in `Rail`.
+   pub field:     usize,
+   /// Offset of the `RefCell` borrow count in the state.
+   pub borrow:    usize,
+   /// `(&list)`, which clears the measured heights and lays the list out again.
+   pub remeasure: usize,
+}
+
+/// `lines` after the register saves and stack reservation that open a function.
+fn past_pushes(lines: &[phoenix_hook::x86::Line]) -> &[phoenix_hook::x86::Line] {
+   let skip = lines
+      .iter()
+      .take_while(|l| l.text.starts_with("push ") || l.text.starts_with("sub rsp,"))
+      .count();
+   &lines[skip..]
+}
+
+/// A list method `fn(&list)` that opens with the state's borrow check:
+/// `mov s,[rdi]`, `cmp qword ptr [s+b],0`, `jne`, `mov qword ptr [s+b],-1`.
+fn list_borrow(lines: &[phoenix_hook::x86::Line]) -> Option<(String, usize)> {
+   let lines = past_pushes(lines);
+   let state = lines
+      .first()?
+      .text
+      .strip_prefix("mov ")?
+      .strip_suffix(",[rdi]")?;
+   let check = lines
+      .get(1)?
+      .text
+      .strip_prefix("cmp qword ptr ")?
+      .strip_suffix(",0")?;
+   let (base, borrow) = mem_operand(check)?;
+   let take = format!("mov qword ptr [{state}+{borrow:X}h],0FFFFFFFFFFFFFFFFh");
+   (base == state && lines.get(2)?.text.starts_with("jne ") && lines.get(3)?.text == take)
+      .then(|| (state.to_owned(), borrow))
+}
+
+/// A list method that borrows the state shared: `mov s,[rdi]`, `mov r,[s+b]`,
+/// then the compare against `isize::MAX`.
+fn list_shared(lines: &[phoenix_hook::x86::Line]) -> bool {
+   let lines = past_pushes(lines);
+   let Some(state) = lines
+      .first()
+      .and_then(|l| l.text.strip_prefix("mov ")?.strip_suffix(",[rdi]"))
+   else {
+      return false;
+   };
+   let loads = lines
+      .get(1)
+      .and_then(|l| mem_operand(&l.text))
+      .is_some_and(|(r, _)| r == state);
+   loads
+      && lines
+         .get(2)
+         .is_some_and(|l| l.text.ends_with(",7FFFFFFFFFFFFFFFh"))
+}
+
+/// The rail's list and the method that forgets its measured heights.
+///
+/// The list type's methods sit together. That one takes no argument but the
+/// list, empties a hash table of them (`mov esi,0FFh` to its control bytes),
+/// and lays the list out again from `[s+18h]`, the layout the other methods
+/// read.
+pub fn rail_list(image: &Image<'_>, rail: &Rail) -> Found<RailList> {
+   let code = function_code(image, rail.render, "rail render")?;
+   let lines = phoenix_hook::x86::disasm(code, rail.render, usize::MAX);
+   // `lea r,[rail+field]`, then the call with it, directly or through `mov
+   // rdi,r`.
+   let mut methods = Vec::new();
+   for at in 0..lines.len() {
+      let Some((dst, src)) = lines[at]
+         .text
+         .strip_prefix("lea ")
+         .and_then(|t| t.split_once(','))
+      else {
+         continue;
+      };
+      let Some((_, field)) = mem_operand(src) else {
+         continue;
+      };
+      let call = match lines.get(at + 1) {
+         Some(next) if dst == "rdi" => next,
+         Some(next) if next.text == format!("mov rdi,{dst}") => {
+            let Some(call) = lines.get(at + 2) else {
+               continue;
+            };
+            call
+         },
+         _ => continue,
+      };
+      let Some(slot) = call
+         .target
+         .filter(|_| call.text.starts_with("call qword ptr"))
+      else {
+         continue;
+      };
+      let Some(method) = image.read_usize(slot).filter(|&m| image.is_function(m)) else {
+         continue;
+      };
+      let Ok(body) = function_code(image, method, "rail list method") else {
+         continue;
+      };
+      if list_borrow(&phoenix_hook::x86::disasm(body, method, 12)).is_some()
+         || list_shared(&phoenix_hook::x86::disasm(body, method, 12))
+      {
+         methods.push((field, method));
+      }
+   }
+   let field = one(
+      "rail list field",
+      &unique(methods.iter().map(|m| m.0).collect()),
+   )?;
+   let (low, high) = methods
+      .iter()
+      .fold((usize::MAX, 0), |(lo, hi), &(_, m)| (lo.min(m), hi.max(m)));
+
+   let mut found = Vec::new();
+   let mut at = low.saturating_sub(0x4000);
+   while at < high + 0x4000 {
+      let Some((start, end)) = image.function_bounds(at) else {
+         at += 16;
+         continue;
+      };
+      at = end.max(at + 1);
+      let Ok(body) = function_code(image, start, "list method") else {
+         continue;
+      };
+      let lines = phoenix_hook::x86::disasm(body, start, usize::MAX);
+      let Some((state, borrow)) = list_borrow(&lines) else {
+         continue;
+      };
+      let Some(clear) = lines.iter().position(|l| l.text == "mov esi,0FFh") else {
+         continue;
+      };
+      let reads_args = lines[..clear].iter().any(|l| {
+         let src = l.text.split_once(',').map_or(l.text.as_str(), |(_, s)| s);
+         ["rsi", "esi", "sil", "rdx", "edx", "dl", "xmm"]
+            .iter()
+            .any(|r| src.contains(r))
+            && !src.starts_with('[')
+      });
+      let layout = format!("lea rbx,[{state}+18h]");
+      let relaid = lines[..clear].iter().any(|l| l.text == layout)
+         && lines[clear..].iter().any(|l| l.text == "mov rdi,rbx")
+         && lines
+            .iter()
+            .any(|l| l.text == format!("inc qword ptr [{state}+{borrow:X}h]"));
+      if !reads_args && relaid {
+         found.push((start, borrow));
+      }
+   }
+   let (remeasure, borrow) = one("rail list remeasure", &unique(found))?;
+   Ok(RailList {
+      field,
+      borrow,
+      remeasure,
+   })
+}
+
+/// The user panel under the server and channel lists, and the getter its width
+/// reads the channel list's width from.
+#[derive(Clone, Copy, Debug)]
+pub struct UserPanel {
+   /// `UserPanel::render`, under [`Prologues::frame`].
+   pub render:       usize,
+   /// The GOT slot of `(window, cx) -> f32`, the channel list's width.
+   pub sidebar_slot: usize,
+}
+
+/// The user panel's render and its width's channel-list term.
+///
+/// The panel spans the rail and the channel list: its width adds the rail's
+/// width getter to the channel list's, which is the saved sidebar width less
+/// the rail's. Both are called through the GOT, the second right after the
+/// first, and its body calls the first.
+pub fn user_panel(image: &Image<'_>) -> Found<UserPanel> {
+   let renders = image
+      .find_bytes(b"user-panels")
+      .into_iter()
+      .flat_map(|anchor| lea_refs(image, anchor))
+      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
+      .collect::<Vec<_>>();
+   let render = one("user panel render", &unique(renders))?;
+   if !prologues(image).frame.at(image, render) {
+      return Err("user panel prologue changed".to_owned());
+   }
+   let code = function_code(image, render, "user panel render")?;
+   let lines = phoenix_hook::x86::disasm(code, render, usize::MAX);
+   let slot_call =
+      |l: &phoenix_hook::x86::Line| l.target.filter(|_| l.text.starts_with("call qword ptr"));
+   let mut slots = Vec::new();
+   for (at, line) in lines.iter().enumerate() {
+      let Some(rail_slot) = slot_call(line) else {
+         continue;
+      };
+      let Some(sidebar_slot) = lines[at + 1..].iter().take(4).find_map(slot_call) else {
+         continue;
+      };
+      let Some(sidebar) = image
+         .read_usize(sidebar_slot)
+         .filter(|&f| image.is_function(f))
+      else {
+         continue;
+      };
+      let Ok(body) = function_code(image, sidebar, "channel list width") else {
+         continue;
+      };
+      let body = phoenix_hook::x86::disasm(body, sidebar, 12);
+      let rail_call = body.iter().any(|l| slot_call(l) == Some(rail_slot));
+      if rail_call && body.iter().any(|l| l.text.starts_with("subss ")) {
+         slots.push(sidebar_slot);
+      }
+   }
+   let sidebar_slot = one("user panel width", &unique(slots))?;
+   Ok(UserPanel {
+      render,
+      sidebar_slot,
+   })
+}
+
+/// `<AnyView as Element>::request_layout` and the fields of `AnyView` it reads.
+/// A cached view lays out as one node of its `cached_style`, and its render
+/// then lays out inside that node's bounds.
+#[derive(Clone, Copy, Debug)]
+pub struct AnyViewLayout {
+   /// `(sret, &mut AnyView, id, inspector id, &mut Window, &mut App) ->
+   /// (LayoutId, Option<AnyElement>)`.
+   pub request_layout: usize,
+   /// The inline `Option<StyleRefinement>` the view is cached with.
+   pub cached_style:   usize,
+   /// The value of the `u32` at `cached_style` that means `None`.
+   pub uncached:       u32,
+   /// The view's type name, a `&'static str`.
+   pub type_name:      usize,
+}
+
+/// The function that loads the `gpui::view::AnyView` element name.
+///
+/// It passes `Some(&cached_style)` on: `cmp dword ptr [view+style],tag`, `lea
+/// r,[view+style]`, `cmovne`. The type name is the pointer and length it passes
+/// beside.
+pub fn any_view_layout(image: &Image<'_>) -> Found<AnyViewLayout> {
+   const NAME: &[u8] = b"gpui::view::AnyView";
+   let functions = unique(
+      image
+         .find_bytes(NAME)
+         .into_iter()
+         .flat_map(|anchor| lea_refs(image, anchor))
+         .filter_map(|lea| Some(image.function_bounds(lea)?.0))
+         .collect(),
+   );
+   let ops = |text: &str| -> (String, String, String) {
+      let (op, rest) = text.split_once(' ').unwrap_or((text, ""));
+      let (a, b) = rest.split_once(',').unwrap_or((rest, ""));
+      (op.to_owned(), a.to_owned(), b.to_owned())
+   };
+   let mut found = Vec::new();
+   for func in functions {
+      let Ok(code) = function_code(image, func, "AnyView element") else {
+         continue;
+      };
+      let lines: Vec<_> = phoenix_hook::x86::disasm(code, func, usize::MAX)
+         .iter()
+         .map(|line| ops(&line.text))
+         .collect();
+      for at in 0..lines.len() {
+         let (op, a, b) = &lines[at];
+         let Some((view, style)) = (op == "cmp" && a.starts_with("dword ptr"))
+            .then(|| mem_operand(a))
+            .flatten()
+         else {
+            continue;
+         };
+         let Some(tag) = imm_operand(b).and_then(|tag| u32::try_from(tag).ok()) else {
+            continue;
+         };
+         let next = lines.get(at + 1..at + 5).unwrap_or_default();
+         let lea = next
+            .iter()
+            .any(|(op, _, b)| op == "lea" && mem_operand(b) == Some((view, style)));
+         if !lea || !next.iter().any(|(op, ..)| op == "cmovne") {
+            continue;
+         }
+         // `mov a,[view+name]`, `mov b,[view+name+8]`.
+         let names = lines.windows(2).filter_map(|pair| {
+            let first =
+               mem_operand(&pair[0].2).filter(|(r, _)| *r == view && pair[0].0 == "mov")?;
+            let second =
+               mem_operand(&pair[1].2).filter(|(r, _)| *r == view && pair[1].0 == "mov")?;
+            (second.1 == first.1 + 8).then_some(first.1)
+         });
+         for name in unique(names.collect()) {
+            found.push((func, style, tag, name));
+         }
+      }
+   }
+   let (request_layout, cached_style, uncached, type_name) =
+      one("AnyView::request_layout", &unique(found))?;
+   if !prologues(image).small_frame.at(image, request_layout) {
+      return Err("AnyView::request_layout prologue changed".to_owned());
+   }
+   Ok(AnyViewLayout {
+      request_layout,
+      cached_style,
+      uncached,
+      type_name,
+   })
 }
 
 #[cfg(test)]

@@ -648,6 +648,58 @@ fn check(
             "relationship counts",
             desktop::relationship_counts(image).and_then(moved),
          );
+         report(
+            "any view",
+            desktop::any_view_layout(image).map(|found| {
+               format!(
+                  "request_layout {} cached style +{:#x} (none {}) type name +{:#x}",
+                  at(found.request_layout),
+                  found.cached_style,
+                  found.uncached,
+                  found.type_name
+               )
+            }),
+         );
+         report(
+            "rail",
+            desktop::rail(image).map(|found| {
+               format!(
+                  "render {} item {} into {} items {:x?} tiles {:x?} folder id +{:#x} len +{:#x} \
+                   open +{:#x}",
+                  at(found.render),
+                  at(found.item),
+                  at(found.render_into),
+                  found.items,
+                  found.tiles,
+                  found.folder_id,
+                  found.folder_len,
+                  found.open_folders
+               )
+            }),
+         );
+         report(
+            "rail list",
+            desktop::rail(image)
+               .and_then(|rail| desktop::rail_list(image, &rail))
+               .map(|found| {
+                  format!(
+                     "field +{:#x} borrow +{:#x} remeasure {}",
+                     found.field,
+                     found.borrow,
+                     at(found.remeasure)
+                  )
+               }),
+         );
+         report(
+            "user panel",
+            desktop::user_panel(image).map(|found| {
+               format!(
+                  "render {} sidebar width slot {}",
+                  at(found.render),
+                  at(found.sidebar_slot)
+               )
+            }),
+         );
          let json = desktop::message_json(image);
          report(
             "stream quality",
