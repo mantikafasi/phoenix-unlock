@@ -293,6 +293,8 @@ enum Holds {
 struct ArgTracker {
    held:     Vec<(Register, Holds)>,
    constant: Vec<(Register, u64)>,
+   /// Frame slots `[rsp|rbp+displacement]` a held register was saved to.
+   spilled:  Vec<((Register, u64), Holds)>,
    found:    ArgUse,
 }
 
@@ -363,6 +365,35 @@ impl ArgTracker {
       self
          .constant
          .retain(|(register, _)| !abi.volatile().contains(register));
+   }
+
+   /// Follows a held register through a frame slot: Windows builds keep the
+   /// pointer on the stack across calls and reload it before each use.
+   fn spill(&mut self, instruction: &Instruction) -> Option<(Register, Holds)> {
+      use iced_x86::{
+         Code,
+         OpKind,
+      };
+      let base = instruction.memory_base();
+      if instruction.memory_index() != Register::None
+         || !matches!(base, Register::RSP | Register::RBP)
+      {
+         return None;
+      }
+      let slot = (base, instruction.memory_displacement64());
+      if instruction.op0_kind() == OpKind::Memory {
+         self.spilled.retain(|(held, _)| *held != slot);
+         if instruction.code() == Code::Mov_rm64_r64
+            && let Some(holds) = self.holds(instruction.op1_register())
+         {
+            self.spilled.push((slot, holds));
+         }
+         return None;
+      }
+      (instruction.code() == Code::Mov_r64_rm64)
+         .then(|| self.spilled.iter().find(|(held, _)| *held == slot))
+         .flatten()
+         .map(|&(_, holds)| (instruction.op0_register().full_register(), holds))
    }
 
    /// What `instruction` makes its first operand hold, and the copies and
@@ -449,6 +480,7 @@ pub fn arg_use(abi: Abi, index: usize, code: &[u8], ip: usize) -> ArgUse {
    let mut tracker = ArgTracker {
       held:     vec![(abi.arg(index), Holds::Pointer(0))],
       constant: Vec::new(),
+      spilled:  Vec::new(),
       found:    ArgUse::default(),
    };
    while decoder.can_decode() {
@@ -471,7 +503,9 @@ pub fn arg_use(abi: Abi, index: usize, code: &[u8], ip: usize) -> ArgUse {
                .max(offset + memory.memory_size().size());
          }
       }
-      let new = tracker.step(&instruction);
+      let new = tracker
+         .spill(&instruction)
+         .or_else(|| tracker.step(&instruction));
       let loaded = constants.loaded(&instruction);
       let written = info
          .used_registers()
@@ -493,6 +527,10 @@ pub fn arg_use(abi: Abi, index: usize, code: &[u8], ip: usize) -> ArgUse {
       tracker
          .constant
          .retain(|(register, _)| !written.contains(register));
+      // A moved frame base, a push among them, leaves its slots elsewhere.
+      tracker
+         .spilled
+         .retain(|((base, _), _)| !written.contains(base));
       if let Some(new) = new {
          tracker.held.retain(|(register, _)| *register != new.0);
          tracker.held.push(new);
@@ -1244,6 +1282,52 @@ mod tests {
          after_calls: 2,
       }]);
       assert_eq!(used.dispatches, [0x78]);
+   }
+
+   #[test]
+   fn arg_use_follows_the_request_through_a_frame_slot() {
+      // Pieces of `ReqwestTransport::send` from the Windows build, which keeps
+      // the request on the stack and reloads it before each use.
+      let code = [
+         0x48, 0x89, 0x95, 0xB0, 0x0B, 0x00, 0x00, // mov [rbp+0xBB0], rdx
+         0xE8, 0x00, 0x00, 0x00, 0x00, // call
+         0x48, 0x8B, 0x95, 0xB0, 0x0B, 0x00, 0x00, // mov rdx, [rbp+0xBB0]
+         0x48, 0x8D, 0x5A, 0x60, // lea rbx, [rdx+0x60]
+         0x48, 0x8B, 0x03, // mov rax, [rbx]
+         0x48, 0x63, 0x04, 0x81, // movsxd rax, [rcx+rax*4]: the body's tag
+         0x48, 0x8B, 0x8D, 0xB0, 0x0B, 0x00, 0x00, // mov rcx, [rbp+0xBB0]
+         0x48, 0x8B, 0x81, 0xD0, 0x00, 0x00, 0x00, // mov rax, [rcx+0xD0]
+         0x4C, 0x8D, 0x85, 0xB0, 0x07, 0x00, 0x00, // lea r8, [rbp+0x7B0]
+         0x49, 0x89, 0x40, 0x10, // mov [r8+0x10], rax
+         0x0F, 0x10, 0x81, 0xC0, 0x00, 0x00, 0x00, // movups xmm0, [rcx+0xC0]
+         0x41, 0x0F, 0x29, 0x00, // movaps [r8], xmm0
+         0x48, 0x8B, 0x81, 0xA8, 0x00, 0x00, 0x00, // mov rax, [rcx+0xA8]
+         0x4C, 0x8D, 0x8D, 0xD0, 0x09, 0x00, 0x00, // lea r9, [rbp+0x9D0]
+         0x49, 0x89, 0x41, 0x10, // mov [r9+0x10], rax
+         0x0F, 0x10, 0x81, 0x98, 0x00, 0x00, 0x00, // movups xmm0, [rcx+0x98]
+         0x41, 0x0F, 0x29, 0x01, // movaps [r9], xmm0
+         0x48, 0x8D, 0x4D, 0xA0, // lea rcx, [rbp-0x60]
+         0xE8, 0x00, 0x00, 0x00, 0x00, // call: the request from method and URL
+         0x6A, 0x60, // push 0x60
+         0x59, // pop rcx
+         0x4C, 0x8D, 0x85, 0xD0, 0x09, 0x00, 0x00, // lea r8, [rbp+0x9D0]
+         0x4C, 0x89, 0xC7, // mov rdi, r8
+         0x48, 0x8B, 0xB5, 0xB0, 0x0B, 0x00, 0x00, // mov rsi, [rbp+0xBB0]
+         0xF3, 0xA4, // rep movsb: the headers
+      ];
+      let used = arg_use(Abi::Win64, 1, &code, 0x1000);
+      assert_eq!(used.calls, [[None, Some(0), None, None], [
+         None,
+         Some(0),
+         Some(0xC0),
+         Some(0x98)
+      ]]);
+      assert_eq!(used.copies, [StructCopy {
+         offset:      0,
+         len:         0x60,
+         after_calls: 2,
+      }]);
+      assert_eq!(used.dispatches, [0x60]);
    }
 
    #[test]
