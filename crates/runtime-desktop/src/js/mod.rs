@@ -36,6 +36,7 @@ use crate::{
       DesktopMember,
    },
    members::Place,
+   rail,
    shortcuts,
    sidebar,
    spotify::{
@@ -93,6 +94,8 @@ pub struct Desktop<'js> {
    pub stream_unlocks:     RefCell<Vec<(u64, String)>>,
    /// `phoenix.appearance.unlockNitro` handles by id and plugin.
    pub appearance_unlocks: RefCell<Vec<(u64, String)>>,
+   /// `phoenix.ui.folderColumn` handles by id and plugin.
+   pub folder_columns:     RefCell<Vec<(u64, String)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -236,6 +239,10 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    pastes.retain(|(_, plugin)| plugin != name);
    limits::allow(!pastes.is_empty());
    drop(pastes);
+
+   let mut columns = registry.folder_columns.borrow_mut();
+   columns.retain(|(_, plugin)| plugin != name);
+   rail::enable(!columns.is_empty());
 
    themes::unload(name);
    let mut stream_unlocks = registry.stream_unlocks.borrow_mut();

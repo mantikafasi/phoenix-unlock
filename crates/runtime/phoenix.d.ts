@@ -1607,6 +1607,11 @@ declare namespace Phoenix {
     /// Pushes a full-screen native Phoenix page onto the active navigator with a header,
     /// working Back button/gesture, scrollable syntax-highlighted code sections, and action buttons.
     openPage(options: { title: string; sections: PageSection[] }): PageHandle;
+    /// Desktop only, undefined on mobile. Shows the open server folders' servers in a column
+    /// beside the server rail, where the rail shows each open folder closed. The column stays
+    /// while any plugin holds one, and goes when the plugin unloads. Call the returned function
+    /// to let it go.
+    folderColumn?(): Remover;
     /// Hides every Phoenix view matching `accessibilityId` (e.g. `"composer.gift"` or
     /// `"Record Voice Message"`) by omitting it from its parent's child list. Call the returned
     /// function to restore it. Desktop only knows `"composer.gift"`.

@@ -36,6 +36,7 @@ mod modal;
 mod notices;
 mod onboarding;
 mod os;
+mod rail;
 mod ready;
 mod recovery;
 #[cfg(windows)]
@@ -293,6 +294,7 @@ pub fn prepare() -> Result<(), Error> {
    feature("gpui_theme", || gpui_theme::install(&image));
    feature("stream", || stream::install(&image));
    feature("os_redraw", || <os::Os as os::DesktopOs>::install(&image));
+   feature("rail", || rail::install(&image, &ix));
    let registry = phoenix_runtime::hook(&image);
    critical(
       "gateway",

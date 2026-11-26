@@ -1039,6 +1039,11 @@ pub fn div_into_any_addr() -> Option<usize> {
    SYMBOLS.get().map(|s| s.div_into_any_raw)
 }
 
+/// The resolved address of `gpui::div`.
+pub fn div_new_addr() -> Option<usize> {
+   SYMBOLS.get().map(|s| s.div_new as usize)
+}
+
 pub fn raw_div() -> Option<RawDiv> {
    let sym = SYMBOLS.get()?;
    Some(Builder { sym }.raw_div())
@@ -1571,6 +1576,7 @@ const DESKTOP_FULL: &[&str] = &[
    "clear-urls",
    "fix-embeds",
    "platform-indicators",
+   "better-folders",
 ];
 
 const DESKTOP_PARTIAL: &[&str] = &["fakenitro"];
