@@ -56,20 +56,14 @@ mod windows {
       OptionExt,
       ResultExt,
    };
+   use phoenix_drover::{
+      ProcessInformation,
+      queue_load,
+   };
 
    type Handle = *mut c_void;
 
-   #[repr(C)]
-   struct ProcessInformation {
-      process:    Handle,
-      thread:     Handle,
-      process_id: u32,
-      thread_id:  u32,
-   }
-
    const CREATE_SUSPENDED: u32 = 0x4;
-   const MEM_COMMIT_RESERVE: u32 = 0x3000;
-   const PAGE_READWRITE: u32 = 0x4;
 
    #[link(name = "kernel32")]
    unsafe extern "system" {
@@ -85,23 +79,6 @@ mod windows {
          startup: *const c_void,
          info: *mut ProcessInformation,
       ) -> i32;
-      fn VirtualAllocEx(
-         process: Handle,
-         address: *const c_void,
-         size: usize,
-         kind: u32,
-         protect: u32,
-      ) -> *mut c_void;
-      fn WriteProcessMemory(
-         process: Handle,
-         address: *mut c_void,
-         buffer: *const c_void,
-         size: usize,
-         written: *mut usize,
-      ) -> i32;
-      fn GetModuleHandleW(name: *const u16) -> Handle;
-      fn GetProcAddress(module: Handle, name: *const u8) -> *mut c_void;
-      fn QueueUserAPC(function: *mut c_void, thread: Handle, data: usize) -> u32;
       fn ResumeThread(thread: Handle) -> u32;
       fn TerminateProcess(process: Handle, code: u32) -> i32;
       fn CloseHandle(handle: Handle) -> i32;
@@ -330,18 +307,20 @@ mod windows {
       if !open.is_empty() {
          let dll_name = dll.file_name().unwrap_or_default();
          let with_sunbird = open.iter().any(|&(_, pid)| has_module(pid, dll_name));
-         let restart = if no_runtime {
-            ask(
+         // The shortcuts pass the saved flags on every start, so only a
+         // change of them is worth a restart.
+         let same = with_sunbird && phoenix_drover::launched_with(no_runtime, drover);
+         let restart = !same
+            && ask(if with_sunbird {
+               "Discord is already running with other Sunbird settings.\n\nRestart it with these? \
+                A call you are in will end."
+            } else if no_runtime {
                "Discord is already running.\n\nRestart it without the Sunbird plugin runtime? A \
-                call you are in will end.",
-            )
-         } else {
-            !with_sunbird
-               && ask(
-                  "Discord is already running without Sunbird.\n\nRestart it with Sunbird? A call \
-                   you are in will end.",
-               )
-         };
+                call you are in will end."
+            } else {
+               "Discord is already running without Sunbird.\n\nRestart it with Sunbird? A call you \
+                are in will end."
+            });
          for &(process, _) in &open {
             if restart {
                // SAFETY: opened with TERMINATE by `running`.
@@ -447,43 +426,6 @@ mod windows {
             *no_runtime = true;
          }
       }
-   }
-
-   /// Copies `dll` into the child and queues `LoadLibraryW` on its main
-   /// thread. kernel32 sits at the same address in every process of a boot.
-   fn queue_load(info: &ProcessInformation, dll: &[u16]) -> io::Result<()> {
-      let size = size_of_val(dll);
-      // SAFETY: `info.process` is a live process handle with full access.
-      let remote = unsafe {
-         VirtualAllocEx(
-            info.process,
-            ptr::null(),
-            size,
-            MEM_COMMIT_RESERVE,
-            PAGE_READWRITE,
-         )
-      };
-      check(!remote.is_null())?;
-      // SAFETY: `remote` holds `size` bytes and `dll` is `size` bytes long.
-      check(unsafe {
-         WriteProcessMemory(
-            info.process,
-            remote,
-            dll.as_ptr().cast(),
-            size,
-            ptr::null_mut(),
-         ) != 0
-      })?;
-      // SAFETY: kernel32 is always loaded and the names are NUL-terminated.
-      let load = unsafe {
-         GetProcAddress(
-            GetModuleHandleW(wide("kernel32.dll").as_ptr()),
-            c"LoadLibraryW".as_ptr().cast(),
-         )
-      };
-      check(!load.is_null())?;
-      // SAFETY: LoadLibraryW takes one pointer argument, as an APC does.
-      check(unsafe { QueueUserAPC(load, info.thread, remote as usize) } != 0)
    }
 
    /// Copies this launcher into `home`, adds its shortcuts once, and brings

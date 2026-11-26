@@ -57,6 +57,7 @@ pub unsafe extern "system" fn DllMain(
       // SAFETY: as above.
       unsafe { phoenix_drover::attach(module) };
       if !phoenix_drover::is_media() {
+         phoenix_drover::announce(env::var_os("SUNBIRD_GATE_ONLY").is_some());
          desktop();
       }
    }
@@ -323,19 +324,16 @@ mod linux {
    /// starts know to take this library out for their own children.
    const BELOW_CLIENT: &str = "SUNBIRD_BELOW_CLIENT";
 
-   /// Whether this process is the client. The client takes this library out
-   /// of `LD_PRELOAD` so its children (`discord_media`, the CEF helper,
-   /// `xdg-open`) never load it. With drover on it keeps it, since
-   /// `discord_media` may carry voice, and each child takes it out instead.
-   /// The processes the `AppImage` runs before the client keep it either way.
+   /// Whether this process is the client, taking this library out of
+   /// `LD_PRELOAD` when [`drops_preload`] says so.
    pub fn claim() -> bool {
       let client = std::fs::read_link("/proc/self/exe")
          .is_ok_and(|exe| exe.file_name() == Some(OsStr::new(CLIENT)));
-      let drop = if client {
-         !phoenix_drover::enabled()
-      } else {
-         env::var_os(BELOW_CLIENT).is_some()
-      };
+      let drop = drops_preload(
+         client,
+         phoenix_drover::enabled(),
+         env::var_os(BELOW_CLIENT).is_some(),
+      );
       if client && !drop {
          // SAFETY: constructors run before `main`, while the loader is the
          // only thread.
@@ -345,6 +343,14 @@ mod linux {
          unpreload(Path::new(OsStr::from_bytes(path.to_bytes())));
       }
       client
+   }
+
+   /// Whether this process takes the library out of `LD_PRELOAD` for its
+   /// children. The client does unless drover needs it in `discord_media`,
+   /// processes the client started do, and the ones the `AppImage` runs on
+   /// the way to the client never do.
+   pub const fn drops_preload(client: bool, drover: bool, below_client: bool) -> bool {
+      if client { !drover } else { below_client }
    }
 
    fn unpreload(ours: &Path) {
@@ -367,6 +373,23 @@ mod linux {
          } else {
             env::set_var("LD_PRELOAD", OsStr::from_bytes(&kept));
          }
+      }
+   }
+
+   #[cfg(test)]
+   mod tests {
+      use super::drops_preload;
+
+      #[test]
+      fn only_the_client_and_below_drop_the_preload() {
+         // The AppImage's own processes on the way to the client keep it.
+         assert!(!drops_preload(false, false, false));
+         assert!(!drops_preload(false, true, false));
+         // The client keeps it only for drover.
+         assert!(drops_preload(true, false, false));
+         assert!(!drops_preload(true, true, false));
+         // What the client starts drops it for its own children.
+         assert!(drops_preload(false, true, true));
       }
    }
 }

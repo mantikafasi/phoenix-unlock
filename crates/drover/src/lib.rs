@@ -116,6 +116,23 @@ mod linux {
    }
 
    fn probe(real: SendTo, fd: c_int, flags: c_int, addr: *const sockaddr, len: socklen_t) {
+      // A stream that happens to carry the same 74 bytes must not get the
+      // probes spliced in.
+      let mut kind: c_int = 0;
+      let mut size = socklen_t::try_from(size_of::<c_int>()).unwrap_or(0);
+      // SAFETY: `kind` and `size` are valid for the call.
+      let failed = unsafe {
+         libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&raw mut kind).cast(),
+            &raw mut size,
+         )
+      };
+      if failed != 0 || kind != libc::SOCK_DGRAM {
+         return;
+      }
       // A null address sends on a connected socket, as `send` would.
       // SAFETY: one readable byte, and the caller's own socket and address.
       super::probe(|byte| unsafe {
@@ -204,8 +221,12 @@ mod linux {
 
 #[cfg(windows)]
 pub use windows::{
+   ProcessInformation,
+   announce,
    attach,
    is_media,
+   launched_with,
+   queue_load,
 };
 
 #[cfg(windows)]
@@ -264,12 +285,13 @@ mod windows {
       buf: *const u8,
    }
 
+   /// `PROCESS_INFORMATION`, which `CreateProcessW` fills.
    #[repr(C)]
-   struct ProcessInformation {
-      process:    Handle,
-      thread:     Handle,
-      process_id: u32,
-      thread_id:  u32,
+   pub struct ProcessInformation {
+      pub process:    Handle,
+      pub thread:     Handle,
+      pub process_id: u32,
+      pub thread_id:  u32,
    }
 
    const CREATE_SUSPENDED: u32 = 0x4;
@@ -297,7 +319,62 @@ mod windows {
       ) -> i32;
       fn QueueUserAPC(function: *mut c_void, thread: Handle, data: usize) -> u32;
       fn ResumeThread(thread: Handle) -> u32;
+      fn CreateEventW(
+         attributes: *const c_void,
+         manual_reset: i32,
+         initial: i32,
+         name: *const u16,
+      ) -> Handle;
+      fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> Handle;
+      fn CloseHandle(handle: Handle) -> i32;
    }
+
+   /// The named event a Discord started with these launcher flags holds.
+   fn launch_event(gate_only: bool, drover: bool) -> Vec<u16> {
+      wide(&format!(
+         "Local\\Sunbird-gate{}-drover{}",
+         u8::from(gate_only),
+         u8::from(drover)
+      ))
+   }
+
+   /// Marks this Discord as started with `gate_only` and drover as [`attach`]
+   /// read it, for [`launched_with`]. The event lives as long as Discord.
+   pub fn announce(gate_only: bool) {
+      // SAFETY: a NUL-terminated name, and the handle is kept open on purpose.
+      unsafe {
+         CreateEventW(
+            ptr::null(),
+            1,
+            0,
+            launch_event(gate_only, super::enabled()).as_ptr(),
+         )
+      };
+   }
+
+   /// Whether a running Discord announced these launcher flags, so the
+   /// launcher only restarts it when they changed.
+   #[must_use]
+   pub fn launched_with(gate_only: bool, drover: bool) -> bool {
+      const SYNCHRONIZE: u32 = 0x0010_0000;
+      // SAFETY: a NUL-terminated name.
+      let event = unsafe { OpenEventW(SYNCHRONIZE, 0, launch_event(gate_only, drover).as_ptr()) };
+      if event.is_null() {
+         return false;
+      }
+      // SAFETY: opened above and closed once.
+      unsafe { CloseHandle(event) };
+      true
+   }
+
+   #[link(name = "ws2_32")]
+   unsafe extern "system" {
+      fn getsockopt(socket: usize, level: i32, name: i32, value: *mut u8, size: *mut i32) -> i32;
+   }
+
+   const SOL_SOCKET: i32 = 0xFFFF;
+   const SO_TYPE: i32 = 0x1008;
+   const SOCK_DGRAM: i32 = 2;
 
    static SENDTO: AtomicUsize = AtomicUsize::new(0);
    static SEND: AtomicUsize = AtomicUsize::new(0);
@@ -431,7 +508,21 @@ mod windows {
 
    fn probe(socket: usize, flags: i32, to: *const c_void, to_len: i32) {
       let real = PROBE.load(Ordering::Acquire);
-      if real == 0 {
+      // A stream that happens to carry the same 74 bytes must not get the
+      // probes spliced in.
+      let mut kind = 0i32;
+      let mut size = 4i32;
+      // SAFETY: `kind` and `size` are valid for the call.
+      let failed = unsafe {
+         getsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_TYPE,
+            (&raw mut kind).cast(),
+            &raw mut size,
+         )
+      };
+      if real == 0 || failed != 0 || kind != SOCK_DGRAM {
          return;
       }
       // SAFETY: ws2_32's `sendto`.
@@ -590,10 +681,17 @@ mod windows {
       }
    }
 
-   /// Copies `dll` into the child and queues `LoadLibraryW` on its main
-   /// thread, as `sunbird.exe` does for Discord. kernel32 sits at the same
-   /// address in every process of a boot.
-   fn queue_load(info: &ProcessInformation, dll: &[u16]) -> io::Result<()> {
+   /// Loads `dll`, a NUL-terminated path, into a suspended child.
+   ///
+   /// Copies the path in and queues `LoadLibraryW` on the child's main
+   /// thread, which runs once the OS loader finishes. `sunbird.exe` starts
+   /// Discord this way too. kernel32 sits at the same address in every
+   /// process of a boot.
+   ///
+   /// # Errors
+   ///
+   /// The OS error of the step that failed.
+   pub fn queue_load(info: &ProcessInformation, dll: &[u16]) -> io::Result<()> {
       let size = size_of_val(dll);
       // SAFETY: `info.process` is a live process handle with full access.
       let remote = unsafe {

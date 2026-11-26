@@ -118,17 +118,20 @@ while true; do
    shift
 done
 # A second Discord hands off to the running one and exits, so one running
-# without Sunbird is restarted with it.
+# without Sunbird, or started with other flags, is restarted with these.
 discord=$(q "$discord")
-pids= sunbird=
+flags() { grep -E '^SUNBIRD_(GATE_ONLY|DROVER)=' | sort | tr '\\n' ' '; }
+wanted=\$(env | flags)
+pids= sunbird= seen= running=
 for p in /proc/[0-9]*; do
    if [ "\$(readlink "\$p/exe" 2>/dev/null)" = "\$discord" ] ||
       tr '\\0' '\\n' <"\$p/environ" 2>/dev/null | grep -qxF "APPIMAGE=\$discord"; then
       pids="\$pids \${p#/proc/}"
       grep -q libphoenix "\$p/maps" 2>/dev/null && sunbird=1
+      [ -n "\$seen" ] || { seen=1; running=\$(tr '\\0' '\\n' <"\$p/environ" 2>/dev/null | flags); }
    fi
 done
-if [ -n "\$pids" ] && [ -z "\$sunbird" ]; then
+if [ -n "\$pids" ] && { [ -z "\$sunbird" ] || [ "\$running" != "\$wanted" ]; }; then
    kill \$pids 2>/dev/null
    for _ in 1 2 3 4 5 6 7 8 9 10; do
       alive=
