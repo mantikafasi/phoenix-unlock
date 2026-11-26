@@ -1310,6 +1310,7 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       "mount",
       "dispatch",
       "update",
+      "disableHaptics",
    ] {
       ui.set(
          slot_fn,

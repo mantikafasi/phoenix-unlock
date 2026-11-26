@@ -1484,6 +1484,10 @@ declare namespace Phoenix {
     /// Shows a native Discord in-app notification banner at the top of the screen. Returns a
     /// function that dismisses it early.
     notify(options: NotifyOptions): () => void;
+    /// Suppresses haptic feedback across the app (host `Haptics` calls and view haptic props on
+    /// mobile; no-op on desktop). Absent on runtimes from before it. Call the returned function
+    /// to re-enable haptics.
+    disableHaptics?(): Remover;
     /// Copies `text` to the device clipboard.
     copy(text: string): void;
     /// A short message at the bottom of the screen, or in a banner at the top on iOS.
