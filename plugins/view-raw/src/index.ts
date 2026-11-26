@@ -1,5 +1,5 @@
 // @description Opens a message's raw text and JSON in a viewer
-// @version 1.2.0
+// @version 1.2.1
 // @author cmdr-chara
 
 const show = (msg: Phoenix.Message) => {
@@ -77,7 +77,7 @@ phoenix.ui.addMessageAction({
           return;
         }
         const list = res.json<Phoenix.Message[]>();
-        const found = list.find((m) => m.id === ctx.messageId) ?? list[0];
+        const found = list.find((m) => m.id === ctx.messageId);
         if (!found) {
           phoenix.ui.toast("Message not found");
           return;
