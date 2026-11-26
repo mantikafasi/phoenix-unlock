@@ -12,11 +12,11 @@ use phoenix_hook::{
    image::Image,
    x86::{
       Abi,
-      Line,
+      Held,
+      PointerUse,
       call_target,
-      disasm,
       jump_target,
-      sret_stores,
+      pointer_uses,
    },
 };
 
@@ -122,13 +122,25 @@ impl DesktopHttpTransport {
          pair => pair,
       };
 
+      // Poll writes its result in whichever state arm finishes, so every
+      // store through the return pointer counts, not only those before a `ret`.
       let poll_result = image
          .function_bounds(poll_fn)
          .and_then(|(start, end)| image.read(start, end - start))
          .and_then(|code| {
-            sret_stores(abi, code, poll_fn)
+            pointer_uses(abi, code, poll_fn, abi.arg(0))
                .into_iter()
-               .map(|(offset, size)| offset + size)
+               .filter_map(|used| {
+                  match used {
+                     PointerUse::Store { offset, size, .. } => Some(offset + size),
+                     PointerUse::Copy {
+                        dest: Some(Held::At(offset)),
+                        count: Some(Held::Constant(count)),
+                        ..
+                     } => Some(offset + usize::try_from(count).ok()?),
+                     _ => None,
+                  }
+               })
                .max()
          })
          .map(|end| end.next_multiple_of(8));
@@ -146,17 +158,16 @@ impl DesktopHttpTransport {
    }
 }
 
-/// Decodes the `TransportRequest` layout from `send`'s own reads of it.
+/// Decodes the `TransportRequest` layout from what `send` does with its
+/// second argument, followed by [`pointer_uses`]:
 ///
-/// - The body's tag indexes the jump table whose arms include the host-file
-///   error at `anchor`: `mov r, [req + body]; movsxd r, [table + r*4]`.
-/// - The URL and method go to reqwest's builder in one call: the URL as the 4th
-///   argument, `lea r, [req + url]`, and the method copied with `movups xmm,
-///   [req + method]` into the buffer the 3rd argument points at.
-/// - The headers are moved out whole with `rep movsb` from `req + headers`.
+/// - The body's tag indexes a jump table, the last one before the host-file
+///   error at `anchor`, one of its arms.
+/// - The URL and method go to reqwest's builder in one call, its 4th and 3rd
+///   arguments, each the field's address or that of a copy of it.
+/// - The headers are moved out whole with a `rep movsb` of their size.
 ///
-/// `req` is the register `send`'s second argument is first copied into. The
-/// four fields must be 8-byte aligned and not overlap.
+/// The four fields must be 8-byte aligned and not overlap.
 fn request_layout(
    image: &Image<'_>,
    abi: Abi,
@@ -167,69 +178,46 @@ fn request_layout(
    let code = image
       .read(send_fn, send_end - send_fn)
       .ok_or("ReqwestTransport::send is unmapped")?;
-   let lines = disasm(code, send_fn, usize::MAX);
-   let arg = |index: usize| format!("{:?}", abi.arg(index)).to_ascii_lowercase();
-   let incoming = arg(1);
-   let req = lines
-      .iter()
-      .find_map(|line| {
-         let (dest, source) = line.text.strip_prefix("mov ")?.split_once(',')?;
-         (source == incoming && dest.starts_with('r') && dest.len() == 3).then(|| dest.to_owned())
-      })
-      .ok_or("send never keeps its request in a register")?;
-   let field = |operand: &str| field_offset(operand, &req);
+   let uses = pointer_uses(abi, code, send_fn, abi.arg(1));
 
-   let anchor_at = lines
+   let body = uses
       .iter()
-      .position(|line| line.addr == anchor)
-      .ok_or("the host-file anchor is not on an instruction boundary")?;
-   let body = lines[..anchor_at]
-      .windows(2)
       .rev()
-      .find_map(|pair| {
-         let (dest, source) = pair[0].text.strip_prefix("mov ")?.split_once(',')?;
-         let offset = field(source)?;
-         let index = pair[1].text.strip_prefix("movsxd ")?;
-         (index.starts_with(&format!("{dest},[")) && index.ends_with(&format!("+{dest}*4]")))
-            .then_some(offset)
+      .find_map(|used| {
+         match *used {
+            PointerUse::Dispatch { at, field } if at < anchor => Some(field),
+            _ => None,
+         }
       })
       .ok_or("no jump table on the request body before the host-file arm")?;
 
-   let url_arg = format!("lea {},", arg(3));
-   let method_arg = format!("[{}],", arg(2));
-   let (url, method) = between_calls(&lines)
-      .find_map(|group| {
-         let url = group
-            .iter()
-            .find_map(|line| field(line.text.strip_prefix(&url_arg)?))?;
-         let method = group.windows(2).find_map(|pair| {
-            let (xmm, source) = pair[0].text.strip_prefix("movups ")?.split_once(',')?;
-            let (_, stored) = pair[1].text.split_once(' ')?;
-            (xmm.starts_with("xmm") && stored == format!("{method_arg}{xmm}"))
-               .then(|| field(source))?
-         })?;
-         Some((url, method))
+   let points_at = |held: Option<Held>| {
+      match held? {
+         Held::At(offset) | Held::CopyOf(offset) => Some(offset),
+         Held::Field(_) | Held::Constant(_) => None,
+      }
+   };
+   let (url, method) = uses
+      .iter()
+      .find_map(|used| {
+         match *used {
+            PointerUse::Call { args, .. } => Some((points_at(args[3])?, points_at(args[2])?)),
+            _ => None,
+         }
       })
       .ok_or("no builder call takes the request's URL and method")?;
 
-   let headers = lines
+   let headers = uses
       .iter()
-      .enumerate()
-      .filter(|(_, line)| line.text == "rep movsb [rdi],[rsi]")
-      .find_map(|(at, _)| {
-         let before = &lines[at.saturating_sub(6)..at];
-         let sized = before.iter().any(|line| {
-            line.text == format!("mov ecx,{HEADER_MAP_SIZE:X}h")
-               || line.text == format!("push {HEADER_MAP_SIZE:X}h")
-         });
-         let source = before.iter().rev().find_map(|line| {
-            if line.text == format!("mov rsi,{req}") {
-               Some(0)
-            } else {
-               field(line.text.strip_prefix("lea rsi,")?)
-            }
-         });
-         sized.then_some(source).flatten()
+      .find_map(|used| {
+         match *used {
+            PointerUse::Copy {
+               source: Some(Held::At(offset)),
+               count: Some(Held::Constant(count)),
+               ..
+            } if count == HEADER_MAP_SIZE as u64 => Some(offset),
+            _ => None,
+         }
       })
       .ok_or("send never moves the request's headers out")?;
 
@@ -256,24 +244,6 @@ fn request_layout(
       return Err(format!("request fields are not 8-byte aligned: {layout:?}"));
    }
    Ok(layout)
-}
-
-/// The runs of instructions between calls.
-fn between_calls(lines: &[Line]) -> impl Iterator<Item = &[Line]> {
-   lines.split_inclusive(|line| line.text.starts_with("call "))
-}
-
-/// The displacement of `[base]` or `[base+XXh]`.
-fn field_offset(operand: &str, base: &str) -> Option<usize> {
-   let inner = operand
-      .strip_suffix(']')?
-      .rsplit_once('[')?
-      .1
-      .strip_prefix(base)?;
-   if inner.is_empty() {
-      return Some(0);
-   }
-   usize::from_str_radix(inner.strip_prefix('+')?.strip_suffix('h')?, 16).ok()
 }
 
 /// Finds all `.rdata` vtable method-0 slots (`vtable + 24`) holding `method_fn`
