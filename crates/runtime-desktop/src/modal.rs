@@ -745,15 +745,15 @@ unsafe extern "C" fn modal_button_callback(
             };
             let url = raw.trim().to_owned();
             if url.is_empty() {
-               set_install_status("Enter an https:// URL ending in .js", true, false);
+               set_install_status("Enter an https:// link to a plugin .js file", true, false);
                return;
             }
             set_install_status("Downloading and installing plugin...", false, true);
             std::thread::spawn(move || {
                match phoenix_runtime::install(&url) {
-                  Ok(name) => {
+                  Ok(installed) => {
                      close_active();
-                     phoenix_ui_desktop::toast(&format!("Installed {name}"));
+                     phoenix_ui_desktop::toast(&installed.to_string());
                   },
                   Err(err) => {
                      set_install_status(&format!("{err}"), true, false);

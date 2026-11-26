@@ -156,6 +156,13 @@ unsafe impl<'js> JsLifetime<'js> for Registry<'js> {
    type Changed<'to> = Registry<'to>;
 }
 
+/// A plugin's source as a function of its `phoenix` object, which the engine
+/// calls to load it.
+#[must_use]
+pub fn wrap(source: &str) -> String {
+   format!("(function (phoenix) {{\n{source}\n}})")
+}
+
 #[expect(clippy::needless_pass_by_value, reason = "used as a map_err callback")]
 #[must_use]
 pub fn js_error(err: CaughtError<'_>) -> Error {
@@ -256,8 +263,8 @@ impl Engine {
       let outcome = self.context.with(|ctx| {
          let run = || -> rquickjs::Result<()> {
             let phoenix = api(&ctx, name)?;
-            let wrapped = format!("(function (phoenix) {{\n{}\n}})", loaded.source);
-            ctx.eval::<Function<'_>, _>(wrapped)?.call((phoenix,))
+            ctx.eval::<Function<'_>, _>(wrap(&loaded.source))?
+               .call((phoenix,))
          };
          run().catch(&ctx).map_err(js_error)
       });

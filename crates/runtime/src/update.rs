@@ -129,7 +129,7 @@ pub fn fetch_catalog() {
 /// Installs a plugin the site lists. Site plugins can call API an older loader
 /// lacks, so platforms with an in-app loader updater wait until the loader is
 /// current.
-pub fn install_listed(name: &str) -> Result<String, crate::Error> {
+pub fn install_listed(name: &str) -> Result<crate::installer::Installed, crate::Error> {
    let updates_loader = crate::platform().is_some_and(<dyn crate::Platform>::updates_loader);
    if updates_loader && let Some(version) = found().and_then(|update| update.loader) {
       return Err(crate::Error::LoaderOutdated { version });

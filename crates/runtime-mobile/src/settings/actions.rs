@@ -6,6 +6,7 @@ use phoenix_runtime::{
    Chosen,
    Control,
    PluginInfo,
+   installer::Installed,
    update::Catalog,
 };
 
@@ -208,12 +209,12 @@ fn listed(index: usize) {
 }
 
 /// Logs an install's outcome and keeps it for the install page.
-fn installed(result: Result<String, phoenix_runtime::Error>, from: &str) {
+fn installed(result: Result<Installed, phoenix_runtime::Error>, from: &str) {
    let status = match result {
-      Ok(name) => {
-         log::info!("installed {name} from {from}");
+      Ok(installed) => {
+         log::info!("{installed} from {from}");
          (
-            format!("Installed {name}. It is on the {TITLE} page now."),
+            format!("{installed}. It is on the {TITLE} page now."),
             COLOR_STRING,
          )
       },

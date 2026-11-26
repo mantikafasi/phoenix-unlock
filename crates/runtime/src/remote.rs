@@ -937,7 +937,7 @@ fn catalog_install(body: &[u8]) -> Reply {
    match outcome {
       Ok(installed) => {
          crate::refresh_settings();
-         ok_json(&Done::Installed(&installed))
+         ok_json(&Done::Installed(&installed.name))
       },
       Err(message) => err("400 Bad Request", &message.to_string()),
    }
