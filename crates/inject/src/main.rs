@@ -534,7 +534,7 @@ mod windows {
       } else {
          "=http"
       };
-      let out = Command::new(system32("curl.exe"))
+      let out = Command::new("curl.exe")
          .args(["-fsSL", "--proto", proto, "--proto-redir", "=https"])
          .args([
             "--ssl-revoke-best-effort",
