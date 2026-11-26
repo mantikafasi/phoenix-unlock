@@ -57,6 +57,10 @@ use crate::{
       self,
       ActionMeta,
    },
+   counts::{
+      self,
+      Count,
+   },
    double_click,
    emoji,
    icons,
@@ -459,7 +463,8 @@ fn cached_message_and_me(channel_id: u64, message_id: u64) -> (Option<String>, O
    let Ok(db) = store::database(&state.files_dir()) else {
       return (None, None);
    };
-   // Phoenix keys messages `<channel>:<message>`, each zero-padded to 20 digits.
+   // Phoenix keys messages `<channel>:<message>`, each zero-padded to 20
+   // digits.
    let rows = if channel_id != 0 {
       store::query(&db, "SELECT v FROM messages WHERE k = ?", &[format!(
          "{channel_id:020}:{message_id:020}"
@@ -1239,6 +1244,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       })?,
    )?;
 
+   let count_owner = plugin.to_owned();
+   ui.set(
+      "hideCount",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, name: String| {
+         hide_count(&ctx, &count_owner, &name)
+      })?,
+   )?;
+
    let owner = plugin.to_owned();
    ui.set(
       "addMessageAccessory",
@@ -1503,6 +1516,33 @@ fn on_emoji_pick<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function
          pickers.retain(|(existing, _)| *existing != id);
          emoji::unlock(!pickers.is_empty());
       }
+   })
+}
+
+/// `phoenix.ui.hideCount`, until the returned remover runs.
+fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result<Function<'js>> {
+   static NEXT_HIDE: AtomicU64 = AtomicU64::new(1);
+
+   let count = name.parse::<Count>().map_err(|()| {
+      Exception::throw_type(
+         ctx,
+         &format!("unknown count {name:?}, expected \"friendRequests\" or \"messageRequests\""),
+      )
+   })?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   let hold = NEXT_HIDE.fetch_add(1, Ordering::Relaxed);
+   let mut hidden = registry.hidden_counts.borrow_mut();
+   hidden.push((hold, plugin.to_owned(), count));
+   counts::hide(hidden.iter().map(|&(.., count)| count));
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut hidden = registry.hidden_counts.borrow_mut();
+      hidden.retain(|&(held, ..)| held != hold);
+      counts::hide(hidden.iter().map(|&(.., count)| count));
    })
 }
 

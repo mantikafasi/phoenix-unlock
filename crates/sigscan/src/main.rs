@@ -388,6 +388,38 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                   .ok_or_else(|| "prologue changed".to_owned())
             }),
          );
+         let pending = desktop::pending_counts(image);
+         let moved = |func: usize| {
+            desktop::entry_prologue(image, func)
+               .map(|prologue| format!("{} ({} bytes moved)", at(func), prologue.len))
+         };
+         report(
+            "pending counts",
+            pending.as_ref().map_err(Clone::clone).and_then(|found| {
+               Ok(format!(
+                  "badge {}, friend requests {}",
+                  moved(found.badge)?,
+                  moved(found.friend_requests)?
+               ))
+            }),
+         );
+         let friend_requests = pending
+            .as_ref()
+            .map(|found| found.friend_requests)
+            .map_err(|_| "needs the pending counts".to_owned());
+         report(
+            "home count",
+            friend_requests
+               .clone()
+               .and_then(|func| desktop::home_count(image, func))
+               .and_then(moved),
+         );
+         report(
+            "home badge",
+            friend_requests
+               .and_then(|func| desktop::home_badge(image, func))
+               .and_then(moved),
+         );
          let json = desktop::message_json(image);
          report(
             "message json",

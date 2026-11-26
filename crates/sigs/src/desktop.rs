@@ -822,6 +822,219 @@ pub fn emoji_check(image: &Image<'_>) -> Found<EmojiCheck> {
    }
 }
 
+/// The id the DM list gives its pending friend requests badge.
+pub const FRIENDS_BADGE: &[u8] = b"dm-friends-badge";
+/// The id the DM list gives its message requests badge.
+pub const MESSAGE_REQUESTS_BADGE: &[u8] = b"dm-message-requests-badge";
+
+/// What draws Phoenix's pending friend and message request counts.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingCounts {
+   /// The DM list's row badge, `fn(out, id: &str, count: u32, _, _) -> out`,
+   /// which draws [`FRIENDS_BADGE`] and [`MESSAGE_REQUESTS_BADGE`] only.
+   pub badge:           usize,
+   /// `u32 f(&RelationshipStore)`, the incoming friend and game friend
+   /// requests the DM list's Friends row and the inbox's Friends tab show.
+   pub friend_requests: usize,
+}
+
+/// The DM list draws both badges through one builder, each call just after the
+/// `lea` of its id. The friends count comes from the call whose `eax` the
+/// count argument was copied from.
+pub fn pending_counts(image: &Image<'_>) -> Found<PendingCounts> {
+   let (friends_call, badge) = badge_call(image, FRIENDS_BADGE)?;
+   let (_, requests_badge) = badge_call(image, MESSAGE_REQUESTS_BADGE)?;
+   if badge != requests_badge {
+      return Err(format!(
+         "the DM badges are drawn by {badge:#x} and {requests_badge:#x}"
+      ));
+   }
+   let friend_requests = count_source(image, friends_call)?;
+   function_code(image, friend_requests, "friend requests count")?;
+   if !counts_incoming(image, friend_requests) {
+      return Err(format!(
+         "friend requests count at {friend_requests:#x} compares no type with 3"
+      ));
+   }
+   Ok(PendingCounts {
+      badge,
+      friend_requests,
+   })
+}
+
+/// `u32 f(&RelationshipStore)`, the number on the Home button.
+///
+/// It adds the DM mentions to the friend requests `friend_requests` counts,
+/// inlined but for its one call, which counts the game friend requests. The
+/// Home button is the other caller of that which counts incoming requests and
+/// returns a plain count.
+pub fn home_count(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
+   let game_requests = game_requests(image, friend_requests)?;
+   let counts = callers(image, game_requests)
+      .into_iter()
+      .filter(|&func| {
+         func != friend_requests && !returns_badge(image, func) && counts_incoming(image, func)
+      })
+      .collect::<Vec<_>>();
+   one("Home count", &counts)
+}
+
+/// `(state, count) f(&Store, _)`, a badge built from the same counts as
+/// [`home_count`].
+///
+/// State 2 is a count, state 1 an unread dot. The badge is the caller of the
+/// game friend requests count which returns a count in `edx`.
+pub fn home_badge(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
+   let game_requests = game_requests(image, friend_requests)?;
+   let badges = callers(image, game_requests)
+      .into_iter()
+      .filter(|&func| func != friend_requests && returns_badge(image, func))
+      .collect::<Vec<_>>();
+   one("Home badge", &badges)
+}
+
+/// The one call `friend_requests` makes, which counts the game friend requests.
+fn game_requests(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
+   let calls = straight_calls(image, friend_requests);
+   let [(_, game_requests)] = calls[..] else {
+      return Err(format!(
+         "friend requests count at {friend_requests:#x} makes {} calls, not 1",
+         calls.len()
+      ));
+   };
+   Ok(game_requests)
+}
+
+/// Whether `func` compares a relationship type with 3, an incoming request, as
+/// it opens.
+fn counts_incoming(image: &Image<'_>, func: usize) -> bool {
+   function_code(image, func, "").is_ok_and(|code| {
+      phoenix_hook::x86::disasm(code, func, 0x80)
+         .iter()
+         .any(|line| line.text.starts_with("cmp byte ptr [") && line.text.ends_with("],3"))
+   })
+}
+
+/// Whether `func` can answer state 2 in `eax` and sets `edx` just before its
+/// epilogue.
+fn returns_badge(image: &Image<'_>, func: usize) -> bool {
+   let Ok(code) = function_code(image, func, "") else {
+      return false;
+   };
+   let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
+   let Some(ret) = lines.iter().position(|line| line.text == "ret") else {
+      return false;
+   };
+   let body = &lines[..ret];
+   let sets_count = body
+      .iter()
+      .rev()
+      .find(|line| !line.text.starts_with("pop ") && !line.text.starts_with("add rsp,"))
+      .is_some_and(|line| line.text.starts_with("mov edx,"));
+   sets_count && body.iter().any(|line| line.text == "mov eax,2")
+}
+
+/// The one `lea` of the UI id `id`.
+fn id_lea(image: &Image<'_>, id: &[u8]) -> Found<usize> {
+   // The ids are packed back to back without a NUL, so `literal` misses them.
+   let leas = image
+      .find_bytes(id)
+      .into_iter()
+      .flat_map(|at| lea_refs(image, at))
+      .collect::<Vec<_>>();
+   one(&format!("{} lea", String::from_utf8_lossy(id)), &leas)
+}
+
+/// The site and callee of the `call` that draws the badge with id `id`, the
+/// first after the `lea` of the id.
+fn badge_call(image: &Image<'_>, id: &[u8]) -> Found<(usize, usize)> {
+   let lea = id_lea(image, id)?;
+   calls_in(image, lea, 0x40).first().copied().ok_or_else(|| {
+      format!(
+         "no call follows the {} lea at {lea:#x}",
+         String::from_utf8_lossy(id)
+      )
+   })
+}
+
+/// Follows the count argument of the `call` at `site` back through register
+/// copies to the call that returned it in `eax`.
+fn count_source(image: &Image<'_>, site: usize) -> Found<usize> {
+   let func = image
+      .function_containing(site)
+      .ok_or_else(|| format!("badge call at {site:#x} is in no function"))?;
+   let code = image
+      .read(func, site - func)
+      .ok_or_else(|| format!("DM list at {func:#x} is unmapped"))?;
+   let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
+   let mut reg = reg32_name(Abi::of(image).arg(3));
+   for (at, line) in lines.iter().enumerate().rev() {
+      let Some(source) = line.text.strip_prefix(&format!("mov {reg},")) else {
+         continue;
+      };
+      if source != "eax" {
+         if source.contains('[') {
+            return Err(format!(
+               "the friends badge count is loaded from memory at {:#x}",
+               line.addr
+            ));
+         }
+         source.clone_into(&mut reg);
+         continue;
+      }
+      // Win64 pads calls that can unwind with a `nop`.
+      let before = lines[..at].iter().rev().find(|prev| prev.text != "nop");
+      return match before {
+         Some(call) if call.text.starts_with("call ") => {
+            call
+               .target
+               .ok_or_else(|| format!("call at {:#x} has no target", call.addr))
+         },
+         _ => Err(format!("{reg} at {:#x} is no call's result", line.addr)),
+      };
+   }
+   Err(format!("the badge call at {site:#x} has no count source"))
+}
+
+/// The 32-bit name of a 64-bit general register, as the disassembly prints it.
+fn reg32_name(register: Register) -> String {
+   let name = reg_name(register);
+   match name.strip_prefix('r') {
+      Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => format!("{name}d"),
+      Some(rest) => format!("e{rest}"),
+      None => name,
+   }
+}
+
+/// The `jmp [rip]` and 8-byte target [`Image::hook_entry`] writes.
+const ENTRY_JUMP_LEN: usize = 14;
+
+/// The whole instructions opening `func` that an absolute jump covers, for a
+/// hook on a function no fixed prologue describes.
+pub fn entry_prologue(image: &Image<'_>, func: usize) -> Found<Prologue> {
+   let head = image
+      .read(func, 32)
+      .ok_or_else(|| format!("{func:#x} is unmapped"))?;
+   let mut len = 0;
+   for line in phoenix_hook::x86::disasm(head, func, head.len()) {
+      len += line.len;
+      if len < ENTRY_JUMP_LEN {
+         continue;
+      }
+      if !phoenix_hook::x86::relocatable(&head[..len], func) {
+         return Err(format!("{func:#x} opens with code that cannot move"));
+      }
+      let hex = head[..len]
+         .iter()
+         .map(|byte| format!("{byte:02X}"))
+         .collect::<Vec<_>>()
+         .join(" ");
+      let pattern = Pattern::leak(hex).ok_or("prologue bytes make no pattern")?;
+      return Ok(Prologue { pattern, len });
+   }
+   Err(format!("{func:#x} opens with less than a jump's bytes"))
+}
+
 /// Settings page 24's sidebar name, `Phoenix`, and its id,
 /// `DESKTOP_PHOENIX`, both relabeled in place.
 #[derive(Clone, Copy, Debug)]
@@ -858,7 +1071,8 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
 /// The `cmp <arg2>, 0xf` immediate in `is_page_visible`, which the runtime
 /// lowers so page 24 is always shown.
 pub fn settings_visibility(image: &Image<'_>) -> Found<usize> {
-   // `movzx ecx, <page>; mov al, 1; lea <arg2>, [rcx-9]; cmp <arg2>, 0xf; ja ...`
+   // `movzx ecx, <page>; mov al, 1; lea <arg2>, [rcx-9]; cmp <arg2>, 0xf; ja
+   // ...`
    let (guard, imm) = match Abi::of(image) {
       Abi::Win64 => {
          (
@@ -2154,7 +2368,8 @@ const NODE_SVG: &[u8] = b"features_ui/partner.svg";
 /// `child_node`'s head: the child handle wrapped as a node child, tag 0.
 const fn child_node_head(abi: Abi) -> [u8; 16] {
    match abi {
-      // `sub rsp,48h; lea rax,[rsp+28h]; and dword ptr [rax],0; mov [rax+8],rdx`
+      // `sub rsp,48h; lea rax,[rsp+28h]; and dword ptr [rax],0; mov
+      // [rax+8],rdx`
       Abi::Win64 => {
          [
             0x48, 0x83, 0xEC, 0x48, 0x48, 0x8D, 0x44, 0x24, 0x28, 0x83, 0x20, 0x00, 0x48, 0x89,
@@ -2819,7 +3034,8 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageContextMenu> {
       .ok_or("MessageContextMenu channel_id offset not found")?;
 
    // Find the `Copy Message ID` and `Delete Message` `lea`s inside `build_fn`
-   // directly (scanning only the ~19 KiB function instead of the whole `.text`).
+   // directly (scanning only the ~19 KiB function instead of the whole
+   // `.text`).
    let build_bytes = image
       .read(build_fn, build_end - build_fn)
       .ok_or("MessageContextMenu body is unmapped")?;
@@ -3841,7 +4057,8 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
             .map(|w| usize::from(w[3]))
       })
    };
-   // `text_get` is the member of C called by the most other members of C (>= 3).
+   // `text_get` is the member of C called by the most other members of C (>=
+   // 3).
    let mut caller_counts: HashMap<usize, usize> = HashMap::new();
    for (func, calls) in &c_calls {
       let mut seen = HashSet::new();
@@ -3919,8 +4136,8 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
    }
    let (set_value, sv_calls) = set_value_hits[0];
 
-   // `arc_drop_slow` is called right after `lock dec qword ptr [rax]` (`F0 48 FF
-   // 08`).
+   // `arc_drop_slow` is called right after `lock dec qword ptr [rax]` (`F0 48
+   // FF 08`).
    let arc_drop_slow = sv_calls
       .iter()
       .find_map(|&(site, callee)| {

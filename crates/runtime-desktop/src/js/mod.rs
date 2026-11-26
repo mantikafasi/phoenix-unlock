@@ -19,6 +19,10 @@ use crate::{
    accessories,
    composer,
    context_menu,
+   counts::{
+      self,
+      Count,
+   },
    double_click,
    emoji,
    js::ui::{
@@ -50,6 +54,8 @@ pub struct Desktop<'js> {
    pub double_taps:   RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.hide` holds by id and plugin.
    pub hides:         RefCell<Vec<(u64, String)>>,
+   /// `phoenix.ui.hideCount` holds by id and plugin.
+   pub hidden_counts: RefCell<Vec<(u64, String, Count)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -68,8 +74,8 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
 }
 
 /// Drops the accessories, member decorations, context menu actions, open page
-/// callbacks, and emoji pick handlers `name` registered and redraws Discord
-/// without them.
+/// callbacks, emoji pick handlers and hidden counts `name` registered and
+/// redraws Discord without them.
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -126,4 +132,8 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       }
       !held
    });
+
+   let mut hidden = registry.hidden_counts.borrow_mut();
+   hidden.retain(|(_, plugin, _)| plugin != name);
+   counts::hide(hidden.iter().map(|&(.., count)| count));
 }
