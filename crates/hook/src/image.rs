@@ -514,6 +514,27 @@ impl Image<'static> {
    }
 }
 
+#[cfg(target_os = "linux")]
+impl Image<'static> {
+   /// Hands the pages a scan faulted in back to the kernel. A scan reads every
+   /// page of the module, so without this the whole binary counts as resident
+   /// until memory pressure reclaims it, not only what Discord itself runs.
+   /// Patched pages are private copies: paging out may swap them, never drop
+   /// them.
+   pub fn release_scanned(&self) {
+      // SAFETY: no preconditions.
+      let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+      for segment in self.segments.iter().filter(|segment| !segment.writable) {
+         let start = segment.addr & !(page - 1);
+         let len = segment.addr + segment.bytes.len() - start;
+         // SAFETY: the range is this module's own mapping, and paging out
+         // never changes what a later read returns. A kernel without
+         // `MADV_PAGEOUT` (before 5.4) fails the call and nothing changes.
+         unsafe { libc::madvise(start as *mut c_void, len, libc::MADV_PAGEOUT) };
+      }
+   }
+}
+
 #[cfg(all(unix, not(target_vendor = "apple")))]
 impl Image<'static> {
    /// Writes each `(slot, value)` pair into this module's mapped memory and

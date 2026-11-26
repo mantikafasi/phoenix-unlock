@@ -121,6 +121,8 @@ pub fn prepare() -> Result<(), Error> {
    }
    // The index is tens of MB and nothing reads it after startup.
    phoenix_sigs::desktop::release_call_index();
+   #[cfg(target_os = "linux")]
+   image.release_scanned();
    *PREPARED.lock().unwrap_or_else(PoisonError::into_inner) = Some((image, registry?));
    Ok(())
 }
@@ -129,7 +131,10 @@ pub fn prepare() -> Result<(), Error> {
 /// without Sunbird. For telling Discord's own behaviour from ours.
 pub fn open_gate_only() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
-   open_access_gate(&phoenix_runtime::target()?);
+   let image = phoenix_runtime::target()?;
+   open_access_gate(&image);
+   #[cfg(target_os = "linux")]
+   image.release_scanned();
    Ok(())
 }
 
