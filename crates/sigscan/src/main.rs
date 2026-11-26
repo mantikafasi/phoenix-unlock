@@ -39,7 +39,10 @@ use phoenix_sigs::{
       BinaryFile,
       Machine,
    },
-   http::DesktopHttpTransport,
+   http::{
+      DesktopHttpTransport,
+      POLL_RESULT_SIZE,
+   },
    ios,
    mobile,
    registry::GatewayRegistry,
@@ -131,8 +134,33 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                prologues
                   .frame
                   .at(image, http.send_fn)
-                  .then(|| at(http.send_fn))
+                  .then(|| {
+                     let request = http.request;
+                     format!(
+                        "{} (headers +{:#x}, body +{:#x}, url +{:#x}, method +{:#x})",
+                        at(http.send_fn),
+                        request.headers,
+                        request.body,
+                        request.url,
+                        request.method
+                     )
+                  })
                   .ok_or_else(|| "send prologue changed".to_owned())
+            }),
+         );
+         report(
+            "http response",
+            http.as_ref().map_err(Clone::clone).and_then(|http| {
+               match http.poll_result {
+                  Some(POLL_RESULT_SIZE) => Ok(format!("{POLL_RESULT_SIZE:#x}-byte poll result")),
+                  Some(size) => {
+                     Err(format!(
+                        "poll result is {size:#x} bytes, the response hooks read \
+                         {POLL_RESULT_SIZE:#x}"
+                     ))
+                  },
+                  None => Err("poll writes no result".to_owned()),
+               }
             }),
          );
          report(

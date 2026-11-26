@@ -12,8 +12,11 @@ use phoenix_hook::{
    image::Image,
    x86::{
       Abi,
+      Line,
       call_target,
+      disasm,
       jump_target,
+      sret_stores,
    },
 };
 
@@ -22,6 +25,28 @@ use crate::Found;
 /// Unique error string inside `ReqwestTransport::send` when handed a mobile
 /// host-file body.
 const HOST_FILE_ANCHOR: &[u8] = b"a host file body needs the host's transport";
+
+/// `http::HeaderMap`, which `send` moves into reqwest's builder whole.
+pub const HEADER_MAP_SIZE: usize = 0x60;
+/// The request's `Body` enum: its tag and a `bytes::Bytes`.
+pub const BODY_SIZE: usize = 0x38;
+/// The request's `String` URL.
+pub const URL_SIZE: usize = 0x18;
+/// `http::Method`.
+pub const METHOD_SIZE: usize = 0x18;
+/// The `Poll<Result<Response, _>>` the response hooks read: headers, body
+/// and status.
+pub const POLL_RESULT_SIZE: usize = 0x80;
+
+/// Where `ReqwestTransport::send` reads each field of the `TransportRequest`
+/// it is handed. Its Rust layout moves between builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLayout {
+   pub headers: usize,
+   pub body:    usize,
+   pub url:     usize,
+   pub method:  usize,
+}
 
 /// Located vtable slots and host allocator entry points for Desktop Phoenix's
 /// `libdiscord/crates/http` transport.
@@ -40,6 +65,10 @@ pub struct DesktopHttpTransport {
    pub host_alloc:   Option<usize>,
    /// Host's `__rust_dealloc(ptr, size, align)` if located.
    pub host_dealloc: Option<usize>,
+   pub request:      RequestLayout,
+   /// The size of `poll`'s `Poll<Result<Response, _>>`, from the stores
+   /// through its hidden return pointer, when any are found.
+   pub poll_result:  Option<usize>,
 }
 
 impl DesktopHttpTransport {
@@ -60,6 +89,7 @@ impl DesktopHttpTransport {
       let (send_fn, send_end) = image
          .function_bounds(lea)
          .ok_or("ReqwestTransport::send has no unwind entry")?;
+      let request = request_layout(image, abi, send_fn, send_end, lea)?;
 
       // 2. Every `dyn Transport` vtable slot in `.rdata` pointing to `send_fn`.
       let send_slots = find_vtable_method_slots(image, send_fn, 1..=0x2000);
@@ -67,8 +97,8 @@ impl DesktopHttpTransport {
          return Err("no Transport vtable holds ReqwestTransport::send".to_owned());
       }
 
-      // 3. The `Box::pin` of the async state machine returns `(ptr, poll_vtable)`,
-      //    from `send_fn` itself or a small helper it calls.
+      // 3. The `Box::pin` of the async state machine returns `(ptr,
+      //    poll_vtable)`, from `send_fn` itself or a small helper it calls.
       let (poll_fn, poll_vtable, box_future) = find_poll_vtable(image, send_fn, send_end)?;
       let mut poll_slots = find_vtable_method_slots(image, poll_fn, 0x100..=0x4000);
       let direct_slot = poll_vtable + 24;
@@ -77,8 +107,8 @@ impl DesktopHttpTransport {
       }
 
       // 4. The host's own `__rust_alloc` and `__rust_dealloc`, so response body
-      //    growth stays allocator-compatible. Both hand the same global allocator
-      //    static to its implementation.
+      //    growth stays allocator-compatible. Both hand the same global
+      //    allocator static to its implementation.
       let host_alloc = box_future.and_then(|box_future| find_host_alloc(image, abi, box_future));
       let host_dealloc = find_host_dealloc(image, abi, send_fn, send_end)
          .or_else(|| host_alloc.and_then(|alloc| dealloc_beside(image, abi, alloc)));
@@ -92,6 +122,17 @@ impl DesktopHttpTransport {
          pair => pair,
       };
 
+      let poll_result = image
+         .function_bounds(poll_fn)
+         .and_then(|(start, end)| image.read(start, end - start))
+         .and_then(|code| {
+            sret_stores(abi, code, poll_fn)
+               .into_iter()
+               .map(|(offset, size)| offset + size)
+               .max()
+         })
+         .map(|end| end.next_multiple_of(8));
+
       Ok(Self {
          send_slots,
          send_fn,
@@ -99,8 +140,140 @@ impl DesktopHttpTransport {
          poll_fn,
          host_alloc,
          host_dealloc,
+         request,
+         poll_result,
       })
    }
+}
+
+/// Decodes the `TransportRequest` layout from `send`'s own reads of it.
+///
+/// - The body's tag indexes the jump table whose arms include the host-file
+///   error at `anchor`: `mov r, [req + body]; movsxd r, [table + r*4]`.
+/// - The URL and method go to reqwest's builder in one call: the URL as the 4th
+///   argument, `lea r, [req + url]`, and the method copied with `movups xmm,
+///   [req + method]` into the buffer the 3rd argument points at.
+/// - The headers are moved out whole with `rep movsb` from `req + headers`.
+///
+/// `req` is the register `send`'s second argument is first copied into. The
+/// four fields must be 8-byte aligned and not overlap.
+fn request_layout(
+   image: &Image<'_>,
+   abi: Abi,
+   send_fn: usize,
+   send_end: usize,
+   anchor: usize,
+) -> Found<RequestLayout> {
+   let code = image
+      .read(send_fn, send_end - send_fn)
+      .ok_or("ReqwestTransport::send is unmapped")?;
+   let lines = disasm(code, send_fn, usize::MAX);
+   let arg = |index: usize| format!("{:?}", abi.arg(index)).to_ascii_lowercase();
+   let incoming = arg(1);
+   let req = lines
+      .iter()
+      .find_map(|line| {
+         let (dest, source) = line.text.strip_prefix("mov ")?.split_once(',')?;
+         (source == incoming && dest.starts_with('r') && dest.len() == 3).then(|| dest.to_owned())
+      })
+      .ok_or("send never keeps its request in a register")?;
+   let field = |operand: &str| field_offset(operand, &req);
+
+   let anchor_at = lines
+      .iter()
+      .position(|line| line.addr == anchor)
+      .ok_or("the host-file anchor is not on an instruction boundary")?;
+   let body = lines[..anchor_at]
+      .windows(2)
+      .rev()
+      .find_map(|pair| {
+         let (dest, source) = pair[0].text.strip_prefix("mov ")?.split_once(',')?;
+         let offset = field(source)?;
+         let index = pair[1].text.strip_prefix("movsxd ")?;
+         (index.starts_with(&format!("{dest},[")) && index.ends_with(&format!("+{dest}*4]")))
+            .then_some(offset)
+      })
+      .ok_or("no jump table on the request body before the host-file arm")?;
+
+   let url_arg = format!("lea {},", arg(3));
+   let method_arg = format!("[{}],", arg(2));
+   let (url, method) = between_calls(&lines)
+      .find_map(|group| {
+         let url = group
+            .iter()
+            .find_map(|line| field(line.text.strip_prefix(&url_arg)?))?;
+         let method = group.windows(2).find_map(|pair| {
+            let (xmm, source) = pair[0].text.strip_prefix("movups ")?.split_once(',')?;
+            let (_, stored) = pair[1].text.split_once(' ')?;
+            (xmm.starts_with("xmm") && stored == format!("{method_arg}{xmm}"))
+               .then(|| field(source))?
+         })?;
+         Some((url, method))
+      })
+      .ok_or("no builder call takes the request's URL and method")?;
+
+   let headers = lines
+      .iter()
+      .enumerate()
+      .filter(|(_, line)| line.text == "rep movsb [rdi],[rsi]")
+      .find_map(|(at, _)| {
+         let before = &lines[at.saturating_sub(6)..at];
+         let sized = before.iter().any(|line| {
+            line.text == format!("mov ecx,{HEADER_MAP_SIZE:X}h")
+               || line.text == format!("push {HEADER_MAP_SIZE:X}h")
+         });
+         let source = before.iter().rev().find_map(|line| {
+            if line.text == format!("mov rsi,{req}") {
+               Some(0)
+            } else {
+               field(line.text.strip_prefix("lea rsi,")?)
+            }
+         });
+         sized.then_some(source).flatten()
+      })
+      .ok_or("send never moves the request's headers out")?;
+
+   let layout = RequestLayout {
+      headers,
+      body,
+      url,
+      method,
+   };
+   let mut spans = [
+      (headers, HEADER_MAP_SIZE),
+      (body, BODY_SIZE),
+      (url, URL_SIZE),
+      (method, METHOD_SIZE),
+   ];
+   spans.sort_unstable();
+   if spans
+      .windows(2)
+      .any(|pair| pair[0].0 + pair[0].1 > pair[1].0)
+   {
+      return Err(format!("request fields overlap: {layout:?}"));
+   }
+   if spans.iter().any(|&(offset, _)| offset % 8 != 0) {
+      return Err(format!("request fields are not 8-byte aligned: {layout:?}"));
+   }
+   Ok(layout)
+}
+
+/// The runs of instructions between calls.
+fn between_calls(lines: &[Line]) -> impl Iterator<Item = &[Line]> {
+   lines.split_inclusive(|line| line.text.starts_with("call "))
+}
+
+/// The displacement of `[base]` or `[base+XXh]`.
+fn field_offset(operand: &str, base: &str) -> Option<usize> {
+   let inner = operand
+      .strip_suffix(']')?
+      .rsplit_once('[')?
+      .1
+      .strip_prefix(base)?;
+   if inner.is_empty() {
+      return Some(0);
+   }
+   usize::from_str_radix(inner.strip_prefix('+')?.strip_suffix('h')?, 16).ok()
 }
 
 /// Finds all `.rdata` vtable method-0 slots (`vtable + 24`) holding `method_fn`
