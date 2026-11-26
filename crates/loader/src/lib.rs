@@ -53,7 +53,12 @@ pub unsafe extern "system" fn DllMain(
    if reason == DLL_PROCESS_ATTACH {
       // SAFETY: `module` is the HINSTANCE handed to DllMain.
       unsafe { DisableThreadLibraryCalls(module) };
-      desktop();
+      logging();
+      // SAFETY: as above.
+      unsafe { phoenix_drover::attach(module) };
+      if !phoenix_drover::is_media() {
+         desktop();
+      }
    }
    1
 }
@@ -61,8 +66,11 @@ pub unsafe extern "system" fn DllMain(
 #[cfg(unix)]
 extern "C" fn init() {
    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-   if linux::claim() {
-      desktop();
+   {
+      phoenix_drover::init();
+      if linux::claim() {
+         desktop();
+      }
    }
    #[cfg(target_os = "ios")]
    {
@@ -311,13 +319,16 @@ mod linux {
    /// preload reaches it and every process it starts.
    const CLIENT: &str = "discord-phoenix";
 
-   /// Whether this process is the client. If so, takes this library out of
+   /// Whether this process is the client. Takes this library out of
    /// `LD_PRELOAD` so the client's children (`discord_media`, the CEF helper,
-   /// `xdg-open`) never load it.
+   /// `xdg-open`) never load it, except with drover on, where `discord_media`
+   /// needs its send hooks and each child takes it out for its own children.
    pub fn claim() -> bool {
       let client = std::fs::read_link("/proc/self/exe")
          .is_ok_and(|exe| exe.file_name() == Some(OsStr::new(CLIENT)));
-      if client && let Some(path) = super::unix::library_path() {
+      if !(client && phoenix_drover::enabled())
+         && let Some(path) = super::unix::library_path()
+      {
          unpreload(Path::new(OsStr::from_bytes(path.to_bytes())));
       }
       client

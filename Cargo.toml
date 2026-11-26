@@ -1,5 +1,6 @@
 [workspace]
 members  = [
+  "crates/drover",
   "crates/hook",
   "crates/inject",
   "crates/loader",
@@ -42,6 +43,7 @@ memchr                  = "2"
 misstep                 = { features = [ "panic-hook", "pretty" ], version = "0.4.1" }
 object                  = { default-features = false, features = [ "elf", "macho", "pe", "read_core", "std" ], version = "0.41" }
 patcher                 = { path = "crates/patcher" }
+phoenix-drover          = { path = "crates/drover" }
 phoenix-hook            = { path = "crates/hook" }
 phoenix-runtime         = { path = "crates/runtime" }
 phoenix-runtime-desktop = { path = "crates/runtime-desktop" }

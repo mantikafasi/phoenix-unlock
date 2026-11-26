@@ -1,0 +1,16 @@
+[package]
+name              = "phoenix-drover"
+description       = "Discord Drover's voice unblock: UDP probes ahead of Discord's IP discovery"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+log          = { workspace = true }
+phoenix-hook = { workspace = true }
+
+[lints]
+workspace = true

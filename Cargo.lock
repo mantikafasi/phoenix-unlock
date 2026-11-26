@@ -637,6 +637,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-drover"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "phoenix-hook",
+]
+
+[[package]]
 name = "phoenix-hook"
 version = "0.1.0"
 dependencies = [
@@ -662,6 +671,7 @@ dependencies = [
  "libc",
  "log",
  "misstep",
+ "phoenix-drover",
  "phoenix-runtime",
  "phoenix-runtime-desktop",
  "phoenix-runtime-mobile",

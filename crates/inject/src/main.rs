@@ -1,5 +1,6 @@
-//! `sunbird.exe`, the Windows launcher, also `phoenix-inject [phoenix.dll] [--
-//! discord args]`.
+//! `sunbird.exe`, the Windows launcher, also `phoenix-inject [--drover]
+//! [phoenix.dll] [-- discord args]`. `--drover` turns on Discord Drover's
+//! voice unblock.
 //!
 //! `Discord.exe` resolves its imports from System32 only (`DependentLoadFlags`
 //! 0x800), so a DLL planted beside it is never loaded. This starts it
@@ -294,12 +295,8 @@ mod windows {
          return Ok(());
       }
       let mut no_runtime = false;
-      while args
-         .next_if(|arg| arg == "--no-runtime" || arg == "--gate-only")
-         .is_some()
-      {
-         no_runtime = true;
-      }
+      let mut drover = false;
+      flags(&mut args, &mut no_runtime, &mut drover);
       let app = local.join("DiscordPhoenix").join("app");
       let exe = app.join("Discord.exe");
       if !exe.is_file() {
@@ -313,12 +310,7 @@ mod windows {
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
       });
-      while args
-         .next_if(|arg| arg == "--no-runtime" || arg == "--gate-only")
-         .is_some()
-      {
-         no_runtime = true;
-      }
+      flags(&mut args, &mut no_runtime, &mut drover);
       let dll = match explicit {
          Some(path) => PathBuf::from(path),
          None => install(&local, &home)?,
@@ -378,6 +370,11 @@ mod windows {
          // the flag and opens only the access gate without starting Sunbird.
          unsafe { env::set_var("SUNBIRD_GATE_ONLY", "1") };
       }
+      if drover {
+         // SAFETY: as above. Discord Drover's voice unblock, for networks
+         // that block Discord voice.
+         unsafe { env::set_var("SUNBIRD_DROVER", "1") };
+      }
 
       // STARTUPINFOW is 104 bytes on x64 and only `cb` must be set.
       let mut startup = [0u64; 13];
@@ -425,6 +422,25 @@ mod windows {
          dll.display()
       );
       Ok(())
+   }
+
+   /// Takes the leading `--no-runtime`, `--gate-only` and `--drover` flags.
+   fn flags(
+      args: &mut std::iter::Peekable<impl Iterator<Item = OsString>>,
+      no_runtime: &mut bool,
+      drover: &mut bool,
+   ) {
+      while let Some(arg) = args.next_if(|arg| {
+         ["--no-runtime", "--gate-only", "--drover"]
+            .iter()
+            .any(|flag| arg == flag)
+      }) {
+         if arg == "--drover" {
+            *drover = true;
+         } else {
+            *no_runtime = true;
+         }
+      }
    }
 
    /// Copies `dll` into the child and queues `LoadLibraryW` on its main

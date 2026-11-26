@@ -6,6 +6,7 @@
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh -s -- /path/to/Discord.AppImage
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh -s -- --no-runtime
+#   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh -s -- --drover
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh -s -- --uninstall
 #
 # SUNBIRD_SITE points it at a local server for testing.
@@ -22,9 +23,15 @@ if [ "${1:-}" = --uninstall ]; then
    exit 0
 fi
 
-no_runtime=
-while [ "${1:-}" = --no-runtime ] || [ "${1:-}" = --gate-only ]; do
-   no_runtime=1
+# --drover turns on Discord Drover's voice unblock, for networks that block
+# Discord voice.
+no_runtime= drover=
+while true; do
+   case ${1:-} in
+      --no-runtime | --gate-only) no_runtime=1 ;;
+      --drover) drover=1 ;;
+      *) break ;;
+   esac
    shift
 done
 
@@ -102,8 +109,12 @@ if [ -n "\$version" ] && [ "\$version" != "\$(cat "\$home/version" 2>/dev/null)"
    fi
 fi
 [ "\${1:-}" = --update ] && exit 0
-while [ "\${1:-}" = --no-runtime ] || [ "\${1:-}" = --gate-only ]; do
-   export SUNBIRD_GATE_ONLY=1
+while true; do
+   case \${1:-} in
+      --no-runtime | --gate-only) export SUNBIRD_GATE_ONLY=1 ;;
+      --drover) export SUNBIRD_DROVER=1 ;;
+      *) break ;;
+   esac
    shift
 done
 # A second Discord hands off to the running one and exits, so one running
@@ -134,6 +145,7 @@ chmod +x "$home/sunbird"
 
 exec_args=
 [ -n "$no_runtime" ] && exec_args=" --no-runtime"
+[ -n "$drover" ] && exec_args="$exec_args --drover"
 cat >"$entry" <<EOF
 [Desktop Entry]
 Type=Application
