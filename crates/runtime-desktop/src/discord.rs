@@ -53,7 +53,11 @@ use phoenix_runtime::{
 };
 use phoenix_sigs::{
    desktop,
-   http::DesktopHttpTransport,
+   http::{
+      self,
+      DesktopHttpTransport,
+      RequestLayout,
+   },
 };
 
 /// Standard HTTP/1.x `http::header::StandardHeader` names in discriminant
@@ -149,7 +153,9 @@ const STANDARD_METHODS: [&str; 10] = [
 // ---------------------------------------------------------------------------
 // ABI mirror of Desktop Phoenix's `libdiscord/crates/http` transport types
 // (verified against Windows x86_64 `Discord.exe`). These are Rust layouts, so
-// the same rustc and crates lay them out alike on Linux x86_64.
+// the same rustc and crates lay them out alike on Linux x86_64. Where the
+// request's fields sit moves between builds, so `RequestLayout` reads them
+// from `send`.
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -195,7 +201,7 @@ struct RawHeaderMap {
    entries_len: usize,
    _tail:       [u64; 6],
 }
-const _: () = assert!(size_of::<RawHeaderMap>() == 0x60);
+const _: () = assert!(size_of::<RawHeaderMap>() == http::HEADER_MAP_SIZE);
 
 #[repr(C)]
 struct RawBody {
@@ -203,24 +209,40 @@ struct RawBody {
    bytes: RawBytes,
    _rest: [u64; 2],
 }
-const _: () = assert!(size_of::<RawBody>() == 0x38);
+const _: () = assert!(size_of::<RawBody>() == http::BODY_SIZE);
 
 #[repr(C)]
 struct RawMethod {
    bytes: [u8; 24],
 }
-const _: () = assert!(size_of::<RawMethod>() == 0x18);
+const _: () = assert!(size_of::<RawMethod>() == http::METHOD_SIZE);
+const _: () = assert!(size_of::<RawVec>() == http::URL_SIZE);
 
-#[repr(C)]
-struct RawTransportRequest {
-   headers:  RawHeaderMap,
-   body:     RawBody,
-   url:      RawVec,
-   _timeout: [u64; 2],
-   method:   RawMethod,
-   _extra:   [u64; 3],
+/// A `TransportRequest`'s fields, at the offsets `send` was found reading.
+struct RawRequest<'a> {
+   headers: &'a RawHeaderMap,
+   body:    &'a mut RawBody,
+   url:     &'a mut RawVec,
+   method:  &'a RawMethod,
 }
-const _: () = assert!(size_of::<RawTransportRequest>() == 0xF0);
+
+impl RawRequest<'_> {
+   /// # Safety
+   ///
+   /// `req` is a live `TransportRequest` laid out as `layout`, whose fields
+   /// the locator checked are 8-byte aligned and apart.
+   unsafe fn at(req: *mut c_void, layout: RequestLayout) -> Self {
+      // SAFETY: forwarded from the caller; the four fields do not overlap.
+      unsafe {
+         Self {
+            headers: &*req.byte_add(layout.headers).cast::<RawHeaderMap>(),
+            body:    &mut *req.byte_add(layout.body).cast::<RawBody>(),
+            url:     &mut *req.byte_add(layout.url).cast::<RawVec>(),
+            method:  &*req.byte_add(layout.method).cast::<RawMethod>(),
+         }
+      }
+   }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -236,7 +258,7 @@ struct RawPollResult {
    status:  u16,
    _pad:    [u8; 6],
 }
-const _: () = assert!(size_of::<RawPollResult>() == 0x80);
+const _: () = assert!(size_of::<RawPollResult>() == http::POLL_RESULT_SIZE);
 
 impl RawPollResult {
    const PENDING_TAG: u64 = u64::MAX - 1;
@@ -255,14 +277,18 @@ impl RawPollResult {
 // same lowering applies on Win64 and SysV: `send` returns its pointer pair
 // (`Pin<Box<dyn Future>>`) in RAX:RDX, and `poll` returns the 128-byte
 // `RawPollResult` through a hidden sret pointer in the first argument register.
-type SendFn = unsafe fn(*const c_void, *mut RawTransportRequest) -> RawPinnedFuture;
+type SendFn = unsafe fn(*const c_void, *mut c_void) -> RawPinnedFuture;
 type PollFn = unsafe fn(*mut c_void, *mut c_void) -> RawPollResult;
 type HostAllocFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
 type HostDeallocFn = unsafe extern "C" fn(*mut u8, usize, usize);
 
 struct Installed {
    send:         SendFn,
+   request:      RequestLayout,
    poll:         PollFn,
+   /// Whether `poll`'s result is a `RawPollResult`, so `poll` is hooked and
+   /// responses can be watched.
+   responses:    bool,
    host_alloc:   Option<HostAllocFn>,
    host_dealloc: Option<HostDeallocFn>,
 }
@@ -403,12 +429,15 @@ pub fn install(image: &Image<'static>) {
          return;
       },
    };
+   let responses = found.poll_result == Some(http::POLL_RESULT_SIZE);
    // SAFETY: `DesktopHttpTransport::locate` verified every target against
    // `.pdata`, and the trampoline replays `send`'s prologue.
    let installed = Installed {
-      send:         unsafe { std::mem::transmute::<usize, SendFn>(trampoline) },
-      poll:         unsafe { std::mem::transmute::<usize, PollFn>(found.poll_fn) },
-      host_alloc:   found
+      send: unsafe { std::mem::transmute::<usize, SendFn>(trampoline) },
+      request: found.request,
+      poll: unsafe { std::mem::transmute::<usize, PollFn>(found.poll_fn) },
+      responses,
+      host_alloc: found
          .host_alloc
          .map(|addr| unsafe { std::mem::transmute::<usize, HostAllocFn>(addr) }),
       host_dealloc: found
@@ -416,6 +445,17 @@ pub fn install(image: &Image<'static>) {
          .map(|addr| unsafe { std::mem::transmute::<usize, HostDeallocFn>(addr) }),
    };
    if INSTALLED.set(installed).is_err() {
+      return;
+   }
+   if !responses {
+      let size = found
+         .poll_result
+         .map_or_else(|| "unknown".to_owned(), |size| format!("{size:#x} bytes"));
+      log::warn!(
+         "discord desktop: hooked HTTP send; poll result is {size}, the response hooks read \
+          {:#x}, leaving onResponse off",
+         http::POLL_RESULT_SIZE,
+      );
       return;
    }
 
@@ -526,7 +566,7 @@ unsafe fn read_headers(map: &RawHeaderMap) -> Vec<(String, String)> {
    out
 }
 
-unsafe fn send_detour(self_ptr: *const c_void, req: *mut RawTransportRequest) -> RawPinnedFuture {
+unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFuture {
    let installed = INSTALLED
       .get()
       .expect("send_detour only runs after INSTALLED is set");
@@ -536,14 +576,14 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut RawTransportRequest) ->
    if !req.is_null()
       && panic::catch_unwind(AssertUnwindSafe(|| {
          // SAFETY: `req` is a live owned `TransportRequest` passed by
-         // `libdiscord_http`.
-         let req_ref = unsafe { &mut *req };
+         // `libdiscord_http`, laid out as `send` was found reading it.
+         let req_ref = unsafe { RawRequest::at(req, installed.request) };
          // SAFETY: reading live fields of `req_ref`.
-         let url = unsafe { read_str(&req_ref.url) }
+         let url = unsafe { read_str(req_ref.url) }
             .unwrap_or_default()
             .to_owned();
-         let method = unsafe { read_method(&req_ref.method) }.into_owned();
-         let headers = unsafe { read_headers(&req_ref.headers) };
+         let method = unsafe { read_method(req_ref.method) }.into_owned();
+         let headers = unsafe { read_headers(req_ref.headers) };
          let body = if req_ref.body.tag == 1 {
             // SAFETY: `tag == 1` is `Body::Bytes(RawBytes)`.
             unsafe { read_bytes(&req_ref.body.bytes) }
@@ -576,7 +616,9 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut RawTransportRequest) ->
             },
          }
 
-         watched = watch_response(&method, &url);
+         if installed.responses {
+            watched = watch_response(&method, &url);
+         }
       }))
       .is_err()
    {
