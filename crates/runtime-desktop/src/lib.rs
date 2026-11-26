@@ -29,6 +29,7 @@ mod message;
 mod modal;
 mod notices;
 mod os;
+mod ready;
 #[cfg(windows)]
 mod restart;
 mod settings;
@@ -239,6 +240,7 @@ pub fn prepare() -> Result<(), Error> {
       discord::install(&image);
       gateway_send::install(&image);
       accessories::install_optimistic_delete(&image);
+      ready::install(&image);
    }
    #[cfg(target_os = "macos")]
    message::writer::install(&image);
