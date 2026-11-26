@@ -509,9 +509,12 @@ mod windows {
       }
       // Per process, so a second launch mid-download writes its own file.
       let fresh = home.join(format!("phoenix.dll.{}.new", std::process::id()));
-      if let Err(err) = curl(&site, 180, &[
+      // Discord waits on this download. With a DLL to fall back on, a slow one
+      // gives up sooner; a first install has nothing else, so it keeps trying.
+      let (max_secs, retries) = if dll.is_file() { (60, "0") } else { (180, "2") };
+      if let Err(err) = curl(&site, max_secs, &[
          "--retry",
-         "2",
+         retries,
          "--retry-delay",
          "2",
          "--speed-limit",
@@ -558,7 +561,10 @@ mod windows {
    /// loader is built with (`crates/runtime/src/update.rs`).
    fn is_loader(path: &Path) -> bool {
       fs::read(path).is_ok_and(|bytes| {
-         bytes.starts_with(b"MZ") && bytes.windows(16).any(|window| window == b"phoenix-version:")
+         bytes.starts_with(b"MZ")
+            && bytes
+               .windows(16)
+               .any(|window| window == b"phoenix-version:")
       })
    }
 
@@ -571,8 +577,8 @@ mod windows {
       } else {
          "=http"
       };
-      let max_secs_str = max_secs.to_string();
       let connect_secs = max_secs.min(15).to_string();
+      let max_secs = max_secs.to_string();
       let run = |revoke: &[&str]| {
          Command::new(system32("curl.exe"))
             .args([
@@ -585,7 +591,7 @@ mod windows {
                &connect_secs,
             ])
             .args(revoke)
-            .args(["--max-time", &max_secs_str])
+            .args(["--max-time", &max_secs])
             .args(args)
             .creation_flags(NO_WINDOW)
             .output()
