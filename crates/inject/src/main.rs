@@ -509,11 +509,22 @@ mod windows {
       }
       // Per process, so a second launch mid-download writes its own file.
       let fresh = home.join(format!("phoenix.dll.{}.new", std::process::id()));
-      curl(&site, 60, &[
+      if let Err(err) = curl(&site, 180, &[
+         "--retry",
+         "2",
+         "--retry-delay",
+         "2",
+         "--speed-limit",
+         "1024",
+         "--speed-time",
+         "30",
          "-o",
          &fresh.to_string_lossy(),
          &format!("{site}/plugins/phoenix-windows-x86_64.dll"),
-      ])?;
+      ]) {
+         let _ = fs::remove_file(&fresh);
+         return Err(err);
+      }
       // `curl -f` only rejects an HTTP error, so a captive portal or a wrong
       // deploy still writes its body here; swapping that in would leave
       // Discord without a working DLL.
@@ -560,12 +571,21 @@ mod windows {
       } else {
          "=http"
       };
-      let max_secs = max_secs.to_string();
+      let max_secs_str = max_secs.to_string();
+      let connect_secs = max_secs.min(15).to_string();
       let run = |revoke: &[&str]| {
          Command::new(system32("curl.exe"))
-            .args(["-fsSL", "--proto", proto, "--proto-redir", "=https"])
+            .args([
+               "-fsSL",
+               "--proto",
+               proto,
+               "--proto-redir",
+               "=https",
+               "--connect-timeout",
+               &connect_secs,
+            ])
             .args(revoke)
-            .args(["--max-time", &max_secs])
+            .args(["--max-time", &max_secs_str])
             .args(args)
             .creation_flags(NO_WINDOW)
             .output()
@@ -580,7 +600,10 @@ mod windows {
          out = run(&[])?;
       }
       if !out.status.success() {
-         misstep::bail!("curl: {}", String::from_utf8_lossy(&out.stderr).trim());
+         let stderr = String::from_utf8_lossy(&out.stderr);
+         let detail = stderr.trim();
+         let detail = detail.strip_prefix("curl:").map_or(detail, str::trim_start);
+         misstep::bail!("curl: {detail}");
       }
       Ok(String::from_utf8_lossy(&out.stdout).into_owned())
    }
