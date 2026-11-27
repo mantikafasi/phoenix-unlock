@@ -421,6 +421,41 @@ fn check(
             }),
          );
          report(
+            "gif menu",
+            desktop::gif_menu(image).map(|menu| {
+               format!(
+                  "{} (item {}, icon {}, click {}, push {}, handler +{:#x}, icon tag {}, url \
+                   +{:#x}/+{:#x})",
+                  at(menu.build_fn),
+                  at(menu.item_new),
+                  at(menu.item_icon),
+                  at(menu.set_click),
+                  at(menu.menu_push),
+                  menu.handler_offset,
+                  menu.icon_tag,
+                  menu.url_ptr,
+                  menu.url_len,
+               )
+            }),
+         );
+         report(
+            "gif results",
+            desktop::gif_results(image).map(|r| {
+               format!(
+                  "{} (search +{:#x}/+{:#x}, favourites +{:#x}/+{:#x}, mode +{:#x} == {}, text +{:#x}/+{:#x})",
+                  at(r.accessor),
+                  r.search_ptr,
+                  r.search_len,
+                  r.fav_ptr,
+                  r.fav_len,
+                  r.mode,
+                  r.fav_mode,
+                  r.query_ptr,
+                  r.query_len,
+               )
+            }),
+         );
+         report(
             "native modal",
             gpui
                .as_ref()

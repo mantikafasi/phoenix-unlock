@@ -3225,6 +3225,139 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageContextMenu> {
    })
 }
 
+/// The GIF picker's right-click menu builder (`Expression Picker Actions`,
+/// holding only `Copy Link`) and the Mana `hosted::context_menu` helpers it
+/// builds that item with, for `phoenix.ui.addGifAction`.
+#[derive(Debug, Clone, Copy)]
+pub struct GifMenu {
+   /// `fn(sret: *mut Menu, url: &String) -> *mut Menu`.
+   pub build_fn:       usize,
+   /// `MenuItem::new(sret, id_ptr, id_len, label: SharedString)`.
+   pub item_new:       usize,
+   /// `MenuItem::icon(sret, item, icon: &Icon)`.
+   pub item_icon:      usize,
+   /// `on_click(sret, old_handler, rc_data, rc_vtable)` over an item's handler.
+   pub set_click:      usize,
+   /// `Menu::item(sret, menu, item)`.
+   pub menu_push:      usize,
+   /// Where the item keeps the handler [`GifMenu::set_click`] rewrites.
+   pub handler_offset: usize,
+   /// `Icon`'s tag word for a Mana icon id, which sits after it.
+   pub icon_tag:       u32,
+   /// The URL `String`'s pointer and length within `build_fn`'s argument.
+   pub url_ptr:        usize,
+   pub url_len:        usize,
+}
+
+/// `MenuItem`'s size, which `Menu::item` copies with `rep movsb`.
+pub const GIF_MENU_ITEM_SIZE: usize = 0xC8;
+/// `Menu`'s size, which `Menu::item` copies out.
+pub const GIF_MENU_SIZE: usize = 0xA8;
+
+/// The direct `call` targets in `func`, in address order.
+fn direct_calls(image: &Image<'_>, func: usize) -> Found<Vec<usize>> {
+   let code = function_code(image, func, "function")?;
+   Ok(phoenix_hook::x86::disasm(code, func, usize::MAX)
+      .into_iter()
+      .filter(|line| line.text.starts_with("call ") && !line.text.contains('['))
+      .filter_map(|line| line.target)
+      .collect())
+}
+
+/// Locates the GIF picker's menu builder by its `gif-picker-copy-link` item id
+/// and decodes the item helpers from the calls that build `Copy Link`.
+pub fn gif_menu(image: &Image<'_>) -> Found<GifMenu> {
+   let id = one(
+      "gif-picker-copy-link string",
+      &literal(image, b"gif-picker-copy-link"),
+   )?;
+   let id_lea = one("gif-picker-copy-link xref", &lea_refs(image, id))?;
+   let (build_fn, build_end) = image
+      .function_bounds(id_lea)
+      .ok_or("GIF menu has no unwind entry")?;
+   let code = image
+      .read(build_fn, build_end - build_fn)
+      .ok_or("GIF menu is unmapped")?;
+   // clone(url), Menu id, label, Menu::new, label, MenuItem::new, icon,
+   // on_click, Menu::item.
+   let calls = direct_calls(image, build_fn)?;
+   let [
+      clone,
+      _,
+      label_a,
+      _,
+      label_b,
+      item_new,
+      item_icon,
+      on_click,
+      menu_push,
+   ] = calls[..]
+   else {
+      return Err(format!("GIF menu makes {} calls, not 9", calls.len()));
+   };
+   if label_a != label_b {
+      return Err("GIF menu labels come from different helpers".to_owned());
+   }
+
+   // The URL clone reads `[rdx + len]` and `[rdx + ptr]` first.
+   let clone_head = image.read(clone, 0x30).ok_or("URL clone is unmapped")?;
+   let rdx_loads = mem_operands(clone_head, 0x8B)
+      .filter(|&(_, base, _)| base == number(Register::RDX))
+      .map(|(.., disp)| disp)
+      .collect::<Vec<_>>();
+   let [url_len, url_ptr] = rdx_loads[..] else {
+      return Err(format!("URL clone loads {rdx_loads:x?} from its argument"));
+   };
+
+   // `mov qword [r8], tag` then `mov word [r8 + 8], icon` build the icon.
+   let icon_tag = code
+      .windows(7)
+      .find_map(|w| {
+         (w[..3] == [0x49, 0xC7, 0x00]).then(|| u32::from_le_bytes([w[3], w[4], w[5], w[6]]))
+      })
+      .ok_or("GIF menu icon tag not found")?;
+   if !code.windows(5).any(|w| w == [0x66, 0x41, 0xC7, 0x40, 0x08]) {
+      return Err("GIF menu icon id is not at +8".to_owned());
+   }
+
+   // on_click -> composer (allocates the Rc) -> the generic handler setter,
+   // its last call. on_click reads the old handler from `[item + offset]`.
+   let composer = *direct_calls(image, on_click)?
+      .first()
+      .ok_or("GIF on_click makes no call")?;
+   let set_click = *direct_calls(image, composer)?
+      .last()
+      .ok_or("GIF click composer makes no call")?;
+   let on_click_head = image
+      .read(on_click, 0x40)
+      .ok_or("GIF on_click is unmapped")?;
+   let handler_offset = mem_operands(on_click_head, 0x8B)
+      .find(|&(reg, base, disp)| {
+         reg == number(Register::RAX) && base == number(Register::RDX) && disp > 0x20
+      })
+      .map(|(.., disp)| disp)
+      .ok_or("GIF on_click handler offset not found")?
+      .checked_sub(0x30)
+      .ok_or("GIF on_click handler offset too small")?;
+   if handler_offset + 0x38 > GIF_MENU_ITEM_SIZE {
+      return Err(format!(
+         "GIF handler at {handler_offset:#x} overruns the item"
+      ));
+   }
+
+   Ok(GifMenu {
+      build_fn,
+      item_new,
+      item_icon,
+      set_click,
+      menu_push,
+      handler_offset,
+      icon_tag,
+      url_ptr,
+      url_len,
+   })
+}
+
 /// Reads [`MenuLayout`] from the `MenuItem::Action` core constructor and
 /// `Vec<MenuItem>::push`.
 ///
@@ -5017,4 +5150,109 @@ mod tests {
       assert_eq!(slot_of("[rsp+8]", "rbp"), None);
       assert_eq!(slot_of("[rsp+rax]", "rsp"), None);
    }
+}
+
+/// The GIF picker's results accessor: `(ptr, len)` of the favourites `Vec`
+/// on the Favourites tab and of the search `Vec` otherwise, which every part
+/// of the picker reads its tiles through.
+#[derive(Debug, Clone, Copy)]
+pub struct GifResults {
+   pub accessor:   usize,
+   pub search_ptr: usize,
+   pub search_len: usize,
+   pub fav_ptr:    usize,
+   pub fav_len:    usize,
+   pub mode:       usize,
+   pub fav_mode:   u8,
+   /// The search text `String`'s pointer and length fields.
+   pub query_ptr:  usize,
+   pub query_len:  usize,
+}
+
+/// One favourite tile's size in the picker's results `Vec`.
+pub const GIF_RESULT_SIZE: usize = 0x88;
+/// The accessor's bytes that `GIF_RESULTS` matches and a hook may displace:
+/// its first three `lea`s.
+pub const GIF_RESULTS_PROLOGUE: Pattern =
+   Pattern::new("48 8D 81 ?? ?? ?? ?? 48 8D 91 ?? ?? ?? ?? 4C 8D 81 ?? ?? ?? ??");
+pub const GIF_RESULTS_PROLOGUE_LEN: usize = 21;
+
+/// `lea rax,[rcx+search_ptr]; lea rdx,[rcx+fav_ptr]; lea r8,[rcx+search_len];
+/// lea r9,[rcx+fav_len]; cmp byte [rcx+mode],fav; cmove rax,rdx;
+/// cmovne r9,r8; mov rdx,[r9]; mov rax,[rax]; ret`.
+const GIF_RESULTS: Pattern = Pattern::new(
+   "48 8D 81 ?? ?? ?? ?? 48 8D 91 ?? ?? ?? ?? 4C 8D 81 ?? ?? ?? ?? 4C 8D 89 ?? ?? ?? ?? 80 B9 ?? \
+    ?? ?? ?? ?? 48 0F 44 C2 4D 0F 45 C8 49 8B 11 48 8B 00 C3",
+);
+
+pub fn gif_results(image: &Image<'_>) -> Found<GifResults> {
+   let accessor = one("GIF results accessor", &image.scan(GIF_RESULTS))?;
+   let code = image
+      .read(accessor, 35)
+      .ok_or("GIF results accessor is unmapped")?;
+   let disp =
+      |at: usize| u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as usize;
+   let (query_ptr, query_len) = gif_query(image, accessor)?;
+   let found = GifResults {
+      accessor,
+      search_ptr: disp(3),
+      fav_ptr: disp(10),
+      search_len: disp(17),
+      fav_len: disp(24),
+      mode: disp(30),
+      fav_mode: code[34],
+      query_ptr,
+      query_len,
+   };
+   if found.search_ptr + 8 != found.search_len
+      || found.fav_ptr + 8 != found.fav_len
+      || found.search_ptr < 0x20
+   {
+      return Err(format!("GIF results fields look wrong: {found:x?}"));
+   }
+   Ok(found)
+}
+
+/// The search text's fields, from the picker renderer: it checks the text is
+/// empty (`cmp qword [state + len], 0`), then loads pointer and length as one
+/// pair (`movups xmm, [state + len - 8]`) to compare with its cached search.
+fn gif_query(image: &Image<'_>, accessor: usize) -> Found<(usize, usize)> {
+   let mut found = Vec::new();
+   for func in callers(image, accessor) {
+      let Some((start, end)) = image.function_bounds(func) else {
+         continue;
+      };
+      let Some(code) = image.read(start, end - start) else {
+         continue;
+      };
+      for (i, w) in code.windows(8).enumerate() {
+         // REX.W 83 /7 with a disp32 base other than rsp/r12, imm8 0.
+         let is_cmp = w[0] & 0xF8 == 0x48 && w[1] == 0x83 && w[2] & 0xF8 == 0xB8 && w[2] & 7 != 4;
+         if !is_cmp || w[7] != 0 {
+            continue;
+         }
+         let len = u32::from_le_bytes([w[3], w[4], w[5], w[6]]) as usize;
+         let (rex_b, rm) = (w[0] & 1, w[2] & 7);
+         let Some(ptr) = len.checked_sub(8) else {
+            continue;
+         };
+         let tail = &code[i + 8..code.len().min(i + 0x100)];
+         let pair = tail.windows(7).enumerate().any(|(j, m)| {
+            let rex_ok = if j > 0 && tail[j - 1] & 0xF0 == 0x40 {
+               tail[j - 1] & 1 == rex_b
+            } else {
+               rex_b == 0
+            };
+            m[0] == 0x0F
+               && m[1] == 0x10
+               && m[2] & 0xC7 == 0x80 | rm
+               && rex_ok
+               && u32::from_le_bytes([m[3], m[4], m[5], m[6]]) as usize == ptr
+         });
+         if pair && !found.contains(&(ptr, len)) {
+            found.push((ptr, len));
+         }
+      }
+   }
+   one("GIF search text", &found)
 }

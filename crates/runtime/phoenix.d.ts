@@ -1491,6 +1491,20 @@ declare namespace Phoenix {
       visible?(ctx: MessageContext): boolean | Promise<boolean>;
       onPress(ctx: MessageContext): void;
     }): Remover;
+    /// A row in the GIF picker's right-click menu, after Copy Link, given the GIF's URL.
+    /// Desktop Phoenix on Windows only, absent elsewhere or where the menu isn't found.
+    addGifAction?(options: {
+      label: string;
+      icon?: Icon;
+      priority?: number;
+      onPress(ctx: { url: string }): void;
+    }): Remover;
+    /// Takes over the GIF picker's Favourites search. `search` gets the search text and returns
+    /// the URLs of the favourites to show, in order, or null to leave Discord's own results.
+    /// It runs off the UI thread as the text changes; `update()` on the returned remover asks
+    /// again, after what `search` depends on changes. The latest plugin to set one wins.
+    /// Desktop Phoenix on Windows only, absent elsewhere or where the picker isn't found.
+    setGifFavoritesSearch?(search: (query: string) => string[] | null): Remover;
     /// A section at the end of a profile's main tab.
     addProfileSection(options: {
       title: string;
@@ -1514,6 +1528,9 @@ declare namespace Phoenix {
       message?: string;
       options?: (string | { label: string; icon?: Icon; danger?: boolean })[];
     }): Promise<number>;
+    /// A one-line text field in a dialog, starting with `initial`. Resolves to the submitted
+    /// text, or null when the dialog closes without a submit. Desktop only, absent elsewhere.
+    prompt?(options: { title?: string; initial?: string }): Promise<string | null>;
     /// Shows a scrollable text/code viewer sheet (with optional syntax highlighting and action
     /// rows such as Copy). Resolves to the chosen option index, or -1 when dismissed.
     showSheet(options: {

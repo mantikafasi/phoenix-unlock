@@ -51,6 +51,11 @@ pub struct Desktop<'js> {
    pub headers:        RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageAction` callbacks.
    pub actions:        RefCell<Vec<DesktopAction<'js>>>,
+   /// `phoenix.ui.addGifAction` callbacks, `visible` unused.
+   pub gif_actions:    RefCell<Vec<DesktopAction<'js>>>,
+   /// The `phoenix.ui.setGifFavoritesSearch` function, by id and plugin. The
+   /// latest plugin to set one wins.
+   pub gif_search:     RefCell<Option<(u64, String, Function<'js>)>>,
    /// Active `phoenix.ui.openPage` button callbacks, keyed by button ID.
    pub page_buttons:   RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
    /// `phoenix.ui.notify` `onPress` callbacks, keyed by banner ID.
@@ -126,6 +131,8 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    }
    drop(actions);
 
+   unload_gifs(&registry, name);
+
    registry
       .page_buttons
       .borrow_mut()
@@ -192,4 +199,21 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    }
 
    themes::unload(name);
+}
+
+/// Drops `name`'s GIF picker registrations.
+fn unload_gifs(registry: &Desktop<'_>, name: &str) {
+   let mut gif_actions = registry.gif_actions.borrow_mut();
+   let before = gif_actions.len();
+   gif_actions.retain(|entry| entry.plugin != name);
+   if gif_actions.len() != before {
+      crate::gif_menu::sync_actions(gif_actions.iter().map(ui::gif_meta).collect());
+   }
+   drop(gif_actions);
+
+   let mut gif_search = registry.gif_search.borrow_mut();
+   if gif_search.as_ref().is_some_and(|(_, plugin, _)| plugin == name) {
+      *gif_search = None;
+      crate::gif_search::set_active(false);
+   }
 }

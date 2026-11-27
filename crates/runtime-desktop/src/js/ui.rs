@@ -635,6 +635,125 @@ fn add_message_action<'js>(
    Ok(remove)
 }
 
+/// Runs the `phoenix.ui.setGifFavoritesSearch` function on `query`: the URLs
+/// of the favourites to show, or `None` for Discord's own results.
+pub fn search_gif_favorites(engine: &Engine, query: &str) -> Option<Vec<String>> {
+   engine.with(|ctx| {
+      let (plugin, search) = ctx.userdata::<Desktop<'_>>().and_then(|registry| {
+         let slot = registry.gif_search.borrow();
+         slot.as_ref().map(|(_, plugin, search)| (plugin.clone(), search.clone()))
+      })?;
+      match search.call::<_, Option<Vec<String>>>((query,)).catch(&ctx) {
+         Ok(urls) => urls,
+         Err(err) => {
+            log::error!("[{plugin}] setGifFavoritesSearch: {err}");
+            None
+         },
+      }
+   })
+}
+
+fn set_gif_search<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   search: Function<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+   let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+   {
+      let registry = ctx
+         .userdata::<Desktop<'js>>()
+         .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+      *registry.gif_search.borrow_mut() = Some((id, plugin.to_owned(), search));
+   }
+   crate::gif_search::set_active(true);
+
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut slot = registry.gif_search.borrow_mut();
+         if slot.as_ref().is_some_and(|(current, ..)| *current == id) {
+            *slot = None;
+            crate::gif_search::set_active(false);
+         }
+      }
+   })?;
+   remove.set(
+      "update",
+      Function::new(ctx.clone(), crate::gif_search::refresh)?,
+   )?;
+   Ok(remove)
+}
+
+pub fn gif_meta(action: &DesktopAction<'_>) -> crate::gif_menu::GifActionMeta {
+   crate::gif_menu::GifActionMeta {
+      id:       action.id,
+      label:    action.label.clone(),
+      icon:     action.icon.clone(),
+      priority: action.priority,
+   }
+}
+
+/// Runs a `phoenix.ui.addGifAction`'s `onPress` with the GIF's URL.
+pub fn invoke_gif_action(engine: &Engine, action_id: u64, url: &str) {
+   engine.with(|ctx| {
+      let Some((plugin, on_press)) = ctx.userdata::<Desktop<'_>>().and_then(|registry| {
+         let list = registry.gif_actions.borrow();
+         let entry = list.iter().find(|e| e.id == action_id)?;
+         Some((entry.plugin.clone(), entry.on_press.clone()))
+      }) else {
+         return;
+      };
+      let arg = Object::new(ctx.clone()).and_then(|arg| {
+         arg.set("url", url)?;
+         Ok(arg)
+      });
+      let Ok(arg) = arg else {
+         return;
+      };
+      if let Err(err) = on_press.call::<_, Value<'_>>((arg,)).catch(&ctx) {
+         log::error!("[{plugin}] addGifAction onPress: {err}");
+      }
+   });
+}
+
+fn add_gif_action<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   let label = options.get::<_, String>("label")?;
+   let icon = checked_icon(ctx, plugin, options.get::<_, Option<String>>("icon")?)?;
+   let priority = options.get::<_, Option<i32>>("priority")?.unwrap_or(0);
+   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let id = NEXT_ACTION.fetch_add(1, Ordering::Relaxed);
+   {
+      let registry = ctx
+         .userdata::<Desktop<'js>>()
+         .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+      let mut list = registry.gif_actions.borrow_mut();
+      list.push(DesktopAction {
+         id,
+         plugin: plugin.to_owned(),
+         label,
+         icon,
+         danger: false,
+         priority,
+         visible: None,
+         on_press,
+      });
+      crate::gif_menu::sync_actions(list.iter().map(gif_meta).collect());
+   }
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'_>>() {
+         let mut list = registry.gif_actions.borrow_mut();
+         list.retain(|entry| entry.id != id);
+         crate::gif_menu::sync_actions(list.iter().map(gif_meta).collect());
+      }
+   })?;
+   remove.set("update", Function::new(ctx.clone(), || {})?)?;
+   Ok(remove)
+}
+
 static NEXT_PAGE: AtomicU64 = AtomicU64::new(1);
 static NEXT_BTN: AtomicU64 = AtomicU64::new(1);
 
@@ -1060,6 +1179,7 @@ fn profile_sections<'js>(
                   on_press: Arc::new(move || {
                      modal::open_prompt(Prompt {
                         title:     title.clone(),
+                        initial:   String::new(),
                         on_submit: Arc::new(move |text| invoke_page_button(btn_id, Some(text))),
                      });
                   }),
@@ -1560,6 +1680,26 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       })?,
    )?;
 
+   if crate::gif_search::supported() {
+      let search_owner = plugin.to_owned();
+      ui.set(
+         "setGifFavoritesSearch",
+         Function::new(ctx.clone(), move |ctx: Ctx<'js>, search: Function<'js>| {
+            set_gif_search(&ctx, &search_owner, search)
+         })?,
+      )?;
+   }
+
+   if crate::gif_menu::supported() {
+      let gif_owner = plugin.to_owned();
+      ui.set(
+         "addGifAction",
+         Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+            add_gif_action(&ctx, &gif_owner, &options)
+         })?,
+      )?;
+   }
+
    let page_owner = plugin.to_owned();
    ui.set(
       "openPage",
@@ -1653,6 +1793,12 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       })?,
    )?;
    ui.set(
+      "prompt",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
+         prompt_dialog(&ctx, &options)
+      })?,
+   )?;
+   ui.set(
       "showSheet",
       Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
          sheet_dialog(&ctx, &options)
@@ -1679,6 +1825,37 @@ fn choose_dialog<'js>(
    let body = message.map(|text| ModalSection::Text { title: None, text });
    let title = title.unwrap_or_else(|| "Sunbird".to_owned());
    in_background(ctx, move || answer(title, body, items))
+}
+
+/// `phoenix.ui.prompt` as the native one-line field: the submitted text, or
+/// null once the field closes without a submit.
+fn prompt_dialog<'js>(
+   ctx: &Ctx<'js>,
+   options: &Object<'js>,
+) -> rquickjs::Result<rquickjs::Promise<'js>> {
+   let title = options
+      .get::<_, Option<String>>("title")?
+      .unwrap_or_else(|| "Sunbird".to_owned());
+   let initial = options
+      .get::<_, Option<String>>("initial")?
+      .unwrap_or_default();
+   in_background(ctx, move || {
+      let (tx, rx) = std::sync::mpsc::channel::<String>();
+      // The sender lives only in the modal, so closing it without a submit
+      // drops it and ends the wait.
+      let tx = std::sync::Mutex::new(Some(tx));
+      modal::open_prompt(Prompt {
+         title,
+         initial,
+         on_submit: Arc::new(move |text| {
+            if let Some(tx) = tx.lock().ok().and_then(|mut tx| tx.take()) {
+               let _ = tx.send(text);
+            }
+         }),
+      });
+      let text = rx.recv_timeout(Duration::from_secs(600)).ok();
+      Settlement::Json(Ok(text.and_then(|text| serde_json::to_string(&text).ok())))
+   })
 }
 
 /// `phoenix.ui.showSheet` as a native Mana modal with the code viewer.
