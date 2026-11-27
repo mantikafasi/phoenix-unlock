@@ -14,6 +14,7 @@ use std::{
       BTreeMap,
       BTreeSet,
       HashMap,
+      HashSet,
    },
    fs,
    io::ErrorKind,
@@ -88,6 +89,7 @@ use crate::{
    },
    permissions::{
       Permissions,
+      hosts,
       url_host,
    },
 };
@@ -100,6 +102,8 @@ const BUDGET: Duration = Duration::from_secs(1);
 /// The heap every plugin shares. Past it allocations throw, so a runaway
 /// plugin fails before Android kills Discord for its memory.
 const HEAP_LIMIT: usize = 128 << 20;
+
+const SEEN_HOSTS: usize = 4096;
 
 pub struct Engine {
    runtime: Runtime,
@@ -229,6 +233,9 @@ pub struct Registry<'js> {
    /// What each loaded plugin may reach, for the checks platform code makes by
    /// plugin name.
    granted:            RefCell<HashMap<String, Arc<Permissions>>>,
+   /// URL hosts Discord's own payloads carried, which `dispatch` and `enqueue`
+   /// may hand back to it, up to [`SEEN_HOSTS`].
+   seen_hosts:         RefCell<HashSet<String>>,
    /// `phoenix.messages.onSend` interceptors in registration order, by id.
    pub interceptors:   RefCell<Vec<(u64, String, Function<'js>)>>,
 }
@@ -606,13 +613,60 @@ impl Engine {
    }
 }
 
+/// What `plugin` may reach, `None` for a plugin not loaded.
+#[must_use]
+pub fn granted(ctx: &Ctx<'_>, plugin: &str) -> Option<Arc<Permissions>> {
+   ctx.userdata::<Registry<'_>>()
+      .and_then(|registry| registry.granted.borrow().get(plugin).cloned())
+}
+
 /// Whether `plugin` may draw an image from `uri`, false for a plugin not
 /// loaded.
 #[must_use]
 pub fn image_allowed(ctx: &Ctx<'_>, plugin: &str, uri: &str) -> bool {
-   ctx.userdata::<Registry<'_>>()
-      .and_then(|registry| registry.granted.borrow().get(plugin).cloned())
-      .is_some_and(|permissions| permissions.image(uri))
+   granted(ctx, plugin).is_some_and(|permissions| permissions.image(uri))
+}
+
+/// Whether `plugin`'s rewrite of `before` into `after` adds a URL host it may
+/// not point Discord at, logging the refusal.
+#[must_use]
+pub fn rewrite_refused(ctx: &Ctx<'_>, plugin: &str, what: &str, before: &str, after: &str) -> bool {
+   let Some(host) = granted(ctx, plugin).map_or_else(
+      || Some("a host".to_owned()),
+      |permissions| permissions.added(before, after),
+   ) else {
+      return false;
+   };
+   log::error!("[{plugin}] {what}: dropped a rewrite adding {host}, not on its // @fetch line");
+   true
+}
+
+/// Remembers the URL hosts in a payload from Discord.
+pub fn saw_hosts(ctx: &Ctx<'_>, payload: &str) {
+   let Some(registry) = ctx.userdata::<Registry<'_>>() else {
+      return;
+   };
+   let mut seen = registry.seen_hosts.borrow_mut();
+   for host in hosts(payload) {
+      if seen.len() >= SEEN_HOSTS {
+         break;
+      }
+      seen.insert(host);
+   }
+}
+
+/// The first URL host in `payload` that `plugin` may not hand Discord, since
+/// neither its grants nor Discord's own payloads carry it.
+#[must_use]
+pub fn foreign_host(ctx: &Ctx<'_>, plugin: &str, payload: &str) -> Option<String> {
+   let (Some(permissions), Some(registry)) = (granted(ctx, plugin), ctx.userdata::<Registry<'_>>())
+   else {
+      return Some("a host".to_owned());
+   };
+   let seen = registry.seen_hosts.borrow();
+   hosts(payload)
+      .into_iter()
+      .find(|host| !permissions.host(host) && !seen.contains(host))
 }
 
 /// `icon` when `plugin` may draw it, else a `TypeError` naming the fix.
@@ -673,6 +727,7 @@ fn registry<'js>(
       response_hooks: RefCell::default(),
       gateway_send_hooks: RefCell::default(),
       granted: RefCell::default(),
+      seen_hosts: RefCell::default(),
       interceptors: RefCell::default(),
    })
 }

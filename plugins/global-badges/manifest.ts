@@ -5,6 +5,13 @@ export default {
    warning: "Fetches badges from Equibadges (badges.equicord.org)",
    permissions: {
       discord: ["GET /users/@me", "GET /users/*/profile", "GET /users/*/badges"],
-      fetch: ["badges.equicord.org"],
+      fetch: [
+         "*.equicord.org",
+         "badges.vencord.dev",
+         "gb.obamabot.me",
+         "nekocord.dev",
+         "codeberg.org",
+         "paicord.llsc12.me",
+      ],
    },
 } satisfies Phoenix.Manifest;

@@ -12,8 +12,9 @@
 //! - `// @ui-tree` for the raw view tree, which holds whatever the screen
 //!   shows.
 //!
-//! Icon URLs a plugin draws reach the network too, so they must point at a
-//! `@fetch` host or Discord's CDN.
+//! Images Discord draws reach the network too. An icon a plugin draws, and a
+//! URL host a hook adds to what Discord renders, must be one of its `@fetch`
+//! hosts or Discord's own.
 
 use std::{
    collections::BTreeSet,
@@ -59,8 +60,79 @@ enum Namespace {
    UiTree,
 }
 
-/// Hosts whose images any plugin may draw, since they reach only Discord.
-const DISCORD_CDN: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
+/// Hosts any plugin may point Discord at, since they reach only Discord.
+fn discord_host(host: &str) -> bool {
+   [
+      "discord.com",
+      "discordapp.com",
+      "discord.gg",
+      "discordapp.net",
+   ]
+   .iter()
+   .any(|domain| {
+      host == *domain
+         || host
+            .strip_suffix(domain)
+            .is_some_and(|sub| sub.ends_with('.'))
+   })
+}
+
+/// The mobile sink draws `…/badge-icons/phx_u_<hex>.png` from the URL the hex
+/// spells, so a badge path counts as that URL.
+const BADGE: &str = "phx_u_";
+
+/// The `https://` URL `hex` spells.
+#[must_use]
+pub fn badge_target(hex: &str) -> Option<String> {
+   if hex.is_empty() || !hex.len().is_multiple_of(2) {
+      return None;
+   }
+   let bytes = hex
+      .as_bytes()
+      .as_chunks::<2>()
+      .0
+      .iter()
+      .map(|&[high, low]| {
+         let high = char::from(high).to_digit(16)?;
+         let low = char::from(low).to_digit(16)?;
+         u8::try_from((high << 4) | low).ok()
+      })
+      .collect::<Option<Vec<u8>>>()?;
+   String::from_utf8(bytes)
+      .ok()
+      .filter(|url| url.starts_with("https://"))
+}
+
+/// Every URL host in `text`, JSON with escaped slashes included, and the hosts
+/// badge paths spell.
+#[must_use]
+pub fn hosts(text: &str) -> BTreeSet<String> {
+   let text = text.replace("\\/", "/");
+   let lower = text.to_ascii_lowercase();
+   let mut found = BTreeSet::new();
+   for (at, _) in lower.match_indices("://") {
+      if !(lower[..at].ends_with("http") || lower[..at].ends_with("https")) {
+         continue;
+      }
+      let host = lower[at + 3..]
+         .split(|byte: char| !(byte.is_ascii_alphanumeric() || byte == '.' || byte == '-'))
+         .next()
+         .unwrap_or_default();
+      if !host.is_empty() {
+         found.insert(host.to_owned());
+      }
+   }
+   for (at, _) in text.match_indices(BADGE) {
+      let hex = text[at + BADGE.len()..]
+         .split(|byte: char| !byte.is_ascii_hexdigit())
+         .next()
+         .unwrap_or_default();
+      if let Some(target) = badge_target(hex) {
+         found.extend(hosts(&target));
+      }
+   }
+   found
+}
 
 struct Route {
    method:   Option<String>,
@@ -404,6 +476,17 @@ impl Permissions {
       }
    }
 
+   /// Whether the plugin may point Discord at `host`.
+   #[must_use]
+   pub fn host(&self, host: &str) -> bool {
+      match self {
+         Self::Console => true,
+         Self::Declared(declared) => {
+            discord_host(host) || declared.fetch.iter().any(|allowed| allowed.matches(host))
+         },
+      }
+   }
+
    /// Whether the plugin may draw an image from `uri`. Names like
    /// `res://ic_mana_id` and inline SVG paths load nothing.
    #[must_use]
@@ -415,10 +498,17 @@ impl Permissions {
       {
          return true;
       }
-      // The mobile sink unwraps these badge paths to whatever URL they encode.
-      if lower.contains("phx_u_") {
-         return false;
-      }
-      url_host(uri).is_some_and(|host| DISCORD_CDN.contains(&host.as_str())) || self.fetch(uri)
+      let found = hosts(uri);
+      !found.is_empty() && found.iter().all(|host| self.host(host))
+   }
+
+   /// The first URL host `after` has that `before` lacks and the plugin may
+   /// not point Discord at.
+   #[must_use]
+   pub fn added(&self, before: &str, after: &str) -> Option<String> {
+      let known = hosts(before);
+      hosts(after)
+         .into_iter()
+         .find(|host| !known.contains(host) && !self.host(host))
    }
 }

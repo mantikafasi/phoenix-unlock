@@ -23,6 +23,8 @@ use crate::{
       Engine,
       Registry,
       restart_budget,
+      rewrite_refused,
+      saw_hosts,
    },
    permissions::Permissions,
 };
@@ -123,7 +125,10 @@ impl Engine {
          body,
          done,
       };
-      self.with(|ctx| run_response_chain(&ctx, pending));
+      self.with(|ctx| {
+         saw_hosts(&ctx, &String::from_utf8_lossy(&pending.body));
+         run_response_chain(&ctx, pending);
+      });
    }
 }
 
@@ -132,6 +137,16 @@ fn json_parser_fn<'js>(ctx: &Ctx<'js>, source: String) -> rquickjs::Result<Funct
       ctx.json_parse(source.as_str())
          .unwrap_or_else(|_| Value::new_null(ctx))
    })
+}
+
+fn body_refused(ctx: &Ctx<'_>, plugin: &str, before: &[u8], after: &[u8]) -> bool {
+   rewrite_refused(
+      ctx,
+      plugin,
+      "onResponse",
+      &String::from_utf8_lossy(before),
+      &String::from_utf8_lossy(after),
+   )
 }
 
 /// Extracts a replacement body from `{ body: string | object }` returned by
@@ -213,7 +228,9 @@ fn run_response_chain<'js>(ctx: &Ctx<'js>, mut pending: Pending) {
          },
       };
       let Some(promise) = result.as_promise() else {
-         if let Some(next_body) = extract_hook_body(ctx, &result) {
+         if let Some(next_body) = extract_hook_body(ctx, &result)
+            && !body_refused(ctx, &plugin, &pending.body, &next_body)
+         {
             pending.body = next_body;
          }
          if let Some(next_status) = extract_hook_status(&result) {
@@ -224,11 +241,14 @@ fn run_response_chain<'js>(ctx: &Ctx<'js>, mut pending: Pending) {
 
       let shared = Arc::new(Mutex::new(Some(pending)));
       let ok_shared = Arc::clone(&shared);
+      let ok_plugin = plugin.clone();
       let ok = Function::new(ctx.clone(), move |value: Value<'_>| {
          let Some(mut rest) = take_pending(&ok_shared) else {
             return;
          };
-         if let Some(next_body) = extract_hook_body(value.ctx(), &value) {
+         if let Some(next_body) = extract_hook_body(value.ctx(), &value)
+            && !body_refused(value.ctx(), &ok_plugin, &rest.body, &next_body)
+         {
             rest.body = next_body;
          }
          if let Some(next_status) = extract_hook_status(&value) {

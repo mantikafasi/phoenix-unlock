@@ -20,8 +20,11 @@ use crate::{
       Before,
       Engine,
       Registry,
+      foreign_host,
       js_error,
       restart_budget,
+      rewrite_refused,
+      saw_hosts,
    },
    permissions::Permissions,
 };
@@ -42,24 +45,35 @@ impl Engine {
          if hooks.is_empty() {
             return Ok(Before::Keep);
          }
+         saw_hosts(&ctx, json);
          let mut payload = ctx.json_parse(json).catch(&ctx).map_err(js_error)?;
+         let mut current = json.to_owned();
+         let what = format!("before {name}");
          for (plugin, before) in hooks {
             restart_budget(&ctx);
             match before.call::<_, Value<'_>>((payload.clone(),)).catch(&ctx) {
                Ok(result) if result.as_bool() == Some(false) => return Ok(Before::Drop),
                Ok(result) if result.is_undefined() => {},
                Ok(result) => payload = result,
-               Err(err) => log::error!("[{plugin}] before {name}: {err}"),
+               Err(err) => log::error!("[{plugin}] {what}: {err}"),
+            }
+            let now = ctx
+               .json_stringify(payload.clone())
+               .catch(&ctx)
+               .map_err(js_error)?
+               .ok_or_else(|| Error::Js(format!("a {what} hook returned no JSON value")))?
+               .to_string()
+               .map_err(|err| Error::Js(err.to_string()))?;
+            if rewrite_refused(&ctx, &plugin, &what, &current, &now) {
+               payload = ctx
+                  .json_parse(current.as_str())
+                  .catch(&ctx)
+                  .map_err(js_error)?;
+            } else {
+               current = now;
             }
          }
-         let json = ctx
-            .json_stringify(payload)
-            .catch(&ctx)
-            .map_err(js_error)?
-            .ok_or_else(|| Error::Js(format!("a before {name} hook returned no JSON value")))?;
-         Ok(Before::Replace(
-            json.to_string().map_err(|err| Error::Js(err.to_string()))?,
-         ))
+         Ok(Before::Replace(current))
       })
    }
 
@@ -257,6 +271,7 @@ pub fn add_gateway_api<'js>(
       )?,
    )?;
    let granted = Arc::clone(permissions);
+   let owner = plugin.to_owned();
    api.set(
       "dispatch",
       Function::new(
@@ -267,6 +282,7 @@ pub fn add_gateway_api<'js>(
                .json_stringify(payload)?
                .ok_or_else(|| Exception::throw_type(&ctx, "dispatch needs a JSON payload"))?
                .to_string()?;
+            refuse_foreign(&ctx, &owner, &json)?;
             gateway::dispatch(event, &json).ok_or_else(|| {
                Exception::throw_message(&ctx, "dispatch runs only inside a gateway hook")
             })
@@ -275,6 +291,7 @@ pub fn add_gateway_api<'js>(
    )?;
 
    let granted = Arc::clone(permissions);
+   let owner = plugin.to_owned();
    api.set(
       "enqueue",
       Function::new(
@@ -285,12 +302,24 @@ pub fn add_gateway_api<'js>(
                .json_stringify(payload)?
                .ok_or_else(|| Exception::throw_type(&ctx, "enqueue needs a JSON payload"))?
                .to_string()?;
+            refuse_foreign(&ctx, &owner, &json)?;
             gateway::enqueue(event, json);
             Ok::<_, rquickjs::Error>(())
          },
       )?,
    )?;
    Ok(())
+}
+
+/// Refuses a `dispatch` or `enqueue` payload pointing Discord at a host the
+/// plugin has no grant for and Discord never sent.
+fn refuse_foreign(ctx: &Ctx<'_>, plugin: &str, json: &str) -> rquickjs::Result<()> {
+   foreign_host(ctx, plugin, json).map_or(Ok(()), |host| {
+      Err(Exception::throw_type(
+         ctx,
+         &format!("{host}: add it to the plugin's // @fetch line"),
+      ))
+   })
 }
 
 pub fn gateway_object<'js>(

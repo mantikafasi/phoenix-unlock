@@ -1,3 +1,5 @@
+import manifest from "../manifest";
+
 const API = "https://badges.equicord.org/users";
 const TTL = 6 * 60 * 60 * 1000;
 const RETRY_DELAY = 30 * 1000;
@@ -11,6 +13,15 @@ const ART_OVERRIDES: Record<string, string> = {
 };
 
 type Badge = { uri: string; name: string; source: string };
+
+// The runtime drops a profile rewrite that adds an image host outside the
+// manifest's fetch list, so badges from other hosts stay off.
+function allowedArt(uri: string): boolean {
+  const host = uri.match(/^https:\/\/([^/:?#]+)/i)?.[1]?.toLowerCase();
+  if (!host) return false;
+  return host === "cdn.discordapp.com" || manifest.permissions.fetch.some((allowed) =>
+    allowed.startsWith("*.") ? host.endsWith(allowed.slice(1)) : host === allowed);
+}
 
 const settings = phoenix.settings.define({
   showCustom: {
@@ -87,7 +98,7 @@ function parseBadges(entries: unknown): Badge[] {
     const source = providerNames.get(mod) ?? entry.mod.trim();
     const name = entry.tooltip.trim();
     const uri = ART_OVERRIDES[`${mod}:${name.toLowerCase()}`] ?? entry.badge.trim();
-    if (!name || !/^https?:\/\/[^/\s]+/i.test(uri) || seen.has(uri)) continue;
+    if (!name || !allowedArt(uri) || seen.has(uri)) continue;
     seen.add(uri);
     badges.push({ uri, name, source });
   }

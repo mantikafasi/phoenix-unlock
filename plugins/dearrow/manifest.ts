@@ -5,6 +5,6 @@ export default {
    permissions: {
       gateway: ["messageCreate", "messageUpdate"],
       discord: ["GET /channels/*/messages"],
-      fetch: ["sponsor.ajay.app"],
+      fetch: ["sponsor.ajay.app", "dearrow-thumb.ajay.app"],
    },
 } satisfies Phoenix.Manifest;
