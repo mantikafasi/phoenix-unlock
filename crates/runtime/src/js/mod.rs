@@ -9,7 +9,10 @@ mod storage;
 
 use std::{
    borrow::Cow,
-   cell::RefCell,
+   cell::{
+      Cell,
+      RefCell,
+   },
    collections::{
       BTreeMap,
       BTreeSet,
@@ -108,6 +111,9 @@ const BUDGET: Duration = Duration::from_secs(1);
 /// plugin fails before Android kills Discord for its memory.
 const HEAP_LIMIT: usize = 128 << 20;
 
+/// Drains in a row that may run out of budget before [`Engine::starve`] runs.
+const OVERRUNS: u32 = 3;
+
 const SEEN_URLS: usize = 32_768;
 
 /// The exact URLs Discord's own payloads carried. Anyone can post a link, so a
@@ -140,13 +146,15 @@ impl SeenUrls {
 const CONSOLE: &str = "console";
 
 pub struct Engine {
-   runtime: Runtime,
-   context: Context,
+   runtime:  Runtime,
+   context:  Context,
    /// The debug shell's prompt, a realm of its own so its unrestricted
    /// `phoenix` never sits in the plugins' frozen globals.
-   console: Context,
-   budget:  Arc<Budget>,
-   plugins: BTreeMap<String, Loaded>,
+   console:  Context,
+   budget:   Arc<Budget>,
+   /// Drains in a row that ran out of budget with jobs left.
+   overruns: Cell<u32>,
+   plugins:  BTreeMap<String, Loaded>,
 }
 
 /// The deadline `QuickJS`'s interrupt handler checks, which every entry into
@@ -340,6 +348,7 @@ impl Engine {
          context,
          console,
          budget,
+         overruns: Cell::new(0),
          plugins: BTreeMap::new(),
       })
    }
@@ -354,16 +363,29 @@ impl Engine {
    }
 
    /// Runs promise reactions until none are left. `QuickJS` queues them, and
-   /// nothing else runs the queue. They share one budget.
+   /// nothing else runs the queue. They share one budget, and the jobs left
+   /// when it runs out wait for the next entry. Only a queue still growing
+   /// after [`OVERRUNS`] entries is starved, since starving fails every
+   /// plugin's pending jobs.
    fn drain(&self) {
       self.budget.restart();
       while !self.budget.spent() {
          match self.runtime.execute_pending_job() {
             Ok(true) => {},
-            Ok(false) => return,
+            Ok(false) => {
+               self.overruns.set(0);
+               return;
+            },
             Err(err) => log::error!("a promise job threw: {err}"),
          }
       }
+      let overruns = self.overruns.get() + 1;
+      if overruns < OVERRUNS {
+         self.overruns.set(overruns);
+         log::warn!("promise jobs ran past {BUDGET:?}, the rest wait for the next call");
+         return;
+      }
+      self.overruns.set(0);
       self.starve();
    }
 
