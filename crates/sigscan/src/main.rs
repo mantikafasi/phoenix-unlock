@@ -123,6 +123,19 @@ fn main() -> misstep::Result<()> {
          }
          Ok(())
       },
+      Some("source") => {
+         let ix = Index::new(image, isa_of(image, parsed.machine()));
+         for func in ix.source(args.get(2).context(USAGE)?) {
+            let callees: Vec<String> = func.calls().iter().map(|at| format!("{at:#x}")).collect();
+            println!(
+               "{func:?} {} bytes, {} callers, calls {}",
+               func.size(),
+               func.callers().len(),
+               callees.join(" ")
+            );
+         }
+         Ok(())
+      },
       Some("explain") => {
          let ix = Index::new(image, isa_of(image, parsed.machine()));
          explain(&ix, addr(2)?, base);

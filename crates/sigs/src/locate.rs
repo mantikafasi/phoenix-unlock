@@ -27,6 +27,9 @@ pub enum Family {
    Mobile,
 }
 
+pub mod mobile;
+
+const MOBILE: &[Family] = &[Family::Mobile];
 const DESKTOP: &[Family] = &[Family::Desktop];
 const ALL: &[Family] = &[Family::Desktop, Family::Mobile];
 
@@ -53,6 +56,13 @@ pub const LOCATORS: &[Locator] = &[
       name:     "gpui builders",
       families: DESKTOP,
       run:      |ix| gpui::gpui(ix).map(|found| format!("{found:x?}")),
+   },
+   Locator {
+      name:     "mobile access gate",
+      families: MOBILE,
+      run:      |ix| {
+         mobile::access_gate(ix).map(|[first, second]| format!("{first:#x}, {second:#x}"))
+      },
    },
    Locator {
       name:     "emoji check",
