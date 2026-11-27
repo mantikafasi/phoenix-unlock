@@ -14,6 +14,8 @@ use crate::{
    },
 };
 
+const NO_THUMB: &str = "Desktop Phoenix has no Thumb-2 build";
+
 /// One instruction's bytes as Discord ships them and as patched. An x86 patch
 /// is one byte and an arm64 one a whole aligned instruction, so a thread at
 /// `site` runs the old or the new instruction whole.
@@ -90,7 +92,7 @@ pub fn auto_pause(ix: &Index<'_>) -> Found<CodePatch> {
       #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
       Isa::X86_64 { .. } => CodePatch::at(ix, func.start, &[0xC3]),
       Isa::Aarch64 => CodePatch::at(ix, func.start, &ARM64_RET),
-      Isa::Thumb2 => Err("Desktop Phoenix has no Thumb-2 build".into()),
+      Isa::Thumb2 => Err(NO_THUMB.into()),
    }
 }
 
@@ -154,7 +156,7 @@ pub fn idle_activity(ix: &Index<'_>) -> Found<CodePatch> {
             .filter(|&site| arm64::tests_since_and_shown(ix, site, shown))
             .collect::<Vec<_>>()
       },
-      Isa::Thumb2 => return Err("Desktop Phoenix has no Thumb-2 build".into()),
+      Isa::Thumb2 => return Err(NO_THUMB.into()),
    };
    let sites = candidates
       .into_iter()
@@ -164,7 +166,8 @@ pub fn idle_activity(ix: &Index<'_>) -> Found<CodePatch> {
    match ix.isa {
       #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
       Isa::X86_64 { .. } => CodePatch::at(ix, site + 1, &[0x39]),
-      Isa::Aarch64 | Isa::Thumb2 => {
+      Isa::Thumb2 => Err(NO_THUMB.into()),
+      Isa::Aarch64 => {
          let csel = ix
             .image
             .read_u32(site + 4)
