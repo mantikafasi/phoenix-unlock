@@ -2,6 +2,7 @@
 //! accessories, and `phoenix.native` for the console.
 
 pub mod native;
+pub mod themes;
 pub mod ui;
 
 use std::{
@@ -181,4 +182,6 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       hidden.retain(|(_, plugin, _)| plugin != name);
       counts::hide(hidden.iter().map(|&(.., count)| count));
    }
+
+   themes::unload(name);
 }
