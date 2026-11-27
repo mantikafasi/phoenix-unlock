@@ -132,6 +132,19 @@ pub enum Op {
       reg:   Reg,
       value: u64,
    },
+   /// `cmp [base + offset], imm`, `size` bytes, a field tested in place.
+   CmpMem {
+      base:   Reg,
+      offset: isize,
+      size:   u8,
+      value:  u64,
+   },
+   /// An atomic access of `[base + offset]`: a `lock` prefix, an exclusive or
+   /// acquire load or store, or a CAS.
+   Atomic {
+      base:   Reg,
+      offset: isize,
+   },
    Ret,
    Other,
 }
@@ -311,6 +324,39 @@ fn x86(image: &Image<'_>, code: &[u8], ip: usize) -> Vec<Step> {
                _ => Op::Other,
             }
          },
+         _ if instruction.has_lock_prefix() && instruction.memory_index() == Register::None => {
+            gpr(instruction.memory_base()).map_or(Op::Other, |base| {
+               Op::Atomic {
+                  base,
+                  offset: instruction.memory_displacement64().cast_signed() as isize,
+               }
+            })
+         },
+         (_, Mnemonic::Cmp)
+            if instruction.op0_kind() == OpKind::Memory
+               && rip_target.is_none()
+               && instruction.memory_index() == Register::None =>
+         {
+            match (gpr(instruction.memory_base()), instruction.op1_kind()) {
+               (
+                  Some(base),
+                  OpKind::Immediate8
+                  | OpKind::Immediate8to64
+                  | OpKind::Immediate32
+                  | OpKind::Immediate8to32
+                  | OpKind::Immediate32to64
+                  | OpKind::Immediate16,
+               ) => {
+                  Op::CmpMem {
+                     base,
+                     offset: instruction.memory_displacement64().cast_signed() as isize,
+                     size: size(mem_size),
+                     value: instruction.immediate(1),
+                  }
+               },
+               _ => Op::Other,
+            }
+         },
          (_, Mnemonic::Cmp) if instruction.op0_kind() == OpKind::Register => {
             match (gpr(instruction.op0_register()), instruction.op1_kind()) {
                (
@@ -475,6 +521,15 @@ fn aarch64(code: &[u8], pc: usize) -> Vec<Step> {
             Op::Branch(target)
          },
          Insn::Ret => Op::Ret,
+         // Load/store exclusive, CAS and the LSE read-modify-writes.
+         Insn::Other(word)
+            if word & 0x3F00_0000 == 0x0800_0000 || word & 0x3F20_0C00 == 0x3820_0000 =>
+         {
+            Op::Atomic {
+               base:   ((word >> 5) & 0x1F) as Reg,
+               offset: 0,
+            }
+         },
          _ => Op::Other,
       };
       steps.push(Step {

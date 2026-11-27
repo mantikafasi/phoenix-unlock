@@ -164,6 +164,16 @@ fn narrow_op(image: &Image<'_>, hw: u32, pc: u32, constants: &mut Constants) -> 
             }
          })
       },
+      _ if hw & 0xFF00 == 0x4400 => {
+         let reg = ((hw >> 4) & 8) | (hw & 7);
+         constants.get((hw >> 3) & 0xF).map_or(Op::Other, |offset| {
+            Op::Offset {
+               reg:    reg as Reg,
+               base:   reg as Reg,
+               offset: offset as isize,
+            }
+         })
+      },
       _ if hw & 0xFF00 == 0x4600 => {
          Op::Move {
             dst: (((hw >> 4) & 8) | (hw & 7)) as Reg,
@@ -300,6 +310,12 @@ fn wide_op(image: &Image<'_>, hw1: u32, hw2: u32, pc: u32, constants: &mut Const
          Op::Global {
             target: target as usize,
             store:  false,
+         }
+      },
+      _ if hw1 & 0xFFE0 == 0xE840 => {
+         Op::Atomic {
+            base:   rn as Reg,
+            offset: 0,
          }
       },
       _ if hw1 & 0xFFF0 == 0xF8D0 => mem(4, false),

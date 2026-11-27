@@ -5,6 +5,7 @@
 pub mod message;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod settings;
+pub mod staff;
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod gpui;
@@ -63,6 +64,11 @@ pub const LOCATORS: &[Locator] = &[
       run:      |ix| {
          mobile::access_gate(ix).map(|[first, second]| format!("{first:#x}, {second:#x}"))
       },
+   },
+   Locator {
+      name:     "staff flag",
+      families: ALL,
+      run:      |ix| staff::staff(ix).map(|staff| staff.to_string()),
    },
    Locator {
       name:     "emoji check",
