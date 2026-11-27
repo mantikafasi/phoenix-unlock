@@ -6,8 +6,10 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-libc    = { workspace = true }
 misstep = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [lints]
 workspace = true
