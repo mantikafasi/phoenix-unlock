@@ -239,6 +239,8 @@ pub struct SettingField {
 #[derive(Clone)]
 pub struct Prompt {
    pub title:     String,
+   /// What the field starts out holding.
+   pub initial:   String,
    pub on_submit: Arc<dyn Fn(String) + Send + Sync>,
 }
 
@@ -1571,9 +1573,10 @@ pub fn open_setting_editor(field: SettingField) {
 /// submitted.
 pub fn open_prompt(prompt: Prompt) {
    resolve_pending_choice();
+   let initial = prompt.initial.clone();
    set_active(ActiveModal::InstallUrl(InstallUrlModal {
       target:       FieldTarget::Prompt(prompt),
-      pending_init: Some(String::new()),
+      pending_init: Some(initial),
       status:       FieldStatus::Idle,
    }));
 }
