@@ -1862,7 +1862,8 @@ pub struct MessageBody {
 }
 
 /// The function `MessageRow::render` calls that loads the `message-edited-`
-/// template.
+/// template. Its prologue is [`Prologues::row`], or [`Prologues::frame`]
+/// where its frame fits in a page, as in Windows build gb71ec80.
 pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> {
    // `mov rcx, [arg0 + disp32]`, loading the message id.
    let mut msg_id_mov = rm_disp8(0x8B, Register::RCX, Abi::of(image).arg(0));
@@ -1871,10 +1872,11 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
       "message-edited template",
       &image.find_bytes(b"\x0fmessage-edited-\xc0\x00"),
    )?;
+   let pro = prologues(image);
    let mut found = lea_refs(image, anchor)
       .into_iter()
       .filter_map(|lea| Some(image.function_bounds(lea)?.0))
-      .filter(|&func| prologues(image).row.at(image, func))
+      .filter(|&func| pro.row.at(image, func) || pro.frame.at(image, func))
       .filter(|&func| callers(image, func).contains(&render_row))
       .collect::<Vec<_>>();
    found.sort_unstable();
@@ -1995,6 +1997,23 @@ fn slot_of(operand: &str, base: &str) -> Option<usize> {
       || disp.parse().ok(),
       |hex| usize::from_str_radix(hex, 16).ok(),
    )
+}
+
+/// [`slot_of`] for slots on either side of the base, like `[rbp-50h]`.
+fn signed_slot(operand: &str, base: &str) -> Option<isize> {
+   if let Some(slot) = slot_of(operand, base) {
+      return isize::try_from(slot).ok();
+   }
+   let disp = operand
+      .strip_prefix('[')?
+      .strip_suffix(']')?
+      .strip_prefix(base)?
+      .strip_prefix('-')?;
+   let disp = disp.strip_suffix('h').map_or_else(
+      || disp.parse::<isize>().ok(),
+      |hex| isize::from_str_radix(hex, 16).ok(),
+   )?;
+   Some(-disp)
 }
 
 /// The callee of the call `line` decodes: `call rel32`, or through a pointer
@@ -2545,10 +2564,33 @@ fn header_builder(image: &Image<'_>, func: usize, anchor: usize) -> Found<(usize
       .iter()
       .position(|line| line.target == Some(anchor))
       .ok_or("header app tag load not decoded")?;
-   let slot = lines[template.saturating_sub(8)..template]
-      .iter()
+   let volatile: &[&str] = match abi {
+      Abi::Win64 => &["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"],
+      Abi::SysV => &["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"],
+   };
+   // The id's address is stored into the format arguments from a register a
+   // `lea reg,[frame+slot]` set, right before the template or, on Windows
+   // gb71ec80, at the top of the builder into a callee-saved register.
+   let slot = (template.saturating_sub(8)..template)
       .rev()
-      .find_map(|line| slot_of(line.text.strip_prefix("lea rax,")?, &base))
+      .find_map(|at| {
+         let (dest, reg) = lines[at].text.strip_prefix("mov ")?.split_once(',')?;
+         if !dest.starts_with('[') {
+            return None;
+         }
+         let set = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|line| !(volatile.contains(&reg) && line.text.starts_with("call ")))
+            .find(|line| written(line) == Some(reg))?;
+         slot_of(
+            set.text
+               .strip_prefix("lea ")?
+               .strip_prefix(reg)?
+               .strip_prefix(',')?,
+            &base,
+         )
+      })
       .ok_or("header message id slot not found")?;
    let mut adds = Vec::new();
    for at in 1..lines.len() {
@@ -2619,40 +2661,52 @@ fn node_svg(image: &Image<'_>, body: usize) -> Found<NodeSvg> {
    svg_news.dedup();
    let svg_new = one("node svg_new", &svg_news)?;
 
-   // In the body: `lea out,[frame+leaf]; ...; call svg_new`, then
-   // `mov dword ptr [frame+color],1` and the call pushing the leaf.
+   // `lea out,[frame+leaf]; ...; call svg_new`, then
+   // `mov dword ptr [frame+color],1` and the call pushing the leaf. Windows
+   // gb71ec80 draws it in a function the body calls, at negative offsets.
    let leaf_arg = format!("lea {},", reg_name(abi.arg(0)));
-   let lines = phoenix_hook::x86::disasm(
-      function_code(image, body, "message body")?,
-      body,
-      usize::MAX,
-   );
-   let (push_svg, svg_color) = lines
-      .iter()
-      .enumerate()
-      .filter(|(_, line)| callee(image, line) == Some(svg_new))
-      .find_map(|(at, _)| {
-         let leaf = lines[at.saturating_sub(8)..at]
-            .iter()
-            .rev()
-            .find_map(|line| slot_of(line.text.strip_prefix(&leaf_arg)?, &base))?;
-         let after = &lines[at + 1..(at + 24).min(lines.len())];
-         let push = after.iter().find(|line| line.text.starts_with("call "))?;
-         let tag = after
-            .iter()
-            .take_while(|line| line.addr < push.addr)
-            .find_map(|line| {
-               slot_of(
-                  line
-                     .text
-                     .strip_prefix("mov dword ptr ")?
-                     .strip_suffix(",1")?,
-                  &base,
-               )
-            })?;
-         Some((callee(image, push)?, tag.checked_sub(leaf)?))
-      })
-      .ok_or("node SVG leaf push not found in the message body")?;
+   let leaf_push = |func: usize| {
+      let lines = phoenix_hook::x86::disasm(function_code(image, func, "").ok()?, func, usize::MAX);
+      lines
+         .iter()
+         .enumerate()
+         .filter(|(_, line)| callee(image, line) == Some(svg_new))
+         .find_map(|(at, _)| {
+            let leaf = lines[at.saturating_sub(8)..at]
+               .iter()
+               .rev()
+               .find_map(|line| signed_slot(line.text.strip_prefix(&leaf_arg)?, &base))?;
+            let after = &lines[at + 1..(at + 24).min(lines.len())];
+            let push = after.iter().find(|line| line.text.starts_with("call "))?;
+            let tag = after
+               .iter()
+               .take_while(|line| line.addr < push.addr)
+               .find_map(|line| {
+                  signed_slot(
+                     line
+                        .text
+                        .strip_prefix("mov dword ptr ")?
+                        .strip_suffix(",1")?,
+                     &base,
+                  )
+               })?;
+            Some((callee(image, push)?, usize::try_from(tag - leaf).ok()?))
+         })
+   };
+   let mut scanned = straight_calls(image, body)
+      .into_iter()
+      .map(|(_, callee)| callee)
+      .chain([body])
+      .collect::<Vec<_>>();
+   scanned.sort_unstable();
+   scanned.dedup();
+   let mut pushes = scanned
+      .into_iter()
+      .filter_map(leaf_push)
+      .collect::<Vec<_>>();
+   pushes.sort_unstable();
+   pushes.dedup();
+   let (push_svg, svg_color) = one("node SVG leaf push near the message body", &pushes)?;
    if !(4..0x30).contains(&svg_color) {
       return Err(format!("node SVG color at {svg_color:#x}"));
    }
