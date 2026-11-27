@@ -2748,6 +2748,56 @@ pub fn composer_gift(image: &Image<'_>) -> Found<usize> {
       .ok_or_else(|| format!("no jne skips the gift button before {none:#x}"))
 }
 
+/// The entry of the function that pauses Spotify after you talk in voice for
+/// 30 s, found from its `spotify: playback auto paused` log line.
+///
+/// Both callers are its timer's poll, which passes `&Arc<state>` and drops the
+/// `Arc` itself afterwards, so a `ret` (`C3`) over its first byte skips the
+/// pause and leaves nothing owned behind. The head must be `push rbp; push rsi;
+/// push rdi; sub rsp, imm32`, before which nothing has run.
+pub fn spotify_auto_pause(image: &Image<'_>) -> Found<usize> {
+   const HEAD: [u8; 6] = [0x55, 0x56, 0x57, 0x48, 0x81, 0xEC];
+
+   let logs = literal(image, b"spotify: playback auto paused")
+      .into_iter()
+      .flat_map(|text| lea_refs(image, text))
+      .collect::<Vec<_>>();
+   let log = one("spotify auto pause log", &logs)?;
+   let (start, _) = image
+      .function_bounds(log)
+      .ok_or("spotify auto pause has no function bounds")?;
+   image
+      .read(start, HEAD.len())
+      .filter(|head| *head == HEAD)
+      .map(|_| start)
+      .ok_or_else(|| format!("spotify auto pause at {start:#x} has an unknown head"))
+}
+
+/// The `test r64, r64` that hides the Spotify activity while you are idle.
+///
+/// Presence building computes the activity's flag as `since == 0 && shown`
+/// with `test since, since; sete al; and al, [rsp + shown]; mov [rsp + d8],
+/// al`, and drops Spotify activities when it is false. `since` is the idle
+/// time, nonzero only while idle. Turning the `test` (`85`) into `cmp` (`39`)
+/// on the same register sets ZF, so the flag is `shown` alone. The opcode is
+/// one byte, so the rewrite is atomic.
+pub fn spotify_idle_activity(image: &Image<'_>) -> Found<usize> {
+   const FLAG: Pattern = Pattern::new("?? 85 ?? 0F 94 C0 22 84 24 ?? ?? 00 00 88 44 24");
+
+   let site = one("spotify idle flag", &image.scan(FLAG))?;
+   let code = image.read(site, 3).ok_or("spotify idle flag is unmapped")?;
+   let (rex, modrm) = (code[0], code[2]);
+   let same_reg = (rex & 0xF8) == 0x48
+      && (rex >> 2 & 1) == (rex & 1)
+      && modrm >> 6 == 0b11
+      && (modrm >> 3 & 7) == (modrm & 7);
+   if same_reg {
+      Ok(site + 1)
+   } else {
+      Err(format!("spotify idle flag at {site:#x} tests two registers"))
+   }
+}
+
 /// The type name `Entity::read` panics with for the channel sidebar's width
 /// state, `discord_desktop::ui::sidebar_resize::SidebarResize`.
 const SIDEBAR_RESIZE: &[u8] = b"discord_desktop::ui::sidebar_resize::SidebarResize";

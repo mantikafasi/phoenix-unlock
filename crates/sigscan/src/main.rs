@@ -514,6 +514,8 @@ fn check(
             }),
          );
          report("composer gift", desktop::composer_gift(image).map(at));
+         report("spotify auto pause", desktop::spotify_auto_pause(image).map(at));
+         report("spotify idle activity", desktop::spotify_idle_activity(image).map(at));
          if abi == x86::Abi::Win64 {
             report(
                "ready text",
