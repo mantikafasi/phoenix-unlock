@@ -29,6 +29,7 @@ mod message;
 mod modal;
 mod notices;
 mod os;
+mod rail;
 mod ready;
 #[cfg(windows)]
 mod restart;
@@ -238,6 +239,7 @@ pub fn prepare() -> Result<(), Error> {
    emoji::install(&image, &ix);
    #[cfg(windows)]
    gpui_theme::install(&image);
+   rail::install(&image, &ix);
    <os::Os as os::DesktopOs>::install(&image);
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {
