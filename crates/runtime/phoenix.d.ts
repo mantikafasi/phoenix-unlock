@@ -1056,7 +1056,7 @@ declare namespace Phoenix {
     readonly bridge: Bridge;
     /// `.theme.css` themes on Desktop Phoenix.
     readonly themes?: Themes;
-    /// Spotify behaviors to turn off, on Windows Desktop Phoenix.
+    /// Spotify behaviors to turn off, on Desktop Phoenix.
     readonly spotify?: Spotify;
   }
 

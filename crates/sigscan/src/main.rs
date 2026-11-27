@@ -739,6 +739,15 @@ fn check(
             }),
          );
          report(
+            "spotify auto pause",
+            phoenix_sigs::macos::spotify_auto_pause(image).map(at),
+         );
+         report(
+            "spotify idle activity",
+            phoenix_sigs::macos::spotify_idle_activity(image)
+               .map(|flag| format!("{} (patched {:#010x})", at(flag.site), flag.patched)),
+         );
+         report(
             "message context menu",
             phoenix_sigs::macos::message_context_menu(image).map(|menu| format!("{menu:x?}")),
          );

@@ -1734,6 +1734,72 @@ fn arm64_start_send_ok_tag(code: &[(usize, Insn)]) -> Option<u64> {
    None
 }
 
+/// `ret`, written over [`spotify_auto_pause`]'s entry.
+pub const RET: u32 = 0xD65F_03C0;
+
+/// The entry of the function that pauses Spotify after you talk in voice for
+/// 30 s, found from its `spotify: playback auto paused` log line.
+///
+/// Both callers are its timer's poll, which passes `&Arc<state>` at `[sp, #8]`
+/// and drops the `Arc` itself afterwards (the function only clones it), so
+/// [`RET`] over its first instruction skips the pause and leaves nothing owned
+/// behind. The head must be `stp _, _, [sp, #-n]!`, before which nothing has
+/// run.
+pub fn spotify_auto_pause(image: &Image<'_>) -> Found<usize> {
+   let logs = image.find_bytes(b"spotify: playback auto paused");
+   let (log, _) = one("spotify auto pause log", &refs_to(image, &logs))?;
+   let (start, _) = image
+      .function_bounds(log)
+      .ok_or("spotify auto pause has no function bounds")?;
+   image
+      .read_u32(start)
+      .filter(|&head| head & 0xFFC0_03E0 == 0xA980_03E0)
+      .map(|_| start)
+      .ok_or_else(|| format!("spotify auto pause at {start:#x} has an unknown head"))
+}
+
+/// The `csel` that hides the Spotify activity while you are idle, and the
+/// `mov` that replaces it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpotifyIdle {
+   pub site:    usize,
+   pub patched: u32,
+}
+
+/// Locates [`SpotifyIdle`].
+///
+/// Presence building takes `shown` in `w4` and computes the activity filter's
+/// flag as `cmp since, #0; csel wD, wzr, w4, ne; strb wD, [sp, #n]`, and the
+/// filter keeps the Spotify activity only when the flag is set. `since` is the
+/// idle time, nonzero only while idle. `mov wD, w4` in place of the `csel`
+/// makes the flag `shown` alone; `csel` sets no flags and `wD` is only stored.
+pub fn spotify_idle_activity(image: &Image<'_>) -> Found<SpotifyIdle> {
+   const FLAG: Pattern = Pattern::new("?? ?? 00 F1 ?? 13 84 1A ?? ?? 00 39");
+   const CSEL_WZR_W4_NE: u32 = 0x1A84_13E0;
+   const MOV_W4: u32 = 0x2A04_03E0;
+
+   let sites = image
+      .scan(FLAG)
+      .into_iter()
+      .filter(|&at| at.is_multiple_of(4))
+      .filter_map(|at| {
+         let [cmp, csel, strb] = [0, 4, 8].map(|off| image.read_u32(at + off));
+         let (cmp, csel, strb) = (cmp?, csel?, strb?);
+         let dst = csel & 0x1F;
+         (cmp & 0xFFFF_FC1F == 0xF100_001F
+            && csel & !0x1F == CSEL_WZR_W4_NE
+            && strb & 0xFFC0_03E0 == 0x3900_03E0
+            && strb & 0x1F == dst)
+            .then_some((at + 4, dst))
+      })
+      .collect::<Vec<_>>();
+   let (site, dst) = one("spotify idle flag", &sites)?;
+   Ok(SpotifyIdle {
+      site,
+      patched: MOV_W4 | dst,
+   })
+}
+
 /// The arm64 branch that skips building the composer's Nitro gift button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComposerGift {
