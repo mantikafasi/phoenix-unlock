@@ -1,15 +1,16 @@
 //! Spotify behaviors `phoenix.spotify` turns off, each a one-instruction
 //! rewrite of `libdiscord/crates/ops-spotify` and the presence builder.
 
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 use phoenix_hook::pattern::Pattern;
 
 use crate::{
    Found,
    index::{
+      Func,
       Index,
       Isa,
       Op,
+      Reg,
    },
 };
 
@@ -47,13 +48,14 @@ impl CodePatch {
 /// voice, which logs `spotify: playback auto paused`, made to return at once.
 ///
 /// Every caller is its timer's poll, which passes the address of its own
-/// `Arc` and takes that address again after the call to drop it, so the
-/// callee only borrows and returning early leaves nothing behind. The check
-/// requires that shape at every call site.
+/// `Arc` and reaches that slot again after the call to drop it, so the callee
+/// only borrows and returning early leaves nothing behind. The check requires
+/// that shape at every call site.
 pub fn auto_pause(ix: &Index<'_>) -> Found<CodePatch> {
    const ARM64_RET: [u8; 4] = 0xD65F_03C0_u32.to_le_bytes();
-   // The caller's `nop` after a call that may unwind sits between the two.
-   const REACH: usize = 2;
+   // Room for a `nop` after a call that may unwind, and for an inlined drop's
+   // first load.
+   const REACH: usize = 3;
 
    let func = ix
       .literal(b"spotify: playback auto paused")
@@ -72,14 +74,17 @@ pub fn auto_pause(ix: &Index<'_>) -> Found<CodePatch> {
          .iter()
          .position(|step| step.at == site)
          .ok_or_else(|| format!("spotify auto pause call {site:#x} does not decode"))?;
-      let lent = at.checked_sub(1).map(|before| steps[before].op);
-      let Some(Op::Offset { reg, .. }) = lent.filter(|&op| matches!(op, Op::Offset { .. })) else {
+      let Some(Op::Offset { reg, base, offset }) = at.checked_sub(1).map(|lend| steps[lend].op)
+      else {
          return Err(format!("spotify auto pause call {site:#x} passes no local's address"));
       };
-      let kept = steps[at + 1..]
-         .iter()
-         .take(REACH)
-         .any(|step| Some(step.op) == lent);
+      let kept = steps[at + 1..].iter().take(REACH).any(|step| {
+         matches!(
+            step.op,
+            Op::Offset { base: b, offset: o, .. } | Op::Load { base: b, offset: o, .. }
+               if b == base && o == offset
+         )
+      });
       if reg != this || !kept {
          return Err(format!("spotify auto pause call {site:#x} gives its argument away"));
       }
@@ -94,29 +99,125 @@ pub fn auto_pause(ix: &Index<'_>) -> Found<CodePatch> {
 
 /// The idle test that hides the Spotify activity while you are idle.
 ///
-/// The presence builder takes the user's state as its second argument (`idle:
-/// bool` at +0, `idle_since: u64` at +8) and whether Spotify is shown as its
-/// sixth. It keeps Spotify activities only when `idle_since == 0 && shown`,
-/// computed as `test since, since; sete r8; and r8, shown`, with `since` loaded
-/// from `[state + 8]` and `shown` in `r9b` on System V or the second stack
-/// argument on Win64. Turning the `test` (`85`) into `cmp` (`39`) on the same
-/// register sets ZF, so the flag is `shown` alone and presence keeps its
-/// `since`.
+/// The presence builder returns its activity through a hidden slot and takes
+/// the user's state first (`idle: bool` at +0, `idle_since: u64` at +8) and
+/// whether Spotify is shown fifth. It keeps Spotify activities only when
+/// `idle_since == 0 && shown`:
+///
+/// - x86-64 computes `test since, since; sete r8; and r8, shown`, with `shown`
+///   in `r9b` on System V or the second stack argument on Win64. Turning the
+///   `test` (`85`) into `cmp` (`39`) on the same register sets ZF.
+/// - arm64 computes `cmp since, #0; csel wD, wzr, w4, ne; strb wD, [sp, #n]`.
+///   `mov wD, w4` in place of the `csel` sets no flags either.
+///
+/// Either way the flag becomes `shown` alone and presence keeps its `since`.
 pub fn idle_activity(ix: &Index<'_>) -> Found<CodePatch> {
-   match ix.isa {
+   let state = arg_after_return_slot(ix.isa, 0).ok_or("no state argument register")?;
+   let shown = arg_after_return_slot(ix.isa, 4);
+   let candidates = match ix.isa {
       #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
       Isa::X86_64 { win64 } => {
-         let sites = ix
-            .image
+         ix.image
             .scan(Pattern::new("?? 85 ?? 0F 94 ??"))
             .into_iter()
-            .filter(|&site| x86::is_idle_flag(ix, site, win64))
-            .collect::<Vec<_>>();
-         let site = crate::one("spotify idle flag", &sites)?;
-         CodePatch::at(ix, site + 1, &[0x39])
+            .filter(|&site| x86::tests_since_and_shown(ix, site, win64, shown))
+            .collect::<Vec<_>>()
       },
-      Isa::Aarch64 => Err("the spotify idle flag is not located on arm64 yet".into()),
-      Isa::Thumb2 => Err("Desktop Phoenix has no Thumb-2 build".into()),
+      Isa::Aarch64 => {
+         let shown = shown.ok_or("no fifth argument register")?;
+         ix.image
+            .scan(Pattern::new("?? ?? 00 F1 ?? 13 ?? 1A ?? ?? ?? 39"))
+            .into_iter()
+            .filter(|&site| arm64::tests_since_and_shown(ix, site, shown))
+            .collect()
+      },
+      Isa::Thumb2 => return Err("Desktop Phoenix has no Thumb-2 build".into()),
+   };
+   let sites = candidates
+      .into_iter()
+      .filter(|&site| ix.function(site).is_some_and(|func| reads_idle_state(&func, site, state)))
+      .collect::<Vec<_>>();
+   let site = crate::one("spotify idle flag", &sites)?;
+   match ix.isa {
+      #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+      Isa::X86_64 { .. } => CodePatch::at(ix, site + 1, &[0x39]),
+      Isa::Aarch64 | Isa::Thumb2 => {
+         let csel = ix
+            .image
+            .read_u32(site + 4)
+            .ok_or_else(|| format!("{:#x} is unmapped", site + 4))?;
+         CodePatch::at(ix, site + 4, &arm64::mov_from_shown(csel).to_le_bytes())
+      },
+   }
+}
+
+/// Integer argument `index` of a function returning through a hidden slot,
+/// which x86-64 passes first and arm64 in `x8`.
+const fn arg_after_return_slot(isa: Isa, index: usize) -> Option<Reg> {
+   match isa {
+      #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+      Isa::X86_64 { .. } => isa.arg(index + 1),
+      Isa::Aarch64 | Isa::Thumb2 => isa.arg(index),
+   }
+}
+
+/// Whether `func` reads the state's `idle` byte and loads its `idle_since`
+/// before `site`.
+fn reads_idle_state(func: &Func<'_>, site: usize, state: Reg) -> bool {
+   const IDLE: isize = 0;
+   const SINCE: isize = 8;
+   let steps = func.steps();
+   let before = steps.iter().take_while(|step| step.at < site);
+   let reads_idle = before.clone().any(|step| {
+      matches!(
+         step.op,
+         Op::CmpMem { base, offset: IDLE, size: 1, value: 0 }
+            | Op::Load { base, offset: IDLE, size: 1, .. } if base == state
+      )
+   });
+   let loads_since = before.clone().any(|step| {
+      matches!(step.op, Op::Load { base, offset: SINCE, size: 8, .. } if base == state)
+   });
+   reads_idle && loads_since
+}
+
+mod arm64 {
+   use crate::index::{
+      Index,
+      Reg,
+   };
+
+   const CSEL_W: u32 = 0x1A80_0000;
+   const NE: u32 = 1;
+   const ZR: u32 = 31;
+
+   const fn field(word: u32, at: u32) -> u32 {
+      (word >> at) & 0x1F
+   }
+
+   /// `cmp xS, #0; csel wD, wzr, w(shown), ne; strb wD, [sp, #n]`.
+   pub(super) fn tests_since_and_shown(ix: &Index<'_>, site: usize, shown: Reg) -> bool {
+      if !site.is_multiple_of(4) {
+         return false;
+      }
+      let [Some(cmp), Some(csel), Some(strb)] = [0, 4, 8].map(|off| ix.image.read_u32(site + off))
+      else {
+         return false;
+      };
+      let flag = field(csel, 0);
+      let csel_shown = CSEL_W | u32::from(shown) << 16 | NE << 12 | ZR << 5;
+      cmp & 0xFFFF_FC1F == 0xF100_001F
+         && field(cmp, 5) != ZR
+         && csel & !0x1F == csel_shown
+         && strb & 0xFFC0_03E0 == 0x3900_03E0
+         && field(strb, 0) == flag
+   }
+
+   /// `mov wD, w(shown)` (`orr wD, wzr, w(shown)`) for `csel wD, wzr, w(shown),
+   /// ne`.
+   pub(super) const fn mov_from_shown(csel: u32) -> u32 {
+      const ORR_W_ZR: u32 = 0x2A00_03E0;
+      ORR_W_ZR | (csel & (0x1F << 16)) | (csel & 0x1F)
    }
 }
 
@@ -133,13 +234,11 @@ mod x86 {
 
    use crate::index::{
       Index,
-      Op,
+      Reg,
    };
 
    // Above the return address, the 32-byte shadow space and the fifth argument.
    const WIN64_SIXTH: u64 = 0x30;
-   const IDLE: isize = 0;
-   const SINCE: isize = 8;
 
    fn decode<const N: usize>(ix: &Index<'_>, at: usize) -> Option<[Instruction; N]> {
       const LONGEST: usize = 15;
@@ -149,11 +248,15 @@ mod x86 {
       insns.iter().all(|insn| !insn.is_invalid()).then_some(insns)
    }
 
-   fn number(reg: Register) -> Option<u8> {
-      u8::try_from(reg.full_register().number()).ok()
-   }
-
-   pub(super) fn is_idle_flag(ix: &Index<'_>, site: usize, win64: bool) -> bool {
+   /// `test r64, r64` on one register, `sete r8`, `and r8, shown`, where
+   /// `shown` is the register the ABI names or, on Win64, the stack slot of
+   /// the sixth argument.
+   pub(super) fn tests_since_and_shown(
+      ix: &Index<'_>,
+      site: usize,
+      win64: bool,
+      shown: Option<Reg>,
+   ) -> bool {
       let Some([test, set, and]) = decode::<3>(ix, site) else {
          return false;
       };
@@ -171,45 +274,19 @@ mod x86 {
       if !shape {
          return false;
       }
-      let Some(func) = ix.function(site) else {
-         return false;
-      };
-      let sixth = if win64 {
+      if win64 {
          and.op1_kind() == OpKind::Memory
             && and.memory_base() == Register::RSP
             && and.memory_index() == Register::None
-            && frame_below_return(ix, func.start).is_some_and(|frame| {
-               and.memory_displacement64() == frame + WIN64_SIXTH
+            && ix.function(site).is_some_and(|func| {
+               frame_below_return(ix, func.start)
+                  .is_some_and(|frame| and.memory_displacement64() == frame + WIN64_SIXTH)
             })
       } else {
          and.op1_kind() == OpKind::Register
             && and.op1_register().is_gpr8()
-            && number(and.op1_register()) == ix.isa.arg(5)
-      };
-      let (Some(state), Some(since)) = (ix.isa.arg(1), number(since)) else {
-         return false;
-      };
-      let steps = func.steps();
-      let before = steps.iter().take_while(|step| step.at < site);
-      let reads_idle = before.clone().any(|step| {
-         step.op
-            == Op::CmpMem {
-               base:   state,
-               offset: IDLE,
-               size:   1,
-               value:  0,
-            }
-      });
-      let loads_since = before.clone().any(|step| {
-         step.op
-            == Op::Load {
-               reg:    since,
-               base:   state,
-               offset: SINCE,
-               size:   8,
-            }
-      });
-      sixth && reads_idle && loads_since
+            && u8::try_from(and.op1_register().full_register().number()).ok() == shown
+      }
    }
 
    fn frame_below_return(ix: &Index<'_>, start: usize) -> Option<u64> {
