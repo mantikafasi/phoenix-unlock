@@ -842,7 +842,9 @@ pub struct PlaybackAllowlist {
    pub allowlist: usize,
 }
 
-/// The Linux playback policy ranks decoder features itself. Its fallback uses
+/// The Linux playback policy ranks decoder features itself.
+///
+/// Its fallback uses
 /// only the three software video decoders, even though its general allowlist
 /// also names `avdec_aac` and `fdkaacdec`; retargeting that one lookup keeps
 /// the AAC decoders usable to `decodebin`.
