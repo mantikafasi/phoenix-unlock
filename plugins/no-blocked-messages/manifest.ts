@@ -10,6 +10,6 @@ export default {
          "relationshipUpdate",
          "relationshipRemove",
       ],
-      discord: ["GET /**"],
+      discord: ["GET /users/@me/relationships", "GET /channels/*/messages"],
    },
 } satisfies Phoenix.Manifest;

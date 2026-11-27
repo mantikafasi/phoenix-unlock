@@ -85,15 +85,9 @@ const loadRelationships = async () => {
 // Warm from disk so the first messages after start are filtered before the GET returns.
 readCache();
 // Desktop has no session until its own first API request, so a load at
-// startup fails there. Try again after the first response.
-loadRelationships().catch(() => {
-  const stop = phoenix.discord.onResponse({ method: "GET" }, () => {
-    stop();
-    loadRelationships().catch((e) =>
-      phoenix.log.error("no-blocked-messages: failed to load relationships", e),
-    );
-  });
-});
+// startup fails there. Try again when it first loads a channel's history.
+let retry = false;
+loadRelationships().catch(() => (retry = true));
 
 // Keep sets in sync when Discord returns the full list again.
 phoenix.discord.onResponse(
@@ -141,6 +135,12 @@ phoenix.hook(gateway.messageUpdate, {
 phoenix.discord.onResponse(
   { method: "GET", pathPrefix: "/channels/", pathSuffix: "/messages" },
   (res) => {
+    if (retry) {
+      retry = false;
+      loadRelationships().catch((e) =>
+        phoenix.log.error("no-blocked-messages: failed to load relationships", e),
+      );
+    }
     if (res.status < 200 || res.status >= 300) return;
     const list = res.json<unknown>();
     if (!Array.isArray(list)) return;
