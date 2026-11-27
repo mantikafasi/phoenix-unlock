@@ -168,11 +168,14 @@ impl PluginState {
 /// A plugin as the settings page shows it.
 #[derive(Clone, Debug)]
 pub struct PluginInfo {
-   pub name:      String,
-   pub state:     PluginState,
-   pub installed: bool,
-   pub header:    Header,
-   pub settings:  Vec<Setting>,
+   pub name:        String,
+   pub state:       PluginState,
+   pub installed:   bool,
+   pub header:      Header,
+   pub settings:    Vec<Setting>,
+   /// Empty when the plugin declares nothing or its lines do not parse, which
+   /// its failed `state` then says.
+   pub permissions: Vec<permissions::Grant>,
 }
 
 /// The `// @key value` lines a bundle starts with.

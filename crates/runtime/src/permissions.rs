@@ -12,6 +12,7 @@
 
 use std::{
    collections::BTreeSet,
+   fmt,
    str::FromStr,
 };
 
@@ -49,6 +50,74 @@ pub struct Declared {
 struct Route {
    method:   Option<String>,
    segments: Vec<Segment>,
+}
+
+/// One thing a plugin reaches, as its settings page lists it.
+#[derive(Clone, Debug)]
+pub enum Grant {
+   Events(Vec<String>),
+   GatewaySend(Vec<u32>),
+   Discord(String),
+   Fetch(Vec<String>),
+   Stores,
+   Messages,
+   Bridge,
+}
+
+impl Grant {
+   #[must_use]
+   pub const fn label(&self) -> &'static str {
+      match self {
+         Self::Events(_) => "Gateway events",
+         Self::GatewaySend(_) => "Gateway sends",
+         Self::Discord(_) => "Discord API",
+         Self::Fetch(_) => "Web hosts",
+         Self::Stores => "Message cache",
+         Self::Messages => "Outgoing messages",
+         Self::Bridge => "Host modules",
+      }
+   }
+}
+
+impl fmt::Display for Grant {
+   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+      match self {
+         Self::Events(names) | Self::Fetch(names) => formatter.write_str(&names.join(", ")),
+         Self::GatewaySend(ops) => {
+            let ops = ops.iter().map(u32::to_string).collect::<Vec<_>>();
+            write!(formatter, "opcode {}", ops.join(", "))
+         },
+         Self::Discord(route) => formatter.write_str(route),
+         Self::Stores => formatter.write_str("read"),
+         Self::Messages => formatter.write_str("read and rewrite"),
+         Self::Bridge => formatter.write_str("full access"),
+      }
+   }
+}
+
+impl fmt::Display for Route {
+   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+      formatter.write_str(self.method.as_deref().unwrap_or("*"))?;
+      formatter.write_str(" ")?;
+      for segment in &self.segments {
+         formatter.write_str("/")?;
+         match segment {
+            Segment::Literal(literal) => formatter.write_str(literal)?,
+            Segment::Any => formatter.write_str("*")?,
+            Segment::Rest => formatter.write_str("**")?,
+         }
+      }
+      Ok(())
+   }
+}
+
+impl fmt::Display for Host {
+   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+      match self {
+         Self::Exact(name) => formatter.write_str(name),
+         Self::Under(name) => write!(formatter, "*.{name}"),
+      }
+   }
 }
 
 enum Segment {
@@ -212,6 +281,40 @@ pub fn url_host(url: &str) -> Option<String> {
 }
 
 impl Permissions {
+   /// What the plugin declared. The console declares nothing.
+   #[must_use]
+   pub fn grants(&self) -> Vec<Grant> {
+      let Self::Declared(declared) = self else {
+         return Vec::new();
+      };
+      let mut grants = Vec::new();
+      if !declared.gateway.is_empty() {
+         grants.push(Grant::Events(declared.gateway.iter().cloned().collect()));
+      }
+      if !declared.gateway_send.is_empty() {
+         grants.push(Grant::GatewaySend(declared.gateway_send.iter().copied().collect()));
+      }
+      grants.extend(
+         declared
+            .discord
+            .iter()
+            .map(|route| Grant::Discord(route.to_string())),
+      );
+      if !declared.fetch.is_empty() {
+         grants.push(Grant::Fetch(declared.fetch.iter().map(Host::to_string).collect()));
+      }
+      for (granted, grant) in [
+         (declared.stores, Grant::Stores),
+         (declared.messages, Grant::Messages),
+         (declared.bridge, Grant::Bridge),
+      ] {
+         if granted {
+            grants.push(grant);
+         }
+      }
+      grants
+   }
+
    #[must_use]
    pub fn event(&self, name: &str) -> bool {
       match self {

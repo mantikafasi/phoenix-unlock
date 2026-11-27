@@ -363,6 +363,10 @@ impl Engine {
                   installed: !matches!(loaded.origin, Origin::Bundled),
                   header: Header::from(loaded.source.as_str()),
                   settings,
+                  permissions: loaded
+                     .source
+                     .parse::<Permissions>()
+                     .map_or_else(|_| Vec::new(), |permissions| permissions.grants()),
                }
             })
             .collect()

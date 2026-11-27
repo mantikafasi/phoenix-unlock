@@ -1764,6 +1764,12 @@ fn render_plugins_tab(
             DesktopCompat::Unverified => desc_parts.push("Unverified on desktop".to_owned()),
          }
       }
+      if plugin.permissions.is_empty() {
+         desc_parts.push("No permissions".to_owned());
+      } else {
+         let grants = plugin.permissions.iter().map(ToString::to_string);
+         desc_parts.push(format!("Reaches {}", grants.collect::<Vec<_>>().join(", ")));
+      }
       if let Some(err) = plugin.state.error() {
          desc_parts.push(format!("Error: {err}"));
       }
