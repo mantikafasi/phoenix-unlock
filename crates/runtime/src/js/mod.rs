@@ -2,6 +2,7 @@ pub mod background;
 mod hooks;
 pub mod http;
 mod intercept;
+mod lockdown;
 pub mod messages;
 mod settings;
 mod storage;
@@ -78,6 +79,7 @@ use crate::{
          discord_object,
          start_fetch,
       },
+      lockdown::lockdown,
       messages::messages_object,
       settings::{
          Definition,
@@ -102,6 +104,9 @@ const HEAP_LIMIT: usize = 128 << 20;
 pub struct Engine {
    runtime: Runtime,
    context: Context,
+   /// The debug shell's prompt, a realm of its own so its unrestricted
+   /// `phoenix` never sits in the plugins' frozen globals.
+   console: Context,
    budget:  Arc<Budget>,
    plugins: BTreeMap<String, Loaded>,
 }
@@ -230,11 +235,15 @@ unsafe impl<'js> JsLifetime<'js> for Registry<'js> {
    type Changed<'to> = Registry<'to>;
 }
 
-/// A plugin's source as a function of its `phoenix` object, which the engine
-/// calls to load it.
-#[must_use]
-pub fn wrap(source: &str) -> String {
-   format!("(function (phoenix) {{\n{source}\n}})")
+/// A plugin's source as the body of a function of its `phoenix` object.
+///
+/// The realm's `Function` constructor parses it as a function body, so the
+/// source cannot close the function early and declare script-level bindings
+/// every other plugin's free names would resolve to.
+pub fn compile<'js>(ctx: &Ctx<'js>, source: &str) -> rquickjs::Result<Function<'js>> {
+   ctx.globals()
+      .get::<_, Function<'js>>("Function")?
+      .call(("phoenix", source))
 }
 
 #[expect(clippy::needless_pass_by_value, reason = "used as a map_err callback")]
@@ -266,21 +275,28 @@ impl Engine {
       let watched = Arc::clone(&budget);
       runtime.set_interrupt_handler(Some(Box::new(move || watched.spent())));
       let context = Context::full(&runtime).map_err(|err| Error::Js(err.to_string()))?;
+      let console = Context::full(&runtime).map_err(|err| Error::Js(err.to_string()))?;
       budget.restart();
       context.with(|ctx| {
          let registry = registry(&ctx, events, Arc::clone(&budget))
             .catch(&ctx)
             .map_err(js_error)?;
+         let handles = registry
+            .handles
+            .iter()
+            .map(|(.., handle)| handle.clone().into_value())
+            .collect();
          ctx.store_userdata(registry)
             .map_err(|err| Error::Js(err.to_string()))?;
          if let Some(platform) = crate::platform() {
             platform.init(&ctx).catch(&ctx).map_err(js_error)?;
          }
-         Ok::<_, Error>(())
+         lockdown(&ctx, handles).catch(&ctx).map_err(js_error)
       })?;
       Ok(Self {
          runtime,
          context,
+         console,
          budget,
          plugins: BTreeMap::new(),
       })
@@ -358,7 +374,7 @@ impl Engine {
       let Some(loaded) = self.plugins.get(name) else {
          return;
       };
-      let source = wrap(&loaded.source);
+      let source = loaded.source.as_str();
       let outcome = loaded
          .source
          .parse::<Permissions>()
@@ -368,7 +384,7 @@ impl Engine {
             self.with(|ctx| {
                let run = || -> rquickjs::Result<()> {
                   let phoenix = api(&ctx, name, &permissions)?;
-                  ctx.eval::<Function<'_>, _>(source)?.call((phoenix,))
+                  compile(&ctx, source)?.call((phoenix,))
                };
                run().catch(&ctx).map_err(js_error)
             })
@@ -552,7 +568,8 @@ impl Engine {
    /// The result as JSON when it has a JSON form, else as `String(result)`.
    /// The prompt sees a `phoenix` object of its own, named "console".
    pub fn evaluate(&self, code: &str) -> Result<String, Error> {
-      self.with(|ctx| {
+      self.budget.restart();
+      let result = self.console.with(|ctx| {
          let run = || -> rquickjs::Result<String> {
             if !ctx.globals().contains_key("phoenix")? {
                let phoenix = api(&ctx, "console", &Arc::new(Permissions::Console))?;
@@ -575,7 +592,9 @@ impl Engine {
             }
          };
          run().catch(&ctx).map_err(js_error)
-      })
+      });
+      self.drain();
+      result
    }
 }
 
@@ -587,17 +606,13 @@ pub fn restart_budget(ctx: &Ctx<'_>) {
    }
 }
 
-/// One frozen handle per live registry entry. Plugins compare nothing and parse
-/// nothing, the runtime recognizes a handle by identity.
+/// One handle per live registry entry, frozen by [`lockdown`]. Plugins compare
+/// nothing and parse nothing, the runtime recognizes a handle by identity.
 fn registry<'js>(
    ctx: &Ctx<'js>,
    events: &GatewayRegistry,
    budget: Arc<Budget>,
 ) -> rquickjs::Result<Registry<'js>> {
-   let freeze = ctx
-      .globals()
-      .get::<_, Object>("Object")?
-      .get::<_, Function>("freeze")?;
    let mut handles = Vec::new();
    for (event, entry) in events.iter() {
       let key = camel_case(&entry.name);
@@ -607,7 +622,6 @@ fn registry<'js>(
          "toString",
          Function::new(ctx.clone(), move || label.clone())?,
       )?;
-      let handle = freeze.call::<_, Object<'js>>((handle,))?;
       handles.push((event, key, handle));
    }
    Ok(Registry {
