@@ -85,6 +85,16 @@ pub fn plugin_sections(index: usize, plugin: &PluginInfo) -> Vec<Tree> {
       }
    }
    info.push(value_row("Status", status));
+   let permissions = if plugin.permissions.is_empty() {
+      vec![value_row("Reaches", "its own settings and storage only")]
+   } else {
+      plugin
+         .permissions
+         .iter()
+         .map(|grant| value_row(grant.label(), &grant.to_string()))
+         .collect()
+   };
+   sections.push(section("Permissions", permissions));
    sections.push(section("Info", info));
    sections
 }
