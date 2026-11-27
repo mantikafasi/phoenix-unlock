@@ -30,7 +30,10 @@ mod os;
 #[cfg(windows)]
 mod restart;
 mod settings;
+mod shortcuts;
+mod sidebar;
 mod staff;
+mod toolbar;
 
 use std::{
    ffi::c_void,
@@ -219,6 +222,8 @@ pub fn prepare() -> Result<(), Error> {
    }
    icons::install(&image);
    composer::install(&image);
+   sidebar::install(&image);
+   toolbar::install(&image);
    badges::install(&image);
    emoji::install(&image);
    <os::Os as os::DesktopOs>::install(&image);
