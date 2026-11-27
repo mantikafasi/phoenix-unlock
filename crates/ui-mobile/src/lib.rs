@@ -27,9 +27,12 @@ use serde::{
 
 use crate::motion::Worklet;
 
+pub mod accent;
 pub mod inspect;
 pub mod mirror;
 pub mod motion;
+mod word_lists;
+pub use word_lists::expand_word_patches;
 
 /// The prop and event name table (`lh/c2.a`, versionCode 356207). The index is
 /// the wire key.

@@ -1008,7 +1008,26 @@ declare namespace Phoenix {
     define<const S extends Record<string, SettingSpec>>(schema: S): SettingValues<S>;
   }
 
+  type MonetTone = 0 | 10 | 50 | 100 | 200 | 300 | 400 | 500 | 600 | 700 | 800 | 900 | 1000;
+  type MonetPalette = Record<"accent1" | "accent2" | "accent3" | "neutral1" | "neutral2", Record<MonetTone, number>>;
+  interface SystemAppearance {
+    /** Android UI_MODE_NIGHT, or null when unspecified. */
+    dark: boolean | null;
+    /** Unsigned ARGB framework colors on Android 12+, or null if unavailable. */
+    monet: MonetPalette | null;
+  }
+
   interface Api {
+    /** Android system resources. Each call returns a fresh snapshot. */
+    readonly appearance?: {
+      get(): SystemAppearance | null;
+      /** Overrides Android host brand, brandText and window content background on subsequent theme writes. Removed on unload. */
+      setChromeColors?(brand: number, onBrand: number, background: number): () => void;
+      /** Paint the Android status-bar inset until this plugin unloads. */
+      setStatusBarColor?(color: number, darkIcons: boolean): void;
+      /** Rechecks system colors on appearance and app lifecycle events. Returns an unsubscribe function. */
+      onChange(listener: (state: SystemAppearance) => void): () => void;
+    };
     readonly gateway: Gateway;
     /// Observes a hook point after the client handled it.
     on<P>(sig: Sig<P>, listener: (payload: P) => void): void;
@@ -1215,6 +1234,8 @@ declare namespace Phoenix {
   type NodeMatch = string | { exact: string } | { prefix: string };
 
   interface NodeInfo {
+    /// Original accessibilityChecked when the host supplies a Boolean.
+    readonly checked: boolean | null;
     readonly id: number;
     /// Phoenix `ViewKind` when Remote Debug Shell is enabled, else `null`.
     readonly kind: string | null;
@@ -1403,6 +1424,8 @@ declare namespace Phoenix {
   /// land a moment after the screen they belong to. Everything goes away when the plugin is
   /// turned off.
   interface Ui {
+    /// Android window renderer for M3E action backgrounds and channel list corners.
+    readonly androidControlSurfaces?: boolean;
     /// In the chat header, left of search. On Windows Desktop Phoenix, in the channel toolbar after the
     /// member list button (where Discord shows one), with `label` as its tooltip and `icon` mapped
     /// to Mana's icon of that name (`res://ic_mana_panel_open` is `PanelOpen`); `tint` is ignored.
@@ -1510,6 +1533,10 @@ declare namespace Phoenix {
     dispatch(node: number, event: string, payload?: Record<string, unknown>): boolean;
     /// Runs when a Phoenix node whose `accessibilityId` matches `match` is created.
     onNode(match: NodeMatch, handler: (node: NodeInfo) => void): Remover;
+    /// Observes original accessibilityChecked writes, including creation and removal.
+    onChecked(handler: (node: NodeInfo) => void): Remover;
+    /// Fires on native accessibilitySelected changes, including anonymous tabs and radios.
+    onSelected?(handler: (node: NodeInfo) => void): Remover;
     /// Declaratively patches props synchronously inside Rust's UI batch rewriter (zero JS
     /// overhead per frame). Use `addOn` to append event names to `on` without clobbering Phoenix's
     /// existing listeners.
@@ -1526,11 +1553,35 @@ declare namespace Phoenix {
     findDown(root: number, match: NodeMatch, maxDepth?: number): number | null;
     /// Reads live tree metadata for `id` from Phoenix's mirrored view tree.
     node(id: number): NodeInfo | null;
+    /// Remaps resolved Discord UI brand and link colors. Colors are ARGB. Removed on plugin unload.
+    setAccentPalette?(primary: number, onPrimary: number, container: number): void;
+    /// Original host surface facts, available without debug capture.
+    surface(id: number): Readonly<{
+      kind: "view" | "stack" | "list" | "scroll" | "image" | "text" | "markup" | "ring" | "other";
+      role?: string | null;
+      selected?: boolean | null;
+      disabled?: boolean;
+      height: number | null;
+      opaque: boolean;
+      backplate: boolean;
+      topLeft: number;
+      topRight: number;
+      padding?: [number, number, number, number];
+      margin?: [number, number, number, number];
+      fill: number | null;
+      brandFill?: boolean;
+      pressable: boolean;
+      horizontal: boolean;
+      gradient: boolean;
+    }> | null;
     /// The live root Phoenix node id (`Op::Root`), or `null` if not yet seen.
     root(): number | null;
     /// Mounts a raw Phoenix UI subtree onto `parentId` (or `"root"` for the root view). Returns a
     /// function that unmounts and deletes all created nodes.
-    mount(parentId: number | "root", node: MountNode, options?: MountOptions): Remover;
+    mount(parentId: number | "root", node: MountNode, options?: MountOptions): Remover & {
+      /// True once the subtree is mounted and until its parent is recycled or it is removed.
+      isMounted?(): boolean;
+    };
     /// Shows a native Discord in-app notification banner at the top of the screen, or in the
     /// bottom right corner on desktop, under the plugin's name. Desktop shows the three newest at
     /// once and the others after one is closed. Returns a function that dismisses it early.

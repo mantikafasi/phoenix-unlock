@@ -67,6 +67,7 @@ use crate::{
 };
 
 pub enum Job {
+   RefreshAccents,
    Refresh(Target),
    Evaluate(ContributionId, Place),
    Evaluated(ContributionId, Place, Outcome),
@@ -225,6 +226,7 @@ pub fn queue(job: Job) {
 /// The engine and the patch state are never held together.
 pub fn run(job: Job) -> Vec<Op> {
    match job {
+      Job::RefreshAccents => patches().refresh_accents(),
       Job::Refresh(target) => patches().redraw(target),
       Job::Select {
          pager,

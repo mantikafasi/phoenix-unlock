@@ -51,10 +51,11 @@ pub enum Method {
    MediaPickerRead,
    MediaPickerRelease,
    TimingSet,
+   AppStateSetTheme,
 }
 
 impl Method {
-   const ALL: [Self; 8] = [
+   const ALL: [Self; 9] = [
       Self::NetworkingRequest,
       Self::LinkingOpenUrl,
       Self::SystemOverlayToast,
@@ -63,6 +64,7 @@ impl Method {
       Self::MediaPickerRead,
       Self::MediaPickerRelease,
       Self::TimingSet,
+      Self::AppStateSetTheme,
    ];
 
    const fn name(self) -> &'static str {
@@ -75,6 +77,7 @@ impl Method {
          Self::MediaPickerRead => "MediaPicker.read",
          Self::MediaPickerRelease => "MediaPicker.release",
          Self::TimingSet => "Timing.set",
+         Self::AppStateSetTheme => "AppState.setTheme",
       }
    }
 
@@ -92,10 +95,20 @@ pub enum Event {
    Read,
    Timer,
    Ws,
+   Appearance,
+   App,
 }
 
 impl Event {
-   const ALL: [Self; 5] = [Self::Http, Self::Picked, Self::Read, Self::Timer, Self::Ws];
+   const ALL: [Self; 7] = [
+      Self::Http,
+      Self::Picked,
+      Self::Read,
+      Self::Timer,
+      Self::Ws,
+      Self::Appearance,
+      Self::App,
+   ];
 
    const fn name(self) -> &'static str {
       match self {
@@ -104,6 +117,8 @@ impl Event {
          Self::Read => "@read",
          Self::Timer => "@timer",
          Self::Ws => "@ws",
+         Self::Appearance => "@appearance",
+         Self::App => "@app",
       }
    }
 }
@@ -127,10 +142,13 @@ pub enum Field {
    Name,
    Denied,
    Delay,
+   Brand,
+   BrandText,
+   Background,
 }
 
 impl Field {
-   const ALL: [Self; 16] = [
+   const ALL: [Self; 19] = [
       Self::Id,
       Self::Error,
       Self::Method,
@@ -147,6 +165,9 @@ impl Field {
       Self::Name,
       Self::Denied,
       Self::Delay,
+      Self::Brand,
+      Self::BrandText,
+      Self::Background,
    ];
 
    const fn name(self) -> &'static str {
@@ -167,6 +188,9 @@ impl Field {
          Self::Name => "name",
          Self::Denied => "denied",
          Self::Delay => "delay",
+         Self::Brand => "brand",
+         Self::BrandText => "brandText",
+         Self::Background => "background",
       }
    }
 }

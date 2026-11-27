@@ -196,6 +196,9 @@ impl Sink for PatchSink {
             return Action::Pass;
          },
       };
+      if !phoenix_ui_mobile::expand_word_patches(&mut ops) {
+         return Action::Pass;
+      }
       if debug {
          crate::debug::record_ops(&ops);
       }
@@ -215,7 +218,11 @@ impl Sink for PatchSink {
    }
 
    fn dispatch(&self, frame: &[u8]) -> Action {
-      if !ACTIVE.load(Ordering::Acquire) && !phoenix_runtime::remote::enabled() {
+      #[cfg(target_os = "android")]
+      let appearance = crate::appearance::active();
+      #[cfg(not(target_os = "android"))]
+      let appearance = false;
+      if !appearance && !ACTIVE.load(Ordering::Acquire) && !phoenix_runtime::remote::enabled() {
          return Action::Pass;
       }
       patches().filter(frame)
@@ -225,7 +232,7 @@ impl Sink for PatchSink {
 impl Patches {
    /// Mirrors `ops` and splices plugin nodes in. `None` leaves the batch as
    /// it was.
-   fn rewrite(&mut self, ops: Vec<Op>, restored: bool) -> Option<Vec<Op>> {
+   fn rewrite(&mut self, mut ops: Vec<Op>, restored: bool) -> Option<Vec<Op>> {
       let mut mine = Vec::new();
       let mut touched = HashSet::new();
       let mut patch_ops: HashMap<i32, (Props, Vec<String>)> = HashMap::new();
@@ -250,6 +257,7 @@ impl Patches {
          let skip_action_placement =
             self.match_prop_patches(&named, &created, &mut patch_ops, &mut list_updates);
          self.notify_watchers(&named);
+         self.notify_checked(&ops);
          self.learn(&named, &ops, &created);
          self.anchor(
             named,
@@ -272,6 +280,7 @@ impl Patches {
          self.suggest(&mut extra);
       }
 
+      let repainted = self.accents.rewrite(&mut ops, &self.mirror);
       let hidden_ops = self.reconcile_hidden();
       let slot_parents = self
          .slots
@@ -285,6 +294,7 @@ impl Patches {
          && patch_ops.is_empty()
          && list_updates.is_empty()
          && !restored
+         && !repainted
          && !self.rewrites(&ops, &slot_parents)
       {
          return None;

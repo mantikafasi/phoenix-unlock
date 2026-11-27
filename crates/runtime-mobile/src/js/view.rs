@@ -143,7 +143,27 @@ pub fn node_created(engine: &Engine, watcher_ids: &[u64], info: &NodeInfo) {
    });
 }
 
+fn add_palette_hook<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rquickjs::Result<()> {
+   let owner = plugin.to_owned();
+   ui.set(
+      "setAccentPalette",
+      Function::new(
+         ctx.clone(),
+         move |primary: u32, on_primary: u32, container: u32| {
+            patches::set_accents(&owner, phoenix_ui_mobile::accent::Palette {
+               primary,
+               on_primary,
+               container,
+            });
+         },
+      )?,
+   )
+}
+
 pub fn add_view_hooks<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rquickjs::Result<()> {
+   #[cfg(target_os = "android")]
+   ui.set("androidControlSurfaces", true)?;
+   add_palette_hook(ctx, plugin, ui)?;
    let owner = plugin.to_owned();
    ui.set(
       "hide",
@@ -180,6 +200,18 @@ pub fn add_view_hooks<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rq
          },
       )?,
    )?;
+   for (name, matcher) in [
+      ("onChecked", NodeMatch::Checked),
+      ("onSelected", NodeMatch::Selected),
+   ] {
+      let owner = plugin.to_owned();
+      ui.set(
+         name,
+         Function::new(ctx.clone(), move |ctx: Ctx<'js>, handler: Function<'js>| {
+            on_node_created(&ctx, &owner, matcher.clone(), handler)
+         })?,
+      )?;
+   }
    let owner = plugin.to_owned();
    ui.set(
       "onNode",
@@ -299,6 +331,40 @@ pub fn add_view_queries<'js>(ctx: &Ctx<'js>, ui: &Object<'js>) -> rquickjs::Resu
          },
       )?,
    )?;
+   ui.set(
+      "surface",
+      Function::new(
+         ctx.clone(),
+         |ctx: Ctx<'js>, id: i32| -> rquickjs::Result<Value<'js>> {
+            let Some(surface) = patches::nodes::surface(id) else {
+               return Ok(Value::new_null(ctx));
+            };
+            let obj = Object::new(ctx)?;
+            obj.set("kind", surface.kind)?;
+            obj.set("role", surface.role)?;
+            obj.set("selected", surface.selected)?;
+            obj.set("disabled", surface.disabled)?;
+            obj.set("height", surface.height)?;
+            obj.set("opaque", surface.opaque)?;
+            obj.set("backplate", surface.backplate)?;
+            obj.set("pressable", surface.pressable)?;
+            obj.set("horizontal", surface.horizontal)?;
+            let [left, right] = surface.top_corners();
+            obj.set("topLeft", left)?;
+            obj.set("topRight", right)?;
+            if let Some(edges) = surface.padding {
+               obj.set("padding", edges.to_vec())?;
+            }
+            if let Some(edges) = surface.margin {
+               obj.set("margin", edges.to_vec())?;
+            }
+            obj.set("brandFill", surface.brand_fill())?;
+            obj.set("fill", surface.fill().map(f64::from))?;
+            obj.set("gradient", surface.gradient())?;
+            Ok(obj.into_value())
+         },
+      )?,
+   )?;
    ui.set("root", Function::new(ctx.clone(), patches::root_id)?)?;
    Ok(())
 }
@@ -398,6 +464,13 @@ pub fn node_info_object<'js>(ctx: &Ctx<'js>, info: &NodeInfo) -> rquickjs::Resul
    let obj = Object::new(ctx.clone())?;
    obj.set("id", info.id)?;
    obj.set("kind", info.kind.clone())?;
+   obj.set(
+      "checked",
+      info.checked.map_or_else(
+         || Value::new_null(ctx.clone()),
+         |checked| Value::new_bool(ctx.clone(), checked),
+      ),
+   )?;
    obj.set("accessibilityId", info.accessibility_id.clone())?;
    obj.set("parent", info.parent)?;
    obj.set("children", info.children.clone())?;

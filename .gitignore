@@ -22,6 +22,8 @@
 !crates/*/
 !crates/*/Cargo.toml
 !crates/*/build.rs
+!crates/runtime-mobile/android/
+!crates/runtime-mobile/android/*.java
 !crates/loader/winres.rs
 !crates/*/src/
 !crates/*/src/**/
@@ -55,6 +57,7 @@
 !plugins/*/src/
 !plugins/*/src/**/
 !plugins/*/src/**/*.ts
+!plugins/m3e-theme/src/theme.js
 !plugins/tsconfig.json
 
 !scripts/

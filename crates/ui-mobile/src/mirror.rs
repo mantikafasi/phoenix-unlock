@@ -16,6 +16,182 @@ use crate::{
    set_prop,
 };
 
+const BG: Prop = Prop::named("bg");
+const BACKGROUND: Prop = Prop::named("background");
+const GRADIENTS: [Prop; 5] = [
+   Prop::named("backgroundGradient"),
+   Prop::named("gradient"),
+   Prop::named("maskGradient"),
+   Prop::named("gradientMask"),
+   Prop::named("activeBackgroundGradient"),
+];
+
+/// Original host paint and layout facts, independent of debug capture and
+/// plugin styling.
+#[expect(
+   clippy::struct_excessive_bools,
+   reason = "host paint, layout and event flags vary independently"
+)]
+#[derive(Clone, Debug, Default)]
+pub struct Surface {
+   pub kind:       &'static str,
+   pub role:       Option<&'static str>,
+   pub selected:   Option<bool>,
+   pub disabled:   bool,
+   pub height:     Option<f64>,
+   pub opaque:     bool,
+   pub backplate:  bool,
+   pub pressable:  bool,
+   pub horizontal: bool,
+   gradients:      u8,
+   radii:          [Option<f64>; 3],
+   fills:          [Option<u32>; 3],
+   pub padding:    Option<[f32; 4]>,
+   pub margin:     Option<[f32; 4]>,
+}
+
+fn control_role(value: &Value) -> Option<&'static str> {
+   [
+      "switch",
+      "radio",
+      "radiogroup",
+      "tab",
+      "tablist",
+      "button",
+      "link",
+      "header",
+      "checkbox",
+   ]
+   .into_iter()
+   .find(|r| value.as_str() == Some(*r))
+}
+
+impl Surface {
+   #[must_use]
+   pub fn top_corners(&self) -> [f64; 2] {
+      [self.radii[1], self.radii[2]].map(|corner| corner.or(self.radii[0]).unwrap_or_default())
+   }
+
+   #[must_use]
+   pub fn fill(&self) -> Option<u32> {
+      self
+         .fills
+         .iter()
+         .flatten()
+         .copied()
+         .find(|color| color >> 24 == 255)
+   }
+
+   #[must_use]
+   pub fn brand_fill(&self) -> bool {
+      self
+         .fills
+         .iter()
+         .flatten()
+         .any(|color| crate::accent::brand_fill(*color))
+   }
+
+   fn update(&mut self, props: &Props) {
+      for (key, value) in props {
+         match *key {
+            Prop::ROLE => {
+               // Export only control roles understood by the theme, never
+               // labels.
+               self.role = control_role(value);
+            },
+            p if p == crate::prop!("accessibilitySelected") => {
+               self.selected = if let Value::Bool(v) = value {
+                  Some(*v)
+               } else {
+                  None
+               }
+            },
+            p if p == crate::prop!("accessibilityDisabled") => {
+               self.disabled = *value == Value::Bool(true);
+            },
+            key if key == crate::prop!("blur") => {
+               self.fills[0] = crate::accent::blur_fallback(value);
+            },
+            BACKGROUND | BG => {
+               let color = crate::accent::argb(value);
+               self.fills[1 + usize::from(*key == BG)] = color;
+               let opaque = color.is_some_and(|color| color >> 24 == 255);
+               if *key == BG {
+                  self.backplate = opaque;
+               } else {
+                  self.opaque = opaque;
+               }
+            },
+            Prop::HEIGHT => {
+               self.height = match value {
+                  Value::I32(n) => Some(f64::from(*n)),
+                  Value::F64(n) if n.is_finite() => Some(*n),
+                  _ => None,
+               }
+            },
+            Prop::ON => {
+               self.pressable =
+                  matches!(value, Value::Arr(on) if on.iter().any(|v| v.as_str() == Some("press")));
+            },
+            key if key == crate::prop!("direction") => {
+               self.horizontal = value.as_str() == Some("row");
+            },
+            key if key == crate::prop!("padding") || key == crate::prop!("margin") => {
+               let edges = match value {
+                  Value::Rect(edges) => Some(*edges),
+                  _ => None,
+               };
+               if key == crate::prop!("padding") {
+                  self.padding = edges;
+               } else {
+                  self.margin = edges;
+               }
+            },
+            key if [
+               crate::prop!("radius"),
+               crate::prop!("radiusTopLeft"),
+               crate::prop!("radiusTopRight"),
+            ]
+            .contains(&key) =>
+            {
+               let at = if key == crate::prop!("radius") {
+                  0
+               } else if key == crate::prop!("radiusTopLeft") {
+                  1
+               } else {
+                  2
+               };
+               self.radii[at] = match value {
+                  Value::I32(n) => Some(f64::from(*n)),
+                  Value::F64(n) if n.is_finite() => Some(*n),
+                  _ => None,
+               };
+            },
+            key => {
+               if let Some(index) = GRADIENTS.iter().position(|gradient| *gradient == key) {
+                  let present = match value {
+                     Value::Null | Value::Bool(false) => false,
+                     Value::Arr(items) => !items.is_empty(),
+                     Value::Words(items) => !items.is_empty(),
+                     _ => true,
+                  };
+                  if present {
+                     self.gradients |= 1 << index;
+                  } else {
+                     self.gradients &= !(1 << index);
+                  }
+               }
+            },
+         }
+      }
+   }
+
+   #[must_use]
+   pub const fn gradient(&self) -> bool {
+      self.gradients != 0
+   }
+}
+
 const FIRST: Prop = Prop::named("first");
 const FORCE_VALUE: Prop = Prop::named("forceValue");
 
@@ -39,6 +215,8 @@ pub struct Mirror {
    kids:         HashMap<i32, Vec<i32>>,
    parent:       HashMap<i32, i32>,
    ids:          HashMap<i32, String>,
+   checked:      HashMap<i32, bool>,
+   surfaces:     HashMap<i32, Surface>,
    /// Debug-only node kind & prop snapshots, populated only when `capture` is
    /// enabled (e.g. when the remote debug shell is active or in unit tests).
    kinds:        HashMap<i32, ViewKind>,
@@ -71,6 +249,7 @@ impl Mirror {
                self.create(*id, kind, props, capture);
             },
             Op::Children { id, ids } => {
+               self.detach_children(*id);
                for kid in ids {
                   self.parent.insert(*kid, *id);
                }
@@ -78,7 +257,7 @@ impl Mirror {
             },
             Op::ChildEdits { id, edits } => {
                let old = self.kids.remove(id).unwrap_or_default();
-               let new = apply_edits(&old, edits);
+               let new = apply_edits(&old, edits, |child| self.detach(*id, child));
                for kid in edits.iter().flat_map(|edit| &edit.ins) {
                   self.parent.insert(*kid, *id);
                }
@@ -101,10 +280,28 @@ impl Mirror {
    }
 
    fn create(&mut self, id: i32, kind: &ViewKind, props: &Props, capture: bool) {
+      let mut surface = Surface {
+         kind: match kind {
+            ViewKind::View => "view",
+            ViewKind::Stack => "stack",
+            ViewKind::Scroll => "scroll",
+            ViewKind::List => "list",
+            ViewKind::Image => "image",
+            ViewKind::Text => "text",
+            ViewKind::Markup => "markup",
+            ViewKind::Ring => "ring",
+            _ => "other",
+         },
+         ..Surface::default()
+      };
+      surface.update(props);
+      self.surfaces.insert(id, surface);
       if capture {
          self.kinds.insert(id, kind.clone());
          self.props.insert(id, props.clone());
       }
+      self.checked.remove(&id);
+      self.record_checked(id, props);
       let is_list = get_prop(props, FIRST).is_some();
       if let Some(Value::I32(first)) = get_prop(props, FIRST) {
          self.firsts.insert(id, *first);
@@ -135,6 +332,10 @@ impl Mirror {
    }
 
    fn update(&mut self, id: i32, props: &Props, capture: bool) {
+      self.record_checked(id, props);
+      if let Some(surface) = self.surfaces.get_mut(&id) {
+         surface.update(props);
+      }
       if capture {
          let stored = self.props.entry(id).or_default();
          for (key, value) in props {
@@ -161,6 +362,28 @@ impl Mirror {
       }
    }
 
+   #[must_use]
+   pub fn surface(&self, id: i32) -> Option<&Surface> {
+      self.surfaces.get(&id)
+   }
+
+   fn record_checked(&mut self, id: i32, props: &Props) {
+      match get_prop(props, Prop::ACCESSIBILITY_CHECKED) {
+         Some(Value::Bool(value)) => {
+            self.checked.insert(id, *value);
+         },
+         Some(_) => {
+            self.checked.remove(&id);
+         },
+         None => {},
+      }
+   }
+
+   #[must_use]
+   pub fn checked(&self, id: i32) -> Option<bool> {
+      self.checked.get(&id).copied()
+   }
+
    /// Records `aid` as the accessibility id of `id`.
    fn name(&mut self, id: i32, aid: &str) {
       if aid == "composer" && !self.composer.iter().any(|(input, _)| *input == id) {
@@ -169,13 +392,31 @@ impl Mirror {
       self.ids.insert(id, aid.to_owned());
    }
 
+   fn detach(&mut self, parent: i32, child: i32) {
+      // Child edits for the old parent can arrive after attachment to a new
+      // row.
+      if self.parent.get(&child) == Some(&parent) {
+         self.parent.remove(&child);
+      }
+   }
+
+   fn detach_children(&mut self, parent: i32) {
+      if let Some(kids) = self.kids.remove(&parent) {
+         for child in kids {
+            self.detach(parent, child);
+         }
+      }
+   }
+
    fn delete(&mut self, id: i32) {
       if self.root == Some(id) {
          self.root = None;
       }
-      self.kids.remove(&id);
+      self.detach_children(id);
       self.parent.remove(&id);
       self.ids.remove(&id);
+      self.checked.remove(&id);
+      self.surfaces.remove(&id);
       self.kinds.remove(&id);
       self.props.remove(&id);
       self.sheets.remove(&id);
@@ -388,14 +629,19 @@ impl Mirror {
    }
 }
 
-fn apply_edits(old: &[i32], edits: &[ChildEdit]) -> Vec<i32> {
+fn apply_edits(old: &[i32], edits: &[ChildEdit], mut detach: impl FnMut(i32)) -> Vec<i32> {
    let mut out = Vec::with_capacity(old.len());
    let mut at = 0;
    for edit in edits {
       let keep = usize::try_from(edit.keep).unwrap_or_default();
       let del = usize::try_from(edit.del).unwrap_or_default();
       out.extend(old.iter().skip(at).take(keep));
-      at = (at + keep + del).min(old.len());
+      at = at.saturating_add(keep).min(old.len());
+      let end = at.saturating_add(del).min(old.len());
+      for &child in &old[at..end] {
+         detach(child);
+      }
+      at = end;
       out.extend_from_slice(&edit.ins);
    }
    out.extend(old.iter().skip(at));
@@ -411,6 +657,123 @@ mod tests {
       inspect::TreeJson,
       prop,
    };
+
+   #[test]
+   fn surface_tracks_partial_host_updates_and_recycled_nodes() {
+      let mut mirror = Mirror::default();
+      let make = |props| {
+         Op::Create {
+            id: 27,
+            kind: ViewKind::View,
+            props,
+         }
+      };
+      let gradient = Value::Arr(vec![Value::I32(-1)]);
+      mirror.apply(
+         &[make(vec![
+            (BACKGROUND, Value::I32(-1)),
+            (Prop::HEIGHT, Value::F64(0.5)),
+            (crate::prop!("radius"), Value::I32(20)),
+            (crate::prop!("radiusTopLeft"), Value::F64(18.0)),
+            (GRADIENTS[0], gradient.clone()),
+            (GRADIENTS[2], gradient),
+         ])],
+         false,
+      );
+      mirror.apply(
+         &[Op::Update {
+            id:    27,
+            props: vec![(GRADIENTS[0], Value::Null)],
+         }],
+         false,
+      );
+      let surface = mirror.surface(27).unwrap();
+      assert_eq!(surface.fill(), Some(u32::MAX));
+      assert!(surface.gradient() && surface.opaque);
+      assert_eq!(surface.height, Some(0.5));
+      assert_eq!(surface.top_corners(), [18.0, 20.0]);
+      assert!(mirror.props(27).is_none());
+      mirror.apply(&[make(vec![(BG, Value::I64(0xFFFF_FFFF))])], false);
+      let surface = mirror.surface(27).unwrap();
+      assert!(surface.backplate && !surface.gradient() && !surface.opaque);
+      assert_eq!(surface.height, None);
+      mirror.apply(&[Op::Delete { ids: vec![27] }], false);
+      assert!(mirror.surface(27).is_none());
+   }
+
+   #[test]
+   fn tracks_checked_without_debug_capture_or_stale_recycled_ids() {
+      let mut mirror = Mirror::default();
+      let create = |props| {
+         Op::Create {
+            id: 8,
+            kind: ViewKind::View,
+            props,
+         }
+      };
+      let checked = |v| vec![(Prop::ACCESSIBILITY_CHECKED, v)];
+      mirror.apply(&[create(checked(Value::Bool(false)))], false);
+      assert_eq!(mirror.checked(8), Some(false));
+      mirror.apply(
+         &[Op::Update {
+            id:    8,
+            props: checked(Value::Bool(true)),
+         }],
+         false,
+      );
+      assert_eq!(mirror.checked(8), Some(true));
+      mirror.apply(
+         &[Op::Update {
+            id:    8,
+            props: vec![],
+         }],
+         false,
+      );
+      assert_eq!(mirror.checked(8), Some(true));
+      mirror.apply(
+         &[Op::Update {
+            id:    8,
+            props: checked(Value::Null),
+         }],
+         false,
+      );
+      assert_eq!(mirror.checked(8), None);
+      mirror.apply(&[create(checked(Value::Bool(true))), create(vec![])], false);
+      assert_eq!(mirror.checked(8), None);
+      mirror.apply(
+         &[create(checked(Value::Bool(false))), Op::Delete {
+            ids: vec![8],
+         }],
+         false,
+      );
+      assert_eq!(mirror.checked(8), None);
+   }
+
+   #[test]
+   fn reparented_message_keeps_only_its_current_row() {
+      let mut m = Mirror::default();
+      m.apply(
+         &[
+            Op::Children {
+               id:  1,
+               ids: vec![7, 8],
+            },
+            Op::Children {
+               id:  2,
+               ids: vec![7],
+            },
+            Op::Children {
+               id:  1,
+               ids: vec![],
+            },
+         ],
+         false,
+      );
+      assert_eq!(m.parent(7), Some(2));
+      assert_eq!(m.parent(8), None);
+      m.apply(&[Op::Delete { ids: vec![2] }], false);
+      assert_eq!(m.parent(7), None);
+   }
 
    #[test]
    fn tracks_root_children_edits_and_deletes() {
@@ -478,6 +841,7 @@ mod tests {
          true,
       );
       assert_eq!(mirror.kids(1), &[2, 4]);
+      assert_eq!(mirror.parent(3), None);
       assert_eq!(mirror.composer(), Some((2, "draft")));
 
       let dump = serde_json::to_value(TreeJson::new(&mirror, 1, 3)).expect("tree serializes");
