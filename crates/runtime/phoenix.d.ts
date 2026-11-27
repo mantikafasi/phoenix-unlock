@@ -1499,6 +1499,12 @@ declare namespace Phoenix {
       priority?: number;
       onPress(ctx: { url: string }): void;
     }): Remover;
+    /// Takes over the GIF picker's Favourites search. `search` gets the search text and returns
+    /// the URLs of the favourites to show, in order, or null to leave Discord's own results.
+    /// It runs off the UI thread as the text changes; `update()` on the returned remover asks
+    /// again, after what `search` depends on changes. The latest plugin to set one wins.
+    /// Desktop Phoenix on Windows only, absent elsewhere or where the picker isn't found.
+    setGifFavoritesSearch?(search: (query: string) => string[] | null): Remover;
     /// A section at the end of a profile's main tab.
     addProfileSection(options: {
       title: string;

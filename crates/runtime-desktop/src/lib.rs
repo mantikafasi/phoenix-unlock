@@ -14,6 +14,7 @@ mod composer;
 mod config;
 mod context_menu;
 mod gif_menu;
+mod gif_search;
 #[cfg(target_arch = "x86_64")]
 mod counts;
 mod discord;
@@ -260,6 +261,7 @@ pub fn prepare() -> Result<(), Error> {
    }
    feature("context_menu", || context_menu::install(&image));
    feature("gif_menu", || gif_menu::install(&image));
+   feature("gif_search", || gif_search::install(&image));
    // Before accessories hooks `MessageRow::render`, whose prologue the header
    // locators check.
    let header = X86_CODE.then(|| headers::locate(&image, &ix));
