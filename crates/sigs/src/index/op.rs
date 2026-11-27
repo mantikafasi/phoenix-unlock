@@ -176,15 +176,22 @@ pub enum Native {
 
 /// Decodes `[start, end)` of `image`, which holds `isa` code.
 pub fn decode(image: &Image<'_>, isa: Isa, start: usize, end: usize) -> Vec<Step> {
+   decode_head(image, isa, start, end, usize::MAX)
+}
+
+/// Decodes at most `limit` instructions of `[start, end)`.
+pub fn decode_head(image: &Image<'_>, isa: Isa, start: usize, end: usize, limit: usize) -> Vec<Step> {
    let Some(code) = image.read(start, end.saturating_sub(start)) else {
       return Vec::new();
    };
-   match isa {
+   let mut steps = match isa {
       #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
-      Isa::X86_64 { .. } => x86(image, code, start),
-      Isa::Aarch64 => aarch64(code, start),
+      Isa::X86_64 { .. } => return x86(image, code, start, limit),
+      Isa::Aarch64 => aarch64(&code[..code.len().min(limit.saturating_mul(4))], start),
       Isa::Thumb2 => crate::index::thumb::decode(image, code, start),
-   }
+   };
+   steps.truncate(limit);
+   steps
 }
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
@@ -195,7 +202,7 @@ pub fn decode(image: &Image<'_>, isa: Isa, start: usize, end: usize) -> Vec<Step
    clippy::cast_sign_loss,
    reason = "one arm per instruction form, each value bounded by the encoding before the cast"
 )]
-fn x86(image: &Image<'_>, code: &[u8], ip: usize) -> Vec<Step> {
+fn x86(image: &Image<'_>, code: &[u8], ip: usize, limit: usize) -> Vec<Step> {
    use iced_x86::{
       Decoder,
       DecoderOptions,
@@ -214,7 +221,7 @@ fn x86(image: &Image<'_>, code: &[u8], ip: usize) -> Vec<Step> {
    let mut decoder = Decoder::with_ip(64, code, ip as u64, DecoderOptions::NONE);
    let mut instruction = Instruction::default();
    let mut steps = Vec::new();
-   while decoder.can_decode() {
+   while steps.len() < limit && decoder.can_decode() {
       decoder.decode_out(&mut instruction);
       if instruction.is_invalid() {
          break;

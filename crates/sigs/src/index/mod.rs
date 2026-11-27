@@ -32,6 +32,7 @@ pub use crate::index::op::{
 use crate::{
    Found,
    one,
+   registry::GatewayRegistry,
 };
 
 /// How far before a match a string literal can start. Rust merges literals
@@ -65,6 +66,7 @@ pub struct Index<'img> {
    base:      usize,
    tables:    OnceLock<Tables>,
    strs:      OnceLock<Vec<StrSlot>>,
+   registry:  OnceLock<Found<GatewayRegistry>>,
 }
 
 impl<'img> Index<'img> {
@@ -83,6 +85,7 @@ impl<'img> Index<'img> {
          base,
          tables: OnceLock::new(),
          strs: OnceLock::new(),
+         registry: OnceLock::new(),
       };
       index.add_leaves();
       index
@@ -170,6 +173,15 @@ impl<'img> Index<'img> {
       list.sort_unstable_by_key(|func| func.start);
       list.dedup_by_key(|func| func.start);
       Funcs { list }
+   }
+
+   /// The gateway registry, walked once (it scans the whole image).
+   pub fn registry(&self) -> Found<&GatewayRegistry> {
+      self
+         .registry
+         .get_or_init(|| GatewayRegistry::locate(self.image).map_err(|err| err.to_string()))
+         .as_ref()
+         .map_err(Clone::clone)
    }
 
    fn tables(&self) -> &Tables {
@@ -281,8 +293,7 @@ impl<'img> Index<'img> {
          part
             .iter()
             .filter(|&&(start, end)| {
-               let head = op::decode(self.image, self.isa, start, end.min(start + bytes));
-               keep(&head[..head.len().min(steps)])
+               keep(&op::decode_head(self.image, self.isa, start, end.min(start + bytes), steps))
             })
             .map(|&(start, _)| start)
             .collect::<Vec<_>>()
@@ -554,6 +565,12 @@ impl<'ix> Func<'ix> {
    #[must_use]
    pub fn steps(&self) -> Vec<Step> {
       op::decode(self.ix.image, self.ix.isa, self.start, self.end)
+   }
+
+   /// The first `count` steps, decoding no further.
+   #[must_use]
+   pub fn head(&self, count: usize) -> Vec<Step> {
+      op::decode_head(self.ix.image, self.ix.isa, self.start, self.end, count)
    }
 
    /// The functions this one calls, in instruction order, tail jumps
