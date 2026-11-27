@@ -263,18 +263,19 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
       .steps()
       .windows(2)
       .filter_map(|pair| {
-         match (pair[0].op, pair[1].op) {
-            (
-               Op::Addr { reg, target },
-               Op::Store {
-                  value: Value::Reg(value),
-                  offset,
-                  size: 8,
-                  ..
-               },
-            ) if value == reg => Some((target, usize::try_from(offset).ok()?)),
-            _ => None,
-         }
+         let Op::Addr { reg, target } = pair[0].op else {
+            return None;
+         };
+         let offset = match pair[1].op {
+            Op::Store {
+               value: Value::Reg(value),
+               offset,
+               size: 8,
+               ..
+            } if value == reg => offset,
+            _ => store_pair_first(pair[1].native).filter(|&(first, _)| first == reg)?.1,
+         };
+         Some((target, usize::try_from(offset).ok()?))
       })
       .next_back()
       .ok_or("Log Out's row stores no click vtable")?;
@@ -310,6 +311,19 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
       click_offset,
       gear: mana_icon(ix, "Settings")?,
    })
+}
+
+/// The first register and offset of an arm64 `stp x, x, [base, #imm]`, which
+/// the op lowering leaves as [`Op::Other`].
+const fn store_pair_first(native: Native) -> Option<(Reg, isize)> {
+   let Native::Arm64(phoenix_hook::arm64::Insn::Other(word)) = native else {
+      return None;
+   };
+   if word & 0xFFC0_0000 != 0xA900_0000 {
+      return None;
+   }
+   let imm7 = (((word >> 15) & 0x7F) << 25).cast_signed() >> 25;
+   Some(((word & 0x1F) as Reg, imm7 as isize * 8))
 }
 
 /// A Mana icon's number, by its name in a table of every icon's name, in
