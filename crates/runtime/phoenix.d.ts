@@ -1092,6 +1092,10 @@ declare namespace Phoenix {
     warning?: string;
     /// Ships only in dev builds, never on the site or in its updates.
     unlisted?: true;
+    /// The oldest Sunbird the plugin runs on, in the loader's dotted form like
+    /// `2026.11.27`. Updates needing a newer loader wait, and such a copy fails
+    /// to load, until Phoenix Unlock updates.
+    minSunbird?: string;
     permissions?: Permissions;
   }
 

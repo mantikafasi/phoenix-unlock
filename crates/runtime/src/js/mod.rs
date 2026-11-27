@@ -100,6 +100,7 @@ use crate::{
       UrlHost,
       url_host,
    },
+   update::outdated,
 };
 
 /// How long one plugin callback or promise job runs before `QuickJS`
@@ -475,6 +476,11 @@ impl Engine {
          .then_some(source)
          .ok_or_else(|| Error::Js(format!("the name {CONSOLE} belongs to the debug shell")))
          .and_then(|source| {
+            if let Some(min) = Header::from(source).min_sunbird.filter(|min| outdated(min)) {
+               return Err(Error::Js(format!(
+                  "needs Sunbird {min}, update Phoenix Unlock first"
+               )));
+            }
             source
                .parse::<Permissions>()
                .map_err(|err| Error::Js(err.to_string()))

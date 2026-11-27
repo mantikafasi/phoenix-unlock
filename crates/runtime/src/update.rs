@@ -195,6 +195,13 @@ pub fn install_listed(name: &str) -> Result<crate::installer::Installed, crate::
    crate::install(&format!("{ASSETS}plugins/{name}.js"))
 }
 
+/// Whether a plugin that needs loader `min_sunbird` is held back on this one.
+/// Versions are `<UTC date>-<hash>`, which sort by date first as strings.
+#[must_use]
+pub fn outdated(min_sunbird: &str) -> bool {
+   min_sunbird > VERSION
+}
+
 /// Asks the site what this install lacks, and remembers it for [`found`].
 /// `None` means up to date.
 fn query() -> Result<Option<Update>, String> {
@@ -387,6 +394,11 @@ pub fn apply() {
 
 fn update_plugin(name: &str, expected_crc: Option<u32>) -> Result<(), String> {
    let source = download_plugin(name, expected_crc)?;
+   if let Some(min) = crate::Header::from(source.as_str()).min_sunbird
+      && outdated(&min)
+   {
+      return Err(format!("needs Sunbird {min}, update Phoenix Unlock first"));
+   }
    same_reach(name, &source)?;
    crate::save_source(name, source).map_err(|err| err.to_string())
 }

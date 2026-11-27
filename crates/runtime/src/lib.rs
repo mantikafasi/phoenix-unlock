@@ -187,6 +187,9 @@ pub struct Header {
    /// `// @enabled false`, for plugins that stay off until the user turns
    /// them on.
    pub default_off: bool,
+   /// `// @min-sunbird <version>`, the oldest loader the plugin runs on,
+   /// compared to [`update::VERSION`] as a string.
+   pub min_sunbird: Option<String>,
 }
 
 impl From<&str> for Header {
@@ -198,6 +201,7 @@ impl From<&str> for Header {
             "version" => header.version = Some(value.to_owned()),
             "author" => header.author = Some(value.to_owned()),
             "enabled" => header.default_off = value == "false",
+            "min-sunbird" => header.min_sunbird = Some(value.to_owned()),
             _ => {},
          }
       }

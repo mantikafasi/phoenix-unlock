@@ -35,6 +35,7 @@ const banner = (manifest: Phoenix.Manifest): string => {
     manifest.enabled === false && '// @enabled false',
     manifest.warning && `// @warning ${manifest.warning}`,
     manifest.unlisted && '// @unlisted',
+    manifest.minSunbird && `// @min-sunbird ${manifest.minSunbird}`,
     granted.gateway?.length && `// @gateway ${granted.gateway.join(' ')}`,
     granted.gatewaySend?.length && `// @gateway-send ${granted.gatewaySend.join(' ')}`,
     ...(granted.discord ?? []).map((route) => `// @discord ${route}`),
