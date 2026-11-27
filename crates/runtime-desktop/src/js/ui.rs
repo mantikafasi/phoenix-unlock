@@ -27,6 +27,7 @@ use phoenix_runtime::{
          Settlement,
          in_background,
       },
+      restart_budget,
    },
    store::{
       self,
@@ -1769,6 +1770,7 @@ pub fn intercept_send_body(engine: &Engine, channel_id: &str, body: &[u8]) -> Re
 
       let mut value = original.clone();
       for (plugin, function) in interceptors {
+         restart_budget(&ctx);
          match function
             .call::<_, Value<'_>>((value.clone(), argument.clone()))
             .catch(&ctx)

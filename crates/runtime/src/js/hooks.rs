@@ -18,8 +18,8 @@ use crate::{
       Before,
       Engine,
       Registry,
-      drain,
       js_error,
+      restart_budget,
    },
 };
 
@@ -34,13 +34,14 @@ impl Engine {
    /// Runs the `before` hooks for `event`. Each sees the previous hook's
    /// payload.
    pub fn before(&self, event: EventId, name: &str, json: &str) -> Result<Before, Error> {
-      let result = self.context.with(|ctx| {
+      self.with(|ctx| {
          let hooks = registered(&ctx, event, |hook| hook.before.as_ref());
          if hooks.is_empty() {
             return Ok(Before::Keep);
          }
          let mut payload = ctx.json_parse(json).catch(&ctx).map_err(js_error)?;
          for (plugin, before) in hooks {
+            restart_budget(&ctx);
             match before.call::<_, Value<'_>>((payload.clone(),)).catch(&ctx) {
                Ok(result) if result.as_bool() == Some(false) => return Ok(Before::Drop),
                Ok(result) if result.is_undefined() => {},
@@ -56,27 +57,24 @@ impl Engine {
          Ok(Before::Replace(
             json.to_string().map_err(|err| Error::Js(err.to_string()))?,
          ))
-      });
-      drain(&self.runtime);
-      result
+      })
    }
 
    pub fn after(&self, event: EventId, name: &str, json: &str, ok: bool) -> Result<(), Error> {
-      let result = self.context.with(|ctx| {
+      self.with(|ctx| {
          let hooks = registered(&ctx, event, |hook| hook.after.as_ref());
          if hooks.is_empty() {
             return Ok(());
          }
          let payload = ctx.json_parse(json).catch(&ctx).map_err(js_error)?;
          for (plugin, after) in hooks {
+            restart_budget(&ctx);
             if let Err(err) = after.call::<_, ()>((payload.clone(), ok)).catch(&ctx) {
                log::error!("[{plugin}] after {name}: {err}");
             }
          }
          Ok(())
-      });
-      drain(&self.runtime);
-      result
+      })
    }
 
    #[must_use]
@@ -86,7 +84,7 @@ impl Engine {
       op: u32,
       frame_json: &str,
    ) -> gateway::SendAction {
-      let action = self.context.with(|ctx| {
+      self.with(|ctx| {
          let Some(registry) = ctx.userdata::<Registry<'_>>() else {
             return gateway::SendAction::Pass;
          };
@@ -120,6 +118,7 @@ impl Engine {
             .and_then(|s| s.to_string().ok());
          let mut replaced = false;
          for (plugin, function) in hooks {
+            restart_budget(&ctx);
             match function.call::<_, Value<'_>>((payload.clone(),)).catch(&ctx) {
                Ok(result) if result.as_bool() == Some(false) => {
                   return gateway::SendAction::Drop;
@@ -158,9 +157,7 @@ impl Engine {
                },
                gateway::SendAction::Replace,
             )
-      });
-      drain(&self.runtime);
-      action
+      })
    }
 }
 

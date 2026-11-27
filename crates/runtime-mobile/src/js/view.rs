@@ -3,7 +3,10 @@
 
 use std::str::FromStr;
 
-use phoenix_runtime::js::Engine;
+use phoenix_runtime::js::{
+   Engine,
+   restart_budget,
+};
 use rquickjs::{
    CatchResultExt,
    Ctx,
@@ -100,6 +103,7 @@ pub fn view_event(
       }
       let mut taken = false;
       for (plugin, is_interceptor, function) in handlers {
+         restart_budget(&ctx);
          match function.call::<_, Value<'_>>((ev.clone(),)).catch(&ctx) {
             Ok(result) if intercepted && is_interceptor && result.as_bool() != Some(false) => {
                taken = true;
@@ -136,6 +140,7 @@ pub fn node_created(engine: &Engine, watcher_ids: &[u64], info: &NodeInfo) {
          return;
       };
       for (plugin, function) in handlers {
+         restart_budget(&ctx);
          if let Err(err) = function.call::<_, Value<'_>>((obj.clone(),)).catch(&ctx) {
             log::error!("[{plugin}] onNode: {err}");
          }

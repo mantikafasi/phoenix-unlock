@@ -3,6 +3,7 @@
 use phoenix_runtime::js::{
    Engine,
    Registry,
+   restart_budget,
 };
 use rquickjs::{
    CatchResultExt,
@@ -91,6 +92,7 @@ pub fn submit(engine: &Engine, text: &str, context: &UiContext) -> Sent {
          .collect::<Vec<_>>();
       drop((core, registry));
       for (plugin, function) in interceptors {
+         restart_budget(&ctx);
          match function
             .call::<_, Value<'_>>((value.clone(), argument.clone()))
             .catch(&ctx)

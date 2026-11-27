@@ -16,6 +16,17 @@ use std::{
    },
    fs,
    io::ErrorKind,
+   sync::{
+      Arc,
+      atomic::{
+         AtomicU64,
+         Ordering,
+      },
+   },
+   time::{
+      Duration,
+      Instant,
+   },
 };
 
 use log::Level;
@@ -75,10 +86,44 @@ use crate::{
    },
 };
 
+/// How long one plugin callback or promise job runs before `QuickJS`
+/// interrupts it. The hooks run on Discord's own threads, so a spinning plugin
+/// freezes the app for this long.
+const BUDGET: Duration = Duration::from_secs(1);
+
+/// The heap every plugin shares. Past it allocations throw, so a runaway
+/// plugin fails before Android kills Discord for its memory.
+const HEAP_LIMIT: usize = 128 << 20;
+
 pub struct Engine {
    runtime: Runtime,
    context: Context,
+   budget:  Arc<Budget>,
    plugins: BTreeMap<String, Loaded>,
+}
+
+/// The deadline `QuickJS`'s interrupt handler checks, which every entry into
+/// the engine and every plugin callback pushes out to [`BUDGET`] from now.
+struct Budget {
+   origin:   Instant,
+   deadline: AtomicU64,
+}
+
+impl Budget {
+   fn nanos(&self) -> u64 {
+      u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+   }
+
+   fn restart(&self) {
+      let budget = u64::try_from(BUDGET.as_nanos()).unwrap_or(u64::MAX);
+      self
+         .deadline
+         .store(self.nanos().saturating_add(budget), Ordering::Relaxed);
+   }
+
+   fn spent(&self) -> bool {
+      self.nanos() > self.deadline.load(Ordering::Relaxed)
+   }
 }
 
 struct Loaded {
@@ -155,20 +200,21 @@ pub enum Before {
 /// Callbacks stay JS values owned by the runtime, and the only thing plugins
 /// can reach is their own `phoenix` object.
 pub struct Registry<'js> {
-   gateway:          Object<'js>,
-   handles:          Vec<(EventId, Object<'js>)>,
-   hooks:            RefCell<HashMap<EventId, Vec<Hook<'js>>>>,
-   defined:          RefCell<BTreeMap<String, Vec<Definition<'js>>>>,
+   budget:             Arc<Budget>,
+   gateway:            Object<'js>,
+   handles:            Vec<(EventId, Object<'js>)>,
+   hooks:              RefCell<HashMap<EventId, Vec<Hook<'js>>>>,
+   defined:            RefCell<BTreeMap<String, Vec<Definition<'js>>>>,
    /// Kept across unloads, so a reloaded plugin sees what the user chose.
-   chosen:           RefCell<ChosenMap>,
+   chosen:             RefCell<ChosenMap>,
    /// `phoenix.onUnload` callbacks, run when the plugin is turned off,
    /// reloaded or removed.
-   unloads:          RefCell<HashMap<String, Vec<Function<'js>>>>,
+   unloads:            RefCell<HashMap<String, Vec<Function<'js>>>>,
    /// The resolve and reject of each promise a worker thread will settle, by
    /// id.
-   pending:          RefCell<HashMap<u64, (Function<'js>, Function<'js>)>>,
+   pending:            RefCell<HashMap<u64, (Function<'js>, Function<'js>)>>,
    /// `phoenix.discord.onRequest` interceptors, by id.
-   request_hooks:    RefCell<HashMap<u64, (String, Function<'js>)>>,
+   request_hooks:      RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.discord.onResponse` interceptors, by id.
    response_hooks:     RefCell<HashMap<u64, (String, Function<'js>)>>,
    gateway_send_hooks: RefCell<HashMap<u64, (String, Function<'js>)>>,
@@ -209,9 +255,19 @@ impl Engine {
    pub fn new(events: &GatewayRegistry) -> Result<Self, Error> {
       let runtime = Runtime::new().map_err(|err| Error::Js(err.to_string()))?;
       runtime.set_max_stack_size(512 * 1024);
+      runtime.set_memory_limit(HEAP_LIMIT);
+      let budget = Arc::new(Budget {
+         origin:   Instant::now(),
+         deadline: AtomicU64::new(0),
+      });
+      let watched = Arc::clone(&budget);
+      runtime.set_interrupt_handler(Some(Box::new(move || watched.spent())));
       let context = Context::full(&runtime).map_err(|err| Error::Js(err.to_string()))?;
+      budget.restart();
       context.with(|ctx| {
-         let registry = registry(&ctx, events).catch(&ctx).map_err(js_error)?;
+         let registry = registry(&ctx, events, Arc::clone(&budget))
+            .catch(&ctx)
+            .map_err(js_error)?;
          ctx.store_userdata(registry)
             .map_err(|err| Error::Js(err.to_string()))?;
          if let Some(platform) = crate::platform() {
@@ -222,6 +278,7 @@ impl Engine {
       Ok(Self {
          runtime,
          context,
+         budget,
          plugins: BTreeMap::new(),
       })
    }
@@ -229,9 +286,23 @@ impl Engine {
    /// Runs `work` in the engine's context, then the promise reactions it
    /// queued.
    pub fn with<R>(&self, work: impl FnOnce(Ctx<'_>) -> R) -> R {
+      self.budget.restart();
       let result = self.context.with(work);
-      drain(&self.runtime);
+      self.drain();
       result
+   }
+
+   /// Runs promise reactions until none are left. `QuickJS` queues them, and
+   /// nothing else runs the queue.
+   fn drain(&self) {
+      loop {
+         self.budget.restart();
+         match self.runtime.execute_pending_job() {
+            Ok(true) => {},
+            Ok(false) => break,
+            Err(err) => log::error!("a promise job threw: {err}"),
+         }
+      }
    }
 
    #[must_use]
@@ -241,7 +312,7 @@ impl Engine {
 
    #[must_use]
    pub fn plugins(&self) -> Vec<PluginInfo> {
-      self.context.with(|ctx| {
+      self.with(|ctx| {
          let registry = ctx.userdata::<Registry<'_>>();
          let defined = registry.as_ref().map(|registry| registry.defined.borrow());
          let chosen = registry.as_ref().map(|registry| registry.chosen.borrow());
@@ -281,18 +352,19 @@ impl Engine {
 
    /// Evaluates `name` with a fresh `phoenix` object, recording any error.
    fn eval(&mut self, name: &str) {
-      let Some(loaded) = self.plugins.get_mut(name) else {
+      let Some(source) = self.plugins.get(name).map(|loaded| wrap(&loaded.source)) else {
          return;
       };
-      let outcome = self.context.with(|ctx| {
+      let outcome = self.with(|ctx| {
          let run = || -> rquickjs::Result<()> {
             let phoenix = api(&ctx, name)?;
-            ctx.eval::<Function<'_>, _>(wrap(&loaded.source))?
-               .call((phoenix,))
+            ctx.eval::<Function<'_>, _>(source)?.call((phoenix,))
          };
          run().catch(&ctx).map_err(js_error)
       });
-      drain(&self.runtime);
+      let Some(loaded) = self.plugins.get_mut(name) else {
+         return;
+      };
       match outcome {
          Ok(()) => {
             log::info!("loaded plugin {name}");
@@ -308,7 +380,7 @@ impl Engine {
    /// Drops every hook `name` registered, and turns off events nobody else
    /// listens to.
    pub(super) fn unload(&self, name: &str) {
-      self.context.with(|ctx| {
+      self.with(|ctx| {
          let Some(registry) = ctx.userdata::<Registry<'_>>() else {
             return;
          };
@@ -354,7 +426,6 @@ impl Engine {
          }
          hooks.retain(|_, list| !list.is_empty());
       });
-      drain(&self.runtime);
    }
 
    pub fn set_enabled(&mut self, name: &str, enabled: bool) {
@@ -411,7 +482,7 @@ impl Engine {
          crate::Uninstalled::RestoredBundled
       } else {
          self.plugins.remove(name);
-         self.context.with(|ctx| {
+         self.with(|ctx| {
             if let Some(registry) = ctx.userdata::<Registry<'_>>() {
                registry.chosen.borrow_mut().remove(name);
             }
@@ -445,7 +516,7 @@ impl Engine {
          }
       }
       let remote_shell = crate::remote_shell_enabled();
-      let json = self.context.with(|ctx| {
+      let json = self.with(|ctx| {
          let registry = ctx.userdata::<Registry<'_>>();
          let chosen = registry.as_ref().map(|registry| registry.chosen.borrow());
          let empty = BTreeMap::new();
@@ -470,7 +541,7 @@ impl Engine {
    /// The result as JSON when it has a JSON form, else as `String(result)`.
    /// The prompt sees a `phoenix` object of its own, named "console".
    pub fn evaluate(&self, code: &str) -> Result<String, Error> {
-      let result = self.context.with(|ctx| {
+      self.with(|ctx| {
          let run = || -> rquickjs::Result<String> {
             if !ctx.globals().contains_key("phoenix")? {
                let phoenix = api(&ctx, "console")?;
@@ -493,27 +564,25 @@ impl Engine {
             }
          };
          run().catch(&ctx).map_err(js_error)
-      });
-      drain(&self.runtime);
-      result
+      })
    }
 }
 
-/// Runs promise reactions until none are left. `QuickJS` queues them, and
-/// nothing else runs the queue.
-pub fn drain(runtime: &Runtime) {
-   loop {
-      match runtime.execute_pending_job() {
-         Ok(true) => {},
-         Ok(false) => break,
-         Err(err) => log::error!("a promise job threw: {err}"),
-      }
+/// Gives the plugin callback about to run a budget of its own, so one that
+/// spins does not take the next plugin's time.
+pub fn restart_budget(ctx: &Ctx<'_>) {
+   if let Some(registry) = ctx.userdata::<Registry<'_>>() {
+      registry.budget.restart();
    }
 }
 
 /// One frozen handle per live registry entry. Plugins compare nothing and parse
 /// nothing, the runtime recognizes a handle by identity.
-fn registry<'js>(ctx: &Ctx<'js>, events: &GatewayRegistry) -> rquickjs::Result<Registry<'js>> {
+fn registry<'js>(
+   ctx: &Ctx<'js>,
+   events: &GatewayRegistry,
+   budget: Arc<Budget>,
+) -> rquickjs::Result<Registry<'js>> {
    let freeze = ctx
       .globals()
       .get::<_, Object>("Object")?
@@ -534,6 +603,7 @@ fn registry<'js>(ctx: &Ctx<'js>, events: &GatewayRegistry) -> rquickjs::Result<R
    }
    let gateway = freeze.call((gateway,))?;
    Ok(Registry {
+      budget,
       gateway,
       handles,
       hooks: RefCell::default(),
@@ -706,7 +776,7 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
       .js
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner);
-   engine.context.with(|ctx| {
+   engine.with(|ctx| {
       if let Some(registry) = ctx.userdata::<Registry<'_>>() {
          *registry.chosen.borrow_mut() = choices.settings.into_owned();
       }
