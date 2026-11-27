@@ -3465,14 +3465,13 @@ pub fn modal(image: &Image<'_>, div_into_any: usize, div: &DivLayout) -> Found<M
    // `Div::id` is the first call after `lea` of `"game-server-shop-carousel"`,
    // checking `ElementId::None` in `Interactivity` (`cmp byte ptr [rcx +
    // disp32], 0xff`).
-   let carousel = one(
-      "game-server-shop-carousel",
-      &image.find_bytes(b"game-server-shop-carousel"),
-   )?;
-   // `Div::id(div, id)` takes the id string as its third argument.
+   // Newer builds have a second copy of the string. `Div::id(div, id)` takes
+   // it as its third argument, which the other use does not.
    let abi = Abi::of(image);
-   let carousel_leas: Vec<usize> = leas_of(carousel)
+   let carousel_leas: Vec<usize> = image
+      .find_bytes(b"game-server-shop-carousel")
       .into_iter()
+      .flat_map(&leas_of)
       .filter(|&lea| image.read(lea, 3) == Some(&lea_rip(abi.arg(2))[..]))
       .collect();
    let carousel_lea = one("game-server-shop-carousel load", &carousel_leas)?;
