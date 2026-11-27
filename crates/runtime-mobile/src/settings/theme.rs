@@ -80,7 +80,7 @@ fn luminance(color: i64) -> f64 {
    0.0722f64.mul_add(blue, 0.7152f64.mul_add(green, 0.2126 * red)) / 255.0
 }
 
-fn light() -> bool {
+pub fn light() -> bool {
    THEME.load(Ordering::Relaxed) == LIGHT
 }
 

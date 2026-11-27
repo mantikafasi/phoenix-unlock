@@ -78,6 +78,7 @@ const ICON_RELOAD: &str = "res://ic_mana_puzzle_piece_retry";
 const ICON_UNINSTALL: &str = "res://ic_mana_puzzle_piece_minus";
 const ICON_CONSOLE: &str = "res://ic_mana_angle_brackets";
 const ICON_FILE: &str = "res://ic_mana_image_file_up";
+const ICON_FILTER: &str = "res://ic_mana_filter";
 /// Plugins are named by their index in [`phoenix_runtime::plugins`] as of the
 /// last render, which every install follows with a fresh one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +94,7 @@ enum Press {
    /// Installs or uninstalls a plugin the site lists, by its index in
    /// [`phoenix_runtime::update::catalog`].
    Listed(usize),
+   CycleInstallFilter,
    Toggle(usize),
    Reload(usize),
    Uninstall(usize),
@@ -139,10 +141,39 @@ enum Job {
 enum Field {
    Eval,
    Install,
+   Search,
    /// A text or number setting, indexed like [`Press::Setting`].
    Setting(usize, usize),
    /// A plugin's code, by its index in [`phoenix_runtime::plugins`].
    Code(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallFilter {
+   All,
+   Installed,
+   NotInstalled,
+   Updates,
+}
+
+impl InstallFilter {
+   const fn next(self) -> Self {
+      match self {
+         Self::All => Self::Installed,
+         Self::Installed => Self::NotInstalled,
+         Self::NotInstalled => Self::Updates,
+         Self::Updates => Self::All,
+      }
+   }
+
+   const fn label(self) -> &'static str {
+      match self {
+         Self::All => "All",
+         Self::Installed => "Installed",
+         Self::NotInstalled => "Not installed",
+         Self::Updates => "Updates available",
+      }
+   }
 }
 
 /// Nodes updated in place, so typing is not interrupted.
@@ -218,6 +249,7 @@ struct Settings {
    force_seq:      i64,
    /// What the last install did, shown on the install page.
    install_status: Option<(String, i64)>,
+   install_filter: InstallFilter,
 }
 
 static SETTINGS: LazyLock<Mutex<Settings>> = LazyLock::new(|| {
@@ -237,6 +269,7 @@ static SETTINGS: LazyLock<Mutex<Settings>> = LazyLock::new(|| {
       log_rows:       HashMap::new(),
       force_seq:      1 << 40,
       install_status: None,
+      install_filter: InstallFilter::All,
    })
 });
 
@@ -292,7 +325,7 @@ pub fn start() {
                   .collect::<Vec<_>>();
                state.drafts.retain(|field, _| {
                   match *field {
-                     Field::Eval | Field::Install => true,
+                     Field::Eval | Field::Install | Field::Search => true,
                      Field::Setting(index, _) | Field::Code(index) => {
                         old.get(index)
                            .is_some_and(|name| names.get(index).is_some_and(|new| new == name))

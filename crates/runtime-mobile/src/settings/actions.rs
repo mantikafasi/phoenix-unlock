@@ -56,6 +56,9 @@ pub fn act(job: &Job) {
 }
 
 fn submit(field: Field) {
+   if field == Field::Search {
+      return;
+   }
    let Some(draft) = settings().drafts.remove(&field) else {
       return;
    };
@@ -89,7 +92,7 @@ fn submit(field: Field) {
          };
          phoenix_runtime::set_setting(&plugin.name, &setting.key, value);
       },
-      Field::Eval | Field::Install | Field::Code(_) => {},
+      Field::Eval | Field::Install | Field::Search | Field::Code(_) => {},
    }
 }
 
@@ -161,6 +164,10 @@ fn press(pressed: Press) {
                Chosen::Text(choice.value.clone()),
             );
          }
+      },
+      Press::CycleInstallFilter => {
+         let mut state = settings();
+         state.install_filter = state.install_filter.next();
       },
       Press::Listed(index) => listed(index),
       Press::ApplyUpdate => {

@@ -29,10 +29,17 @@ use crate::settings::{
 };
 
 pub fn plugin_sections(index: usize, plugin: &PluginInfo) -> Vec<Tree> {
+   let description = plugin.header.description.as_deref();
    let (subtitle, status) = match &plugin.state {
-      PluginState::Failed(error) => (Some(format!("Failed: {error}")), "failed"),
-      PluginState::On => (None, "running"),
-      PluginState::Off => (None, "off"),
+      PluginState::Failed(error) => {
+         let subtitle = description.map_or_else(
+            || format!("Failed: {error}"),
+            |description| format!("Failed: {error}\n{description}"),
+         );
+         (Some(subtitle), "failed")
+      },
+      PluginState::On => (description.map(str::to_owned), "running"),
+      PluginState::Off => (description.map(str::to_owned), "off"),
    };
    let (rows, fields) = setting_controls(index, plugin);
    let mut sections = vec![section("", vec![switch_row(

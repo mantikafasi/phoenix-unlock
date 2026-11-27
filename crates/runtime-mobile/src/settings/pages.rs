@@ -4,7 +4,10 @@ use phoenix_runtime::{
    PluginInfo,
    update::Catalog,
 };
-use phoenix_ui_mobile::Prop;
+use phoenix_ui_mobile::{
+   Prop,
+   prop,
+};
 use phoenix_wire::Value;
 
 use crate::settings::{
@@ -13,11 +16,15 @@ use crate::settings::{
    ICON_FILE,
    ICON_PLUGIN,
    ICON_RELOAD,
+   InstallFilter,
    Press,
    console::log_line,
    rows::{
       InputKind,
       button_row,
+      grid_cell,
+      grid_section,
+      search_filter_row,
       section,
       switch_row,
       text_field,
@@ -35,19 +42,14 @@ pub fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
          .iter()
          .enumerate()
          .map(|(index, plugin)| {
-            let subtitle = plugin
-               .state
-               .error()
-               .map(|error| format!("Failed: {error}"))
-               .or_else(|| plugin.header.description.clone());
-            switch_row(
+            grid_cell(switch_row(
                Some(ICON_PLUGIN),
                &plugin.name,
-               subtitle.as_deref(),
+               plugin.state.error().map(|_| "Failed"),
                plugin.state.is_on(),
                Press::OpenPlugin(index),
                Press::Toggle(index),
-            )
+            ))
          })
          .collect()
    };
@@ -55,11 +57,11 @@ pub fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
    update_section()
       .into_iter()
       .chain([
-         section("Plugins", rows),
          section("", vec![
             button_row("Install plugin", ICON_FILE, Some(Press::OpenInstall), true),
             button_row("Console", ICON_CONSOLE, Some(Press::OpenConsole), true),
          ]),
+         grid_section(&format!("Plugins ({})", plugins.len()), rows),
          debug_section(),
          section("About", vec![
             value_row("Version", phoenix_runtime::update::VERSION),
@@ -146,7 +148,7 @@ fn update_section() -> Option<Tree> {
 }
 
 /// The site's plugins, each with a switch that installs or uninstalls it.
-fn listed_rows(plugins: &[PluginInfo]) -> Vec<Tree> {
+fn listed_rows(plugins: &[PluginInfo], query: Option<&str>, filter: InstallFilter) -> Vec<Tree> {
    let listed = match phoenix_runtime::update::catalog() {
       Catalog::Unfetched | Catalog::Loading => {
          return vec![button_row(
@@ -166,10 +168,23 @@ fn listed_rows(plugins: &[PluginInfo]) -> Vec<Tree> {
       },
       Catalog::Loaded(listed) => listed,
    };
-   listed
+   let query = query.map(str::to_lowercase);
+   let updates = phoenix_runtime::update::found().map_or_else(Vec::new, |update| update.plugins);
+   let mut shown_count = 0;
+   let mut rows = listed
       .iter()
       .enumerate()
       .map(|(index, plugin)| {
+         let shown = query.as_ref().is_none_or(|query| {
+            plugin.name.to_lowercase().contains(query)
+               || plugin.description.to_lowercase().contains(query)
+         }) && match filter {
+            InstallFilter::All => true,
+            InstallFilter::Installed => plugins.iter().any(|other| other.name == plugin.name),
+            InstallFilter::NotInstalled => !plugins.iter().any(|other| other.name == plugin.name),
+            InstallFilter::Updates => updates.iter().any(|name| name == &plugin.name),
+         };
+         shown_count += usize::from(shown);
          let on = plugins
             .iter()
             .any(|other| other.name == plugin.name && (other.installed || other.state.is_on()));
@@ -177,16 +192,27 @@ fn listed_rows(plugins: &[PluginInfo]) -> Vec<Tree> {
             || plugin.description.clone(),
             |warning| format!("{} \u{26A0} {warning}", plugin.description),
          );
-         switch_row(
+         let mut row = switch_row(
             Some(ICON_PLUGIN),
             &plugin.name,
             Some(&subtitle),
             on,
             Press::Listed(index),
             Press::Listed(index),
-         )
+         );
+         row.set(prop!("hidden"), Some(Value::Bool(!shown)));
+         row.set(prop!("accessibilityHidden"), Some(Value::Bool(!shown)));
+         row
       })
-      .collect()
+      .collect::<Vec<_>>();
+   let mut empty = button_row("No plugins match", ICON_PLUGIN, None, false);
+   empty.set(prop!("hidden"), Some(Value::Bool(shown_count != 0)));
+   empty.set(
+      prop!("accessibilityHidden"),
+      Some(Value::Bool(shown_count != 0)),
+   );
+   rows.push(empty);
+   rows
 }
 
 fn debug_section() -> Tree {
@@ -214,9 +240,18 @@ fn debug_section() -> Tree {
    section("Debug", debug_rows)
 }
 
-pub fn install_sections(status: Option<&(String, i64)>, plugins: &[PluginInfo]) -> Vec<Tree> {
+pub fn install_sections(
+   status: Option<&(String, i64)>,
+   plugins: &[PluginInfo],
+   query: Option<&str>,
+   filter: InstallFilter,
+) -> Vec<Tree> {
    let mut sections = vec![
-      section("From Sunbird", listed_rows(plugins)),
+      section("", vec![search_filter_row(
+         filter.label(),
+         Press::CycleInstallFilter,
+      )]),
+      section("From Sunbird", listed_rows(plugins, query, filter)),
       section("From a URL", vec![text_field(
          Field::Install,
          Some(ICON_PLUGIN),

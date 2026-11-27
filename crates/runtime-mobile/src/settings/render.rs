@@ -218,6 +218,10 @@ impl Settings {
    pub fn run(&mut self, job: Job) -> Vec<Op> {
       match job {
          Job::Draft(field, draft) => {
+            if field == Field::Search {
+               self.drafts.insert(field, draft);
+               return self.rerender_all(None);
+            }
             let ops = match field {
                Field::Code(_) => {
                   self
@@ -243,10 +247,15 @@ impl Settings {
             ops.extend(self.clear_ops(Field::Eval));
             ops
          },
-         Job::Submit(Field::Code(_)) | Job::Press(Press::PickFile | Press::OpenSite) => Vec::new(),
+         Job::Submit(Field::Code(_) | Field::Search)
+         | Job::Press(Press::PickFile | Press::OpenSite) => Vec::new(),
          Job::Refresh
          | Job::Press(
-            Press::SaveCode(_) | Press::Reload(_) | Press::ApplyUpdate | Press::Listed(_),
+            Press::SaveCode(_)
+            | Press::Reload(_)
+            | Press::ApplyUpdate
+            | Press::Listed(_)
+            | Press::CycleInstallFilter,
          )
          | Job::Picked(_)
          | Job::Submit(Field::Install | Field::Setting(..)) => self.rerender_all(None),
@@ -297,7 +306,12 @@ impl Settings {
          PageKind::Install => {
             (
                "Install plugin".to_owned(),
-               install_sections(self.install_status.as_ref(), &self.plugins),
+               install_sections(
+                  self.install_status.as_ref(),
+                  &self.plugins,
+                  self.drafts.get(&Field::Search).map(String::as_str),
+                  self.install_filter,
+               ),
             )
          },
          PageKind::Code(index) => {
