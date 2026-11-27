@@ -435,12 +435,13 @@ impl Image<'static> {
 /// [`swap_protected`] for code pages. A signed image's `__TEXT` never takes
 /// `PROT_WRITE`, its maximum protection is `r-x`, so each page is copied
 /// writable with `VM_PROT_COPY`, which drops its execute bit until it is
-/// restored.
+/// restored. Every other thread is suspended meanwhile, so none faults on the
+/// pages, and nothing allocates while they are, since one may hold malloc's
+/// lock.
 ///
 /// # Safety
 ///
-/// As [`swap_protected`], and no thread runs code on these pages until this
-/// returns, since they are not executable meanwhile.
+/// As [`swap_protected`].
 #[cfg(target_vendor = "apple")]
 unsafe fn swap_code(
    writes: &[(usize, usize)],
@@ -451,44 +452,118 @@ unsafe fn swap_code(
    const VM_PROT_WRITE: c_int = 2;
    const VM_PROT_COPY: c_int = 0x10;
 
-   let protect = |page: usize, prot: c_int| {
-      // SAFETY: `page` is a mapped page of this task the caller looked up.
-      let status = unsafe { vm_protect(mach_task_self_, page, page_size, 0, prot) };
-      if status == 0 {
-         Ok(())
-      } else {
-         Err(crate::Error::Protect {
-            addr:   page,
-            source: std::io::Error::other(format!("vm_protect returned {status}")),
-         })
-      }
-   };
+   // SAFETY: `page` is a mapped page of this task the caller looked up.
+   let protect =
+      |page: usize, prot: c_int| unsafe { vm_protect(mach_task_self_, page, page_size, 0, prot) };
 
    let _serial = PROTECT
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner);
-   for (done, &(page, _)) in restore.iter().enumerate() {
-      if let Err(err) = protect(page, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) {
-         for &(page, prot) in &restore[..done] {
-            let _ = protect(page, prot);
+   let mut previous = Vec::with_capacity(writes.len());
+   let failed = {
+      let _others = Suspended::others(restore.first().map_or(0, |&(page, _)| page))?;
+      let failed = restore.iter().enumerate().find_map(|(done, &(page, _))| {
+         let status = protect(page, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+         (status != 0).then_some((done, page, status))
+      });
+      let writable = failed.map_or(restore.len(), |(done, ..)| done);
+      if failed.is_none() {
+         for &(slot, value) in writes {
+            // SAFETY: the caller guarantees aligned slots, now writable.
+            let slot = unsafe { AtomicUsize::from_ptr(slot as *mut usize) };
+            previous.push(slot.swap(value, Ordering::AcqRel));
          }
-         return Err(err);
+      }
+      for &(page, prot) in &restore[..writable] {
+         // SAFETY: `page` is mapped; drop stale instruction cache lines before
+         // restoring execute permission.
+         unsafe { sys_icache_invalidate(page as *mut c_void, page_size) };
+         protect(page, prot);
+      }
+      failed
+   };
+   match failed {
+      None => Ok(previous),
+      Some((_, page, status)) => {
+         Err(crate::Error::Protect {
+            addr:   page,
+            source: std::io::Error::other(format!("vm_protect returned {status}")),
+         })
+      },
+   }
+}
+
+/// Every thread of this task but the calling one, suspended until dropped. A
+/// thread started after the list is taken keeps running.
+#[cfg(target_vendor = "apple")]
+struct Suspended {
+   threads: *mut u32,
+   count:   u32,
+   this:    u32,
+}
+
+#[cfg(target_vendor = "apple")]
+impl Suspended {
+   fn others(page: usize) -> Result<Self, crate::Error> {
+      let (mut threads, mut count) = (std::ptr::null_mut(), 0);
+      // SAFETY: the kernel fills both out-parameters when it succeeds.
+      let status = unsafe { task_threads(mach_task_self_, &raw mut threads, &raw mut count) };
+      if status != 0 {
+         return Err(crate::Error::Protect {
+            addr:   page,
+            source: std::io::Error::other(format!("task_threads returned {status}")),
+         });
+      }
+      // SAFETY: no preconditions, and the right is released on drop.
+      let this = unsafe { mach_thread_self() };
+      let suspended = Self {
+         threads,
+         count,
+         this,
+      };
+      for &thread in suspended.threads() {
+         if thread != this {
+            // SAFETY: a thread port of this task the kernel just returned.
+            unsafe { thread_suspend(thread) };
+         }
+      }
+      Ok(suspended)
+   }
+
+   const fn threads(&self) -> &[u32] {
+      if self.threads.is_null() {
+         return &[];
+      }
+      // SAFETY: `task_threads` returned `count` ports at `threads`, released
+      // only on drop.
+      unsafe { std::slice::from_raw_parts(self.threads, self.count as usize) }
+   }
+}
+
+#[cfg(target_vendor = "apple")]
+impl Drop for Suspended {
+   fn drop(&mut self) {
+      for &thread in self.threads() {
+         // SAFETY: ports from `task_threads`, each suspended once by `others`
+         // unless it is this thread.
+         unsafe {
+            if thread != self.this {
+               thread_resume(thread);
+            }
+            mach_port_deallocate(mach_task_self_, thread);
+         }
+      }
+      // SAFETY: the array `task_threads` allocated in this task, no longer
+      // read, and the right `mach_thread_self` gave.
+      unsafe {
+         vm_deallocate(
+            mach_task_self_,
+            self.threads as usize,
+            self.count as usize * size_of::<u32>(),
+         );
+         mach_port_deallocate(mach_task_self_, self.this);
       }
    }
-   let previous = writes
-      .iter()
-      // SAFETY: the caller guarantees aligned slots, now writable.
-      .map(|&(slot, value)| {
-         unsafe { AtomicUsize::from_ptr(slot as *mut usize) }.swap(value, Ordering::AcqRel)
-      })
-      .collect();
-   for &(page, prot) in restore {
-      // SAFETY: `page` is mapped; drop stale instruction cache lines before
-      // restoring execute permission.
-      unsafe { sys_icache_invalidate(page as *mut c_void, page_size) };
-      let _ = protect(page, prot);
-   }
-   Ok(previous)
 }
 
 #[cfg(target_vendor = "apple")]
@@ -502,6 +577,12 @@ unsafe extern "C" {
       protection: c_int,
    ) -> c_int;
    fn sys_icache_invalidate(start: *mut c_void, len: usize);
+   fn task_threads(task: u32, threads: *mut *mut u32, count: *mut u32) -> c_int;
+   fn mach_thread_self() -> u32;
+   fn thread_suspend(thread: u32) -> c_int;
+   fn thread_resume(thread: u32) -> c_int;
+   fn mach_port_deallocate(task: u32, name: u32) -> c_int;
+   fn vm_deallocate(task: u32, address: usize, size: usize) -> c_int;
    fn vm_region_64(
       task: u32,
       address: *mut usize,
