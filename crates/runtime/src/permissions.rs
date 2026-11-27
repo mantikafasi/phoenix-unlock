@@ -17,9 +17,22 @@
 //! hosts or Discord's own.
 
 use std::{
-   collections::BTreeSet,
+   collections::{
+      BTreeMap,
+      BTreeSet,
+   },
    fmt,
    str::FromStr,
+};
+
+use serde::{
+   Deserializer,
+   de::{
+      DeserializeSeed,
+      MapAccess,
+      SeqAccess,
+      Visitor,
+   },
 };
 
 use crate::banner;
@@ -114,35 +127,196 @@ pub fn badge_target(hex: &str) -> Option<String> {
       .filter(|url| url.starts_with("https://"))
 }
 
-/// Every URL host in `text`, JSON with escaped slashes included, and the hosts
-/// badge paths spell.
-#[must_use]
-pub fn hosts(text: &str) -> BTreeSet<String> {
-   let text = text.replace("\\/", "/");
-   let lower = text.to_ascii_lowercase();
-   let mut found = BTreeSet::new();
-   for (at, _) in lower.match_indices("://") {
-      if !(lower[..at].ends_with("http") || lower[..at].ends_with("https")) {
-         continue;
-      }
-      let host = lower[at + 3..]
-         .split(|byte: char| !(byte.is_ascii_alphanumeric() || byte == '.' || byte == '-'))
-         .next()
-         .unwrap_or_default();
-      if !host.is_empty() {
-         found.insert(host.to_owned());
+/// A host a client could connect to for a URL.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UrlHost {
+   Named(String),
+   /// Brackets, percent escapes or other bytes a host name lacks, which a
+   /// client may decode into any host.
+   Unreadable,
+}
+
+impl fmt::Display for UrlHost {
+   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+      match self {
+         Self::Named(name) => formatter.write_str(name),
+         Self::Unreadable => formatter.write_str("a host with escaped or bracketed bytes"),
       }
    }
-   for (at, _) in text.match_indices(BADGE) {
-      let hex = text[at + BADGE.len()..]
-         .split(|byte: char| !byte.is_ascii_hexdigit())
-         .next()
-         .unwrap_or_default();
-      if let Some(target) = badge_target(hex) {
-         found.extend(hosts(&target));
+}
+
+/// The hosts after `http:` or `https:`. `OkHttp` ends the authority at `\` and
+/// takes the last `@`, `java.net.URL` reads past `\` and takes the first,
+/// WHATWG drops tabs and newlines, and the message linkifier stops at
+/// whitespace, so each reading counts.
+fn readings(rest: &str) -> BTreeSet<UrlHost> {
+   let rest = rest.trim_start_matches(['/', '\\', '\t', '\n', '\r']);
+   let wide = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+   let narrow = &wide[..wide.find('\\').unwrap_or(wide.len())];
+   let word = &narrow[..narrow.find(char::is_whitespace).unwrap_or(narrow.len())];
+   let joined = narrow.replace(['\t', '\n', '\r'], "");
+   let mut found = BTreeSet::new();
+   for authority in [wide, narrow, word, joined.as_str()] {
+      let first = authority
+         .split_once('@')
+         .map_or(authority, |(_, host)| host);
+      let last = authority
+         .rsplit_once('@')
+         .map_or(authority, |(_, host)| host);
+      for userless in [first, last] {
+         let host = userless.split(':').next().unwrap_or_default();
+         if host.is_empty() || host.contains(char::is_whitespace) {
+            continue;
+         }
+         let named = host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-');
+         found.insert(if named {
+            UrlHost::Named(host.to_ascii_lowercase())
+         } else {
+            UrlHost::Unreadable
+         });
       }
    }
    found
+}
+
+/// The hosts `url` reaches when it is an `http(s)` URL.
+#[must_use]
+pub fn url_hosts(url: &str) -> Option<BTreeSet<UrlHost>> {
+   let (scheme, rest) = url.split_once(':')?;
+   if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+      return None;
+   }
+   Some(readings(rest)).filter(|found| !found.is_empty())
+}
+
+/// The first host name `url` reaches, for messages.
+#[must_use]
+pub fn url_host(url: &str) -> Option<String> {
+   url_hosts(url)?.into_iter().find_map(|host| {
+      match host {
+         UrlHost::Named(name) => Some(name),
+         UrlHost::Unreadable => None,
+      }
+   })
+}
+
+/// The `http(s)` URLs in a text, keyed by how the text spells them up to the
+/// next whitespace, with the hosts each reaches. JSON is read string by
+/// string, so escapes cannot hide a URL.
+#[derive(Default)]
+pub struct Links(BTreeMap<String, BTreeSet<UrlHost>>);
+
+impl Links {
+   #[must_use]
+   pub fn scan(text: &str) -> Self {
+      let mut links = Self::default();
+      let mut json = serde_json::Deserializer::from_str(text);
+      let walked = Strings(&mut links)
+         .deserialize(&mut json)
+         .and_then(|()| json.end());
+      if walked.is_err() {
+         links = Self::default();
+         links.plain(text);
+      }
+      links
+   }
+
+   fn plain(&mut self, text: &str) {
+      let bytes = text.as_bytes();
+      for (colon, _) in text.match_indices(':') {
+         let scheme = |name: &str| {
+            colon
+               .checked_sub(name.len())
+               .filter(|&start| bytes[start..colon].eq_ignore_ascii_case(name.as_bytes()))
+         };
+         let Some(start) = scheme("https").or_else(|| scheme("http")) else {
+            continue;
+         };
+         let found = readings(&text[colon + 1..]);
+         if found.is_empty() {
+            continue;
+         }
+         let end = text[start..]
+            .find(char::is_whitespace)
+            .map_or(text.len(), |length| start + length);
+         self
+            .0
+            .entry(text[start..end].to_owned())
+            .or_default()
+            .extend(found);
+      }
+      for (at, _) in text.match_indices(BADGE) {
+         let hex = text[at + BADGE.len()..]
+            .split(|byte: char| !byte.is_ascii_hexdigit())
+            .next()
+            .unwrap_or_default();
+         if let Some(target) = badge_target(hex) {
+            self.plain(&target);
+         }
+      }
+   }
+
+   pub fn urls(&self) -> impl Iterator<Item = &str> {
+      self.0.keys().map(String::as_str)
+   }
+}
+
+/// Feeds every string in a JSON document, keys included, to [`Links::plain`].
+struct Strings<'links>(&'links mut Links);
+
+impl<'de> DeserializeSeed<'de> for Strings<'_> {
+   type Value = ();
+
+   fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+      deserializer.deserialize_any(self)
+   }
+}
+
+impl<'de> Visitor<'de> for Strings<'_> {
+   type Value = ();
+
+   fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+      formatter.write_str("JSON")
+   }
+
+   fn visit_str<E>(self, text: &str) -> Result<(), E> {
+      self.0.plain(text);
+      Ok(())
+   }
+
+   fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+      Ok(())
+   }
+
+   fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+      Ok(())
+   }
+
+   fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+      Ok(())
+   }
+
+   fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+      Ok(())
+   }
+
+   fn visit_unit<E>(self) -> Result<(), E> {
+      Ok(())
+   }
+
+   fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+      while seq.next_element_seed(Strings(&mut *self.0))?.is_some() {}
+      Ok(())
+   }
+
+   fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+      while map.next_key_seed(Strings(&mut *self.0))?.is_some() {
+         map.next_value_seed(Strings(&mut *self.0))?;
+      }
+      Ok(())
+   }
 }
 
 struct Route {
@@ -377,18 +551,6 @@ impl Host {
    }
 }
 
-/// The host of an `http(s)://` URL, lowercased, after any `user@` part.
-#[must_use]
-pub fn url_host(url: &str) -> Option<String> {
-   let rest = url
-      .strip_prefix("https://")
-      .or_else(|| url.strip_prefix("http://"))?;
-   let authority = rest.split(['/', '?', '#']).next()?;
-   let authority = authority.rsplit('@').next()?;
-   let host = authority.split(':').next()?;
-   (!host.is_empty()).then(|| host.to_ascii_lowercase())
-}
-
 impl Permissions {
    /// What the plugin declared. The console declares nothing.
    #[must_use]
@@ -461,8 +623,12 @@ impl Permissions {
       match self {
          Self::Console => true,
          Self::Declared(declared) => {
-            url_host(url)
-               .is_some_and(|host| declared.fetch.iter().any(|allowed| allowed.matches(&host)))
+            url_hosts(url).is_some_and(|found| {
+               found.iter().all(|host| {
+                  matches!(host, UrlHost::Named(name)
+                     if declared.fetch.iter().any(|allowed| allowed.matches(name)))
+               })
+            })
          },
       }
    }
@@ -505,6 +671,16 @@ impl Permissions {
       }
    }
 
+   /// The first host in `found` the plugin may not point Discord at.
+   fn refused<'found>(&self, found: &'found BTreeSet<UrlHost>) -> Option<&'found UrlHost> {
+      found.iter().find(|host| {
+         match host {
+            UrlHost::Named(name) => !self.host(name),
+            UrlHost::Unreadable => !matches!(self, Self::Console),
+         }
+      })
+   }
+
    /// Whether the plugin may draw an image from `uri`. Names like
    /// `res://ic_mana_id` and inline SVG paths load nothing.
    #[must_use]
@@ -516,18 +692,28 @@ impl Permissions {
       {
          return true;
       }
-      let found = hosts(uri);
-      !found.is_empty() && found.iter().all(|host| self.host(host))
+      let mut links = Links::default();
+      links.plain(uri);
+      !links.0.is_empty() && links.0.values().all(|found| self.refused(found).is_none())
    }
 
-   /// The first URL host `after` has that `before` lacks and the plugin may
-   /// not point Discord at.
+   /// The first host a URL in `after` reaches that the plugin may not point
+   /// Discord at, unless `before` spelled the same URL.
    #[must_use]
-   pub fn added(&self, before: &str, after: &str) -> Option<String> {
-      let known = hosts(before);
-      hosts(after)
-         .into_iter()
-         .find(|host| !known.contains(host) && !self.host(host))
+   pub fn added(&self, before: &Links, after: &Links) -> Option<UrlHost> {
+      self.foreign(after, |url| before.0.contains_key(url))
+   }
+
+   /// The first host a URL in `links` reaches that the plugin may not point
+   /// Discord at, among the URLs `known` does not vouch for.
+   #[must_use]
+   pub fn foreign(&self, links: &Links, known: impl Fn(&str) -> bool) -> Option<UrlHost> {
+      links
+         .0
+         .iter()
+         .filter(|(url, _)| !known(url))
+         .find_map(|(_, found)| self.refused(found))
+         .cloned()
    }
 
    /// What `newer` declares that this does not, so an update cannot widen

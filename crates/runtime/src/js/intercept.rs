@@ -24,9 +24,12 @@ use crate::{
       Registry,
       restart_budget,
       rewrite_refused,
-      saw_hosts,
+      saw,
    },
-   permissions::Permissions,
+   permissions::{
+      Links,
+      Permissions,
+   },
 };
 
 impl Engine {
@@ -126,7 +129,7 @@ impl Engine {
          done,
       };
       self.with(|ctx| {
-         saw_hosts(&ctx, &String::from_utf8_lossy(&pending.body));
+         saw(&ctx, &Links::scan(&String::from_utf8_lossy(&pending.body)));
          run_response_chain(&ctx, pending);
       });
    }
@@ -140,13 +143,8 @@ fn json_parser_fn<'js>(ctx: &Ctx<'js>, source: String) -> rquickjs::Result<Funct
 }
 
 fn body_refused(ctx: &Ctx<'_>, plugin: &str, before: &[u8], after: &[u8]) -> bool {
-   rewrite_refused(
-      ctx,
-      plugin,
-      "onResponse",
-      &String::from_utf8_lossy(before),
-      &String::from_utf8_lossy(after),
-   )
+   let scan = |body: &[u8]| Links::scan(&String::from_utf8_lossy(body));
+   before != after && rewrite_refused(ctx, plugin, "onResponse", &scan(before), &scan(after))
 }
 
 /// Extracts a replacement body from `{ body: string | object }` returned by

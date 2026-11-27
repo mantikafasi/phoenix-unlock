@@ -17,6 +17,10 @@ use std::{
       HashSet,
    },
    fs,
+   hash::{
+      BuildHasher,
+      RandomState,
+   },
    io::ErrorKind,
    sync::{
       Arc,
@@ -88,8 +92,9 @@ use crate::{
       },
    },
    permissions::{
+      Links,
       Permissions,
-      hosts,
+      UrlHost,
       url_host,
    },
 };
@@ -103,7 +108,32 @@ const BUDGET: Duration = Duration::from_secs(1);
 /// plugin fails before Android kills Discord for its memory.
 const HEAP_LIMIT: usize = 128 << 20;
 
-const SEEN_HOSTS: usize = 4096;
+const SEEN_URLS: usize = 32_768;
+
+/// The exact URLs Discord's own payloads carried. Anyone can post a link, so a
+/// host seen once vouches for nothing, and a plugin may hand back only a URL
+/// Discord sent. Kept by keyed hash in two generations of [`SEEN_URLS`], so a
+/// flood ages old URLs out without locking new ones out.
+#[derive(Default)]
+struct SeenUrls {
+   keys:     RandomState,
+   current:  HashSet<u64>,
+   previous: HashSet<u64>,
+}
+
+impl SeenUrls {
+   fn insert(&mut self, url: &str) {
+      if self.current.len() >= SEEN_URLS {
+         self.previous = std::mem::take(&mut self.current);
+      }
+      self.current.insert(self.keys.hash_one(url));
+   }
+
+   fn contains(&self, url: &str) -> bool {
+      let key = self.keys.hash_one(url);
+      self.current.contains(&key) || self.previous.contains(&key)
+   }
+}
 
 /// The name the debug shell's `phoenix` object goes by, which no plugin may
 /// take, since grants are looked up by name.
@@ -237,9 +267,7 @@ pub struct Registry<'js> {
    /// What each loaded plugin may reach, for the checks platform code makes by
    /// plugin name.
    granted:            RefCell<HashMap<String, Arc<Permissions>>>,
-   /// URL hosts Discord's own payloads carried, which `dispatch` and `enqueue`
-   /// may hand back to it, up to [`SEEN_HOSTS`].
-   seen_hosts:         RefCell<HashSet<String>>,
+   seen:               RefCell<SeenUrls>,
    /// `phoenix.messages.onSend` interceptors in registration order, by id.
    pub interceptors:   RefCell<Vec<(u64, String, Function<'js>)>>,
 }
@@ -654,46 +682,45 @@ pub fn image_allowed(ctx: &Ctx<'_>, plugin: &str, uri: &str) -> bool {
    granted(ctx, plugin).is_some_and(|permissions| permissions.image(uri))
 }
 
-/// Whether `plugin`'s rewrite of `before` into `after` adds a URL host it may
-/// not point Discord at, logging the refusal.
+/// Whether `plugin`'s rewrite of `before` into `after` adds a URL reaching a
+/// host it may not point Discord at, logging the refusal.
 #[must_use]
-pub fn rewrite_refused(ctx: &Ctx<'_>, plugin: &str, what: &str, before: &str, after: &str) -> bool {
-   let Some(host) = granted(ctx, plugin).map_or_else(
-      || Some("a host".to_owned()),
-      |permissions| permissions.added(before, after),
-   ) else {
+pub fn rewrite_refused(
+   ctx: &Ctx<'_>,
+   plugin: &str,
+   what: &str,
+   before: &Links,
+   after: &Links,
+) -> bool {
+   let Some(host) = granted(ctx, plugin).map_or(Some(UrlHost::Unreadable), |permissions| {
+      permissions.added(before, after)
+   }) else {
       return false;
    };
    log::error!("[{plugin}] {what}: dropped a rewrite adding {host}, not on its // @fetch line");
    true
 }
 
-/// Remembers the URL hosts in a payload from Discord.
-pub fn saw_hosts(ctx: &Ctx<'_>, payload: &str) {
-   let Some(registry) = ctx.userdata::<Registry<'_>>() else {
-      return;
-   };
-   let mut seen = registry.seen_hosts.borrow_mut();
-   for host in hosts(payload) {
-      if seen.len() >= SEEN_HOSTS {
-         break;
+/// Remembers the URLs in a payload from Discord.
+pub fn saw(ctx: &Ctx<'_>, links: &Links) {
+   if let Some(registry) = ctx.userdata::<Registry<'_>>() {
+      let mut seen = registry.seen.borrow_mut();
+      for url in links.urls() {
+         seen.insert(url);
       }
-      seen.insert(host);
    }
 }
 
-/// The first URL host in `payload` that `plugin` may not hand Discord, since
-/// neither its grants nor Discord's own payloads carry it.
+/// The first host a URL in `payload` reaches that `plugin` may not hand
+/// Discord, since neither its grants nor Discord's own payloads vouch for it.
 #[must_use]
-pub fn foreign_host(ctx: &Ctx<'_>, plugin: &str, payload: &str) -> Option<String> {
+pub fn foreign_host(ctx: &Ctx<'_>, plugin: &str, payload: &str) -> Option<UrlHost> {
    let (Some(permissions), Some(registry)) = (granted(ctx, plugin), ctx.userdata::<Registry<'_>>())
    else {
-      return Some("a host".to_owned());
+      return Some(UrlHost::Unreadable);
    };
-   let seen = registry.seen_hosts.borrow();
-   hosts(payload)
-      .into_iter()
-      .find(|host| !permissions.host(host) && !seen.contains(host))
+   let seen = registry.seen.borrow();
+   permissions.foreign(&Links::scan(payload), |url| seen.contains(url))
 }
 
 /// `icon` when `plugin` may draw it, else a `TypeError` naming the fix.
@@ -754,7 +781,7 @@ fn registry<'js>(
       response_hooks: RefCell::default(),
       gateway_send_hooks: RefCell::default(),
       granted: RefCell::default(),
-      seen_hosts: RefCell::default(),
+      seen: RefCell::default(),
       interceptors: RefCell::default(),
    })
 }

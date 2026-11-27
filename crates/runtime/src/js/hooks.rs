@@ -24,9 +24,12 @@ use crate::{
       js_error,
       restart_budget,
       rewrite_refused,
-      saw_hosts,
+      saw,
    },
-   permissions::Permissions,
+   permissions::{
+      Links,
+      Permissions,
+   },
 };
 
 #[derive(Clone)]
@@ -45,7 +48,8 @@ impl Engine {
          if hooks.is_empty() {
             return Ok(Before::Keep);
          }
-         saw_hosts(&ctx, json);
+         let mut known = Links::scan(json);
+         saw(&ctx, &known);
          let mut payload = ctx.json_parse(json).catch(&ctx).map_err(js_error)?;
          let mut current = json.to_owned();
          let what = format!("before {name}");
@@ -64,13 +68,18 @@ impl Engine {
                .ok_or_else(|| Error::Js(format!("a {what} hook returned no JSON value")))?
                .to_string()
                .map_err(|err| Error::Js(err.to_string()))?;
-            if rewrite_refused(&ctx, &plugin, &what, &current, &now) {
+            if now == current {
+               continue;
+            }
+            let links = Links::scan(&now);
+            if rewrite_refused(&ctx, &plugin, &what, &known, &links) {
                payload = ctx
                   .json_parse(current.as_str())
                   .catch(&ctx)
                   .map_err(js_error)?;
             } else {
                current = now;
+               known = links;
             }
          }
          Ok(Before::Replace(current))
