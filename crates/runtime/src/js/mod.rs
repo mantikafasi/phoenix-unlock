@@ -938,6 +938,35 @@ fn log_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
    Ok(log)
 }
 
+/// The name and source of every `*.js` file in `dir`. A file that cannot be
+/// read is logged and left out, so one bad download keeps no other plugin off.
+fn installed(dir: &std::path::Path) -> Result<Vec<(String, String)>, Error> {
+   let paths = match fs::read_dir(dir) {
+      Ok(entries) => {
+         entries
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io_error(dir))?
+      },
+      Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
+      Err(err) => return Err(io_error(dir)(err)),
+   };
+   let mut found = Vec::new();
+   for path in paths.iter().map(fs::DirEntry::path) {
+      let Some(name) = path
+         .file_stem()
+         .and_then(|stem| stem.to_str())
+         .filter(|_| path.extension().is_some_and(|ext| ext == "js"))
+      else {
+         continue;
+      };
+      match fs::read_to_string(&path) {
+         Ok(source) => found.push((name.to_owned(), source)),
+         Err(err) => log::error!("{}: {err}, loading the other plugins", path.display()),
+      }
+   }
+   Ok(found)
+}
+
 /// Evaluates `bundled` plus every `*.js` file in the plugins directory, in name
 /// order, skipping the ones the user turned off.
 #[expect(
@@ -962,35 +991,17 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
       platform.staff(&state.image);
    }
 
-   let dir = state.plugins_dir();
    let mut plugins = bundled
       .into_iter()
       .map(|plugin| {
          (plugin.name, Loaded::new(plugin.source, Origin::Bundled))
       })
       .collect::<BTreeMap<String, Loaded>>();
-   let paths = match fs::read_dir(&dir) {
-      Ok(entries) => {
-         entries
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(io_error(&dir))?
-      },
-      Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
-      Err(err) => return Err(io_error(&dir)(err)),
-   };
-   for path in paths.iter().map(fs::DirEntry::path) {
-      let Some(name) = path
-         .file_stem()
-         .and_then(|stem| stem.to_str())
-         .filter(|_| path.extension().is_some_and(|ext| ext == "js"))
-      else {
-         continue;
-      };
-      let source = fs::read_to_string(&path).map_err(io_error(&path))?;
-      match plugins.get_mut(name) {
+   for (name, source) in installed(&state.plugins_dir())? {
+      match plugins.get_mut(&name) {
          Some(loaded) => loaded.install(source),
          None => {
-            plugins.insert(name.to_owned(), Loaded::new(source, Origin::Installed));
+            plugins.insert(name, Loaded::new(source, Origin::Installed));
          },
       }
    }
@@ -1031,4 +1042,30 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
             .is_some_and(|loaded| matches!(loaded.state, PluginState::On))
       })
       .collect())
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn a_file_that_cannot_be_read_leaves_the_other_plugins() {
+      let dir = std::env::temp_dir().join(format!("phoenix-installed-{}", std::process::id()));
+      fs::create_dir_all(&dir).unwrap();
+      fs::write(dir.join("works.js"), "const works = 1;").unwrap();
+      fs::write(dir.join("broken.js"), [0xFF, 0xFE, 0x00]).unwrap();
+      fs::write(dir.join("notes.txt"), "not a plugin").unwrap();
+      let found = installed(&dir);
+      fs::remove_dir_all(&dir).unwrap();
+      assert_eq!(found.unwrap(), [(
+         "works".to_owned(),
+         "const works = 1;".to_owned()
+      )]);
+   }
+
+   #[test]
+   fn a_missing_directory_has_no_plugins() {
+      let dir = std::env::temp_dir().join("phoenix-installed-missing-directory");
+      assert_eq!(installed(&dir).unwrap(), Vec::<(String, String)>::new());
+   }
 }
