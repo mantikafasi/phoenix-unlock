@@ -421,6 +421,10 @@ fn check(
             }),
          );
          report(
+            "menu submenu",
+            desktop::submenu_layout(image).map(|layout| format!("{layout:x?}")),
+         );
+         report(
             "native modal",
             gpui
                .as_ref()
