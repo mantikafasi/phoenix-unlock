@@ -449,6 +449,23 @@ fn check(
             }),
          );
          report(
+            "gif results",
+            desktop::gif_results(image).map(|r| {
+               format!(
+                  "{} (search +{:#x}/+{:#x}, favourites +{:#x}/+{:#x}, mode +{:#x} == {}, text +{:#x}/+{:#x})",
+                  at(r.accessor),
+                  r.search_ptr,
+                  r.search_len,
+                  r.fav_ptr,
+                  r.fav_len,
+                  r.mode,
+                  r.fav_mode,
+                  r.query_ptr,
+                  r.query_len,
+               )
+            }),
+         );
+         report(
             "native modal",
             gpui
                .as_ref()

@@ -636,6 +636,55 @@ fn add_message_action<'js>(
    Ok(remove)
 }
 
+/// Runs the `phoenix.ui.setGifFavoritesSearch` function on `query`: the URLs
+/// of the favourites to show, or `None` for Discord's own results.
+pub fn search_gif_favorites(engine: &Engine, query: &str) -> Option<Vec<String>> {
+   engine.with(|ctx| {
+      let (plugin, search) = ctx.userdata::<Desktop<'_>>().and_then(|registry| {
+         let slot = registry.gif_search.borrow();
+         slot.as_ref().map(|(_, plugin, search)| (plugin.clone(), search.clone()))
+      })?;
+      match search.call::<_, Option<Vec<String>>>((query,)).catch(&ctx) {
+         Ok(urls) => urls,
+         Err(err) => {
+            log::error!("[{plugin}] setGifFavoritesSearch: {err}");
+            None
+         },
+      }
+   })
+}
+
+fn set_gif_search<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   search: Function<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+   let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+   {
+      let registry = ctx
+         .userdata::<Desktop<'js>>()
+         .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+      *registry.gif_search.borrow_mut() = Some((id, plugin.to_owned(), search));
+   }
+   crate::gif_search::set_active(true);
+
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut slot = registry.gif_search.borrow_mut();
+         if slot.as_ref().is_some_and(|(current, ..)| *current == id) {
+            *slot = None;
+            crate::gif_search::set_active(false);
+         }
+      }
+   })?;
+   remove.set(
+      "update",
+      Function::new(ctx.clone(), crate::gif_search::refresh)?,
+   )?;
+   Ok(remove)
+}
+
 pub fn gif_meta(action: &DesktopAction<'_>) -> crate::gif_menu::GifActionMeta {
    crate::gif_menu::GifActionMeta {
       id:       action.id,
@@ -1636,6 +1685,16 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          add_message_action(&ctx, &action_owner, &options)
       })?,
    )?;
+
+   if crate::gif_search::supported() {
+      let search_owner = plugin.to_owned();
+      ui.set(
+         "setGifFavoritesSearch",
+         Function::new(ctx.clone(), move |ctx: Ctx<'js>, search: Function<'js>| {
+            set_gif_search(&ctx, &search_owner, search)
+         })?,
+      )?;
+   }
 
    if crate::gif_menu::supported() {
       let gif_owner = plugin.to_owned();

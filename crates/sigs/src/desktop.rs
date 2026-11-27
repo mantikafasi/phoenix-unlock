@@ -5253,3 +5253,108 @@ mod tests {
       assert_eq!(slot_of("[rsp+rax]", "rsp"), None);
    }
 }
+
+/// The GIF picker's results accessor: `(ptr, len)` of the favourites `Vec`
+/// on the Favourites tab and of the search `Vec` otherwise, which every part
+/// of the picker reads its tiles through.
+#[derive(Debug, Clone, Copy)]
+pub struct GifResults {
+   pub accessor:   usize,
+   pub search_ptr: usize,
+   pub search_len: usize,
+   pub fav_ptr:    usize,
+   pub fav_len:    usize,
+   pub mode:       usize,
+   pub fav_mode:   u8,
+   /// The search text `String`'s pointer and length fields.
+   pub query_ptr:  usize,
+   pub query_len:  usize,
+}
+
+/// One favourite tile's size in the picker's results `Vec`.
+pub const GIF_RESULT_SIZE: usize = 0x88;
+/// The accessor's bytes that `GIF_RESULTS` matches and a hook may displace:
+/// its first three `lea`s.
+pub const GIF_RESULTS_PROLOGUE: Pattern =
+   Pattern::new("48 8D 81 ?? ?? ?? ?? 48 8D 91 ?? ?? ?? ?? 4C 8D 81 ?? ?? ?? ??");
+pub const GIF_RESULTS_PROLOGUE_LEN: usize = 21;
+
+/// `lea rax,[rcx+search_ptr]; lea rdx,[rcx+fav_ptr]; lea r8,[rcx+search_len];
+/// lea r9,[rcx+fav_len]; cmp byte [rcx+mode],fav; cmove rax,rdx;
+/// cmovne r9,r8; mov rdx,[r9]; mov rax,[rax]; ret`.
+const GIF_RESULTS: Pattern = Pattern::new(
+   "48 8D 81 ?? ?? ?? ?? 48 8D 91 ?? ?? ?? ?? 4C 8D 81 ?? ?? ?? ?? 4C 8D 89 ?? ?? ?? ?? 80 B9 ?? \
+    ?? ?? ?? ?? 48 0F 44 C2 4D 0F 45 C8 49 8B 11 48 8B 00 C3",
+);
+
+pub fn gif_results(image: &Image<'_>) -> Found<GifResults> {
+   let accessor = one("GIF results accessor", &image.scan(GIF_RESULTS))?;
+   let code = image
+      .read(accessor, 35)
+      .ok_or("GIF results accessor is unmapped")?;
+   let disp =
+      |at: usize| u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as usize;
+   let (query_ptr, query_len) = gif_query(image, accessor)?;
+   let found = GifResults {
+      accessor,
+      search_ptr: disp(3),
+      fav_ptr: disp(10),
+      search_len: disp(17),
+      fav_len: disp(24),
+      mode: disp(30),
+      fav_mode: code[34],
+      query_ptr,
+      query_len,
+   };
+   if found.search_ptr + 8 != found.search_len
+      || found.fav_ptr + 8 != found.fav_len
+      || found.search_ptr < 0x20
+   {
+      return Err(format!("GIF results fields look wrong: {found:x?}"));
+   }
+   Ok(found)
+}
+
+/// The search text's fields, from the picker renderer: it checks the text is
+/// empty (`cmp qword [state + len], 0`), then loads pointer and length as one
+/// pair (`movups xmm, [state + len - 8]`) to compare with its cached search.
+fn gif_query(image: &Image<'_>, accessor: usize) -> Found<(usize, usize)> {
+   let mut found = Vec::new();
+   for func in callers(image, accessor) {
+      let Some((start, end)) = image.function_bounds(func) else {
+         continue;
+      };
+      let Some(code) = image.read(start, end - start) else {
+         continue;
+      };
+      for (i, w) in code.windows(8).enumerate() {
+         // REX.W 83 /7 with a disp32 base other than rsp/r12, imm8 0.
+         let is_cmp = w[0] & 0xF8 == 0x48 && w[1] == 0x83 && w[2] & 0xF8 == 0xB8 && w[2] & 7 != 4;
+         if !is_cmp || w[7] != 0 {
+            continue;
+         }
+         let len = u32::from_le_bytes([w[3], w[4], w[5], w[6]]) as usize;
+         let (rex_b, rm) = (w[0] & 1, w[2] & 7);
+         let Some(ptr) = len.checked_sub(8) else {
+            continue;
+         };
+         let tail = &code[i + 8..code.len().min(i + 0x100)];
+         let pair = tail.windows(7).enumerate().any(|(j, m)| {
+            let rex_ok = if j > 0 && tail[j - 1] & 0xF0 == 0x40 {
+               tail[j - 1] & 1 == rex_b
+            } else {
+               rex_b == 0
+            };
+            m[0] == 0x0F
+               && m[1] == 0x10
+               && m[2] & 0xC7 == 0x80 | rm
+               && rex_ok
+               && u32::from_le_bytes([m[3], m[4], m[5], m[6]]) as usize == ptr
+         });
+         if pair && !found.contains(&(ptr, len)) {
+            found.push((ptr, len));
+         }
+      }
+   }
+   one("GIF search text", &found)
+}
