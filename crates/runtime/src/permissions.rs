@@ -299,11 +299,18 @@ impl Route {
       let Some(path) = path.strip_prefix('/') else {
          return false;
       };
+      let lower = path.to_ascii_lowercase();
+      if ["\\", "%2f", "%5c"]
+         .iter()
+         .any(|slash| lower.contains(slash))
+      {
+         return false;
+      }
       let dots = |part: &str| {
-         let decoded = part.to_ascii_lowercase().replace("%2e", ".");
+         let decoded = part.replace("%2e", ".");
          decoded == "." || decoded == ".."
       };
-      if path.split('/').any(dots) {
+      if lower.split('/').any(dots) {
          return false;
       }
       let mut parts = path.split('/');
