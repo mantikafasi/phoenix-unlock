@@ -1501,6 +1501,14 @@ declare namespace Phoenix {
       visible?(ctx: MessageContext): boolean | Promise<boolean>;
       onPress(ctx: MessageContext): void;
     }): Remover;
+    /// A row in the GIF picker's right-click menu, after Copy Link, given the GIF's URL.
+    /// Desktop Phoenix on Windows only, absent elsewhere or where the menu isn't found.
+    addGifAction?(options: {
+      label: string;
+      icon?: Icon;
+      priority?: number;
+      onPress(ctx: { url: string }): void;
+    }): Remover;
     /// A section at the end of a profile's main tab.
     addProfileSection(options: {
       title: string;
