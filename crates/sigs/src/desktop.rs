@@ -2978,15 +2978,17 @@ pub fn scene_draw(image: &Image<'_>) -> Found<SceneDraw> {
 ///
 /// The composer fills an `Option` for the button: its block, after the
 /// `gift-button.wrap` id, stores `Some` (`mov qword [rax - 8], 1`) and jumps
-/// past the `None` store, `and qword [rsp + disp32], 0`. The first `jne` to
+/// past the `None` store, `and qword [rsp|rbp + disp32], 0`. The first `jne` to
 /// just before that store skips the button. Rewriting its two opcode bytes as
 /// `nop; jmp` keeps the displacement, and the locator checks both bytes share
 /// a word so the rewrite is one atomic store.
 pub fn composer_gift(image: &Image<'_>) -> Found<usize> {
    const SOME_THEN_JMP: [u8; 9] = [0x48, 0xC7, 0x40, 0xF8, 0x01, 0x00, 0x00, 0x00, 0xE9];
-   const NONE_STORE: [u8; 4] = [0x48, 0x83, 0xA4, 0x24];
+   const NONE_STORES: [&[u8]; 2] = [&[0x48, 0x83, 0xA4, 0x24], &[0x48, 0x83, 0xA5]];
 
-   let ids = literal(image, b"gift-button.wrap")
+   // Windows build gb71ec80 pools the id without a NUL, so `literal` misses it.
+   let ids = image
+      .find_bytes(b"gift-button.wrap")
       .into_iter()
       .flat_map(|text| lea_refs(image, text))
       .collect::<Vec<_>>();
@@ -3001,15 +3003,17 @@ pub fn composer_gift(image: &Image<'_>) -> Found<usize> {
       .ok_or("gift button stores no Some")?;
    let after = rel32_target(image, id + some + SOME_THEN_JMP.len())
       .ok_or("gift button jump does not decode")?;
-   let none = after.checked_sub(9).ok_or("gift button jumps to 0")?;
-   match image.read(none, 9) {
-      Some(store) if store.starts_with(&NONE_STORE) && store[8] == 0 => {},
-      _ => {
-         return Err(format!(
-            "gift button jumps to {after:#x}, after no None store"
-         ));
-      },
-   }
+   let none = NONE_STORES
+      .into_iter()
+      .find_map(|prefix| {
+         let len = prefix.len() + 5;
+         let store = after.checked_sub(len)?;
+         image
+            .read(store, len)
+            .filter(|bytes| bytes.starts_with(prefix) && bytes[len - 1] == 0)
+            .map(|_| store)
+      })
+      .ok_or_else(|| format!("gift button jumps to {after:#x}, after no None store"))?;
    let code = none
       .checked_sub(start)
       .and_then(|len| image.read(start, len))
