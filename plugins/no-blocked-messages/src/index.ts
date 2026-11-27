@@ -201,10 +201,67 @@ phoenix.hook(gateway.messageUpdate, {
   },
 });
 
-// Channel history / jump-to-message loads. A page can come back shorter than asked.
+interface HistoryMessage {
+  id?: string;
+  author?: { id?: string };
+}
+
+const visible = (list: HistoryMessage[]) =>
+  list.filter((msg) => !hidden(msg as Phoenix.Message));
+
+/** Query parameters of an API path. QuickJS has no URLSearchParams. */
+const queryOf = (path: string) => {
+  const params: Record<string, string> = {};
+  const query = path.split("?")[1];
+  if (!query) return params;
+  for (const pair of query.split("&")) {
+    const [key, value = ""] = pair.split("=");
+    if (key) params[decodeURIComponent(key)] = decodeURIComponent(value);
+  }
+  return params;
+};
+
+// Discord treats a history page shorter than its `limit` as the end of the channel and caches
+// that, so a filtered page is topped up from beyond it until it is full again. The onResponse
+// hook falls back to the original reply after 4 s, so the top-up stops well before that.
+const TOP_UP_PAGES = 3;
+const TOP_UP_BUDGET_MS = 2500;
+
+/**
+ * `page` filtered and topped up to its original length, `null` when that can't be done in time
+ * (the unfiltered page is safer than a short one).
+ */
+const fullPage = async (
+  channelPath: string,
+  direction: "before" | "after",
+  page: HistoryMessage[],
+): Promise<HistoryMessage[] | null> => {
+  const started = Date.now();
+  let kept = visible(page);
+  let raw = page;
+  for (let round = 0; round < TOP_UP_PAGES && kept.length < page.length; round++) {
+    if (Date.now() - started > TOP_UP_BUDGET_MS) return null;
+    // Pages are newest first: older history continues past the last item, newer past the first.
+    const anchor = direction === "before" ? raw[raw.length - 1]?.id : raw[0]?.id;
+    if (!anchor) return null;
+    const res = await phoenix.discord.get(`${channelPath}?limit=100&${direction}=${anchor}`);
+    if (!res.ok) return null;
+    const more = res.json<unknown>();
+    if (!Array.isArray(more)) return null;
+    raw = more as HistoryMessage[];
+    kept = direction === "before" ? [...kept, ...visible(raw)] : [...visible(raw), ...kept];
+    // A short reply is Discord's real end of history, so a short page is correct from here.
+    if (raw.length < 100) break;
+  }
+  if (kept.length < page.length && raw.length === 100) return null;
+  // Trimmed so the next page starts right after what Discord was given.
+  return direction === "before" ? kept.slice(0, page.length) : kept.slice(-page.length);
+};
+
+// Channel history / jump-to-message loads.
 phoenix.discord.onResponse(
   { method: "GET", pathPrefix: "/channels/", pathSuffix: "/messages" },
-  (res) => {
+  async (res) => {
     if (retry) {
       retry = false;
       loadRelationships().catch((e) =>
@@ -214,9 +271,19 @@ phoenix.discord.onResponse(
     if (res.status < 200 || res.status >= 300) return;
     const list = res.json<unknown>();
     if (!Array.isArray(list)) return;
+    const page = list as HistoryMessage[];
+    if (visible(page).length === page.length) return;
 
-    const filtered = list.filter((item) => !hidden(item as Phoenix.Message));
+    const query = queryOf(res.path);
+    const limit = Number(query.limit ?? 50);
+    // A page already shorter than asked is the real end of history, so filtering it is safe.
+    if (page.length < limit) return { body: visible(page) };
+    // A jump loads both sides of a message, and a short side would end history there, so it is
+    // left whole (blocked messages stay collapsed as Discord shows them).
+    if (query.around) return;
 
-    if (filtered.length !== list.length) return { body: filtered };
+    const channelPath = res.path.split("?")[0];
+    const filled = await fullPage(channelPath, query.after ? "after" : "before", page);
+    if (filled) return { body: filled };
   },
 );
