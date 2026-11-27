@@ -202,6 +202,29 @@ pub fn url_host(url: &str) -> Option<String> {
    })
 }
 
+/// Whether `url` is `original` with query pairs dropped, as tracker stripping
+/// leaves it. Which pairs go is still a choice an attacker's link offers.
+fn trimmed(original: &str, url: &str) -> bool {
+   fn split(text: &str) -> (&str, &str, Option<&str>) {
+      let (rest, fragment) = text
+         .split_once('#')
+         .map_or((text, None), |(rest, fragment)| (rest, Some(fragment)));
+      let (base, query) = rest.split_once('?').unwrap_or((rest, ""));
+      (base, query, fragment)
+   }
+
+   let (base, query, fragment) = split(original);
+   let (trimmed_base, trimmed_query, trimmed_fragment) = split(url);
+   if base != trimmed_base || fragment != trimmed_fragment {
+      return false;
+   }
+   let mut pairs = query.split('&');
+   trimmed_query
+      .split('&')
+      .filter(|pair| !pair.is_empty())
+      .all(|kept| pairs.any(|pair| pair == kept))
+}
+
 /// The `http(s)` URLs in a text, keyed by how the text spells them up to the
 /// next whitespace, with the hosts each reaches. JSON is read string by
 /// string, so escapes cannot hide a URL.
@@ -241,11 +264,10 @@ impl Links {
          let end = text[start..]
             .find(char::is_whitespace)
             .map_or(text.len(), |length| start + length);
-         self
-            .0
-            .entry(text[start..end].to_owned())
-            .or_default()
-            .extend(found);
+         let url = text[start..end].trim_end_matches([
+            '.', ',', '!', '?', ';', ':', ']', ')', '>', '"', '\'', '*', '~',
+         ]);
+         self.0.entry(url.to_owned()).or_default().extend(found);
       }
       for (at, _) in text.match_indices(BADGE) {
          let hex = text[at + BADGE.len()..]
@@ -698,10 +720,12 @@ impl Permissions {
    }
 
    /// The first host a URL in `after` reaches that the plugin may not point
-   /// Discord at, unless `before` spelled the same URL.
+   /// Discord at, unless `before` spelled the same URL or one it trims down to.
    #[must_use]
    pub fn added(&self, before: &Links, after: &Links) -> Option<UrlHost> {
-      self.foreign(after, |url| before.0.contains_key(url))
+      self.foreign(after, |url| {
+         before.0.contains_key(url) || before.urls().any(|original| trimmed(original, url))
+      })
    }
 
    /// The first host a URL in `links` reaches that the plugin may not point
