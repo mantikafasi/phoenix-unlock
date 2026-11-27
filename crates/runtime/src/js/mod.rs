@@ -721,6 +721,9 @@ pub fn image_allowed(ctx: &Ctx<'_>, plugin: &str, uri: &str) -> bool {
 
 /// Whether `plugin`'s rewrite of `before` into `after` adds a URL reaching a
 /// host it may not point Discord at, logging the refusal.
+///
+/// A URL Discord sent elsewhere counts too, like a message a plugin fetched to
+/// fill a page.
 #[must_use]
 pub fn rewrite_refused(
    ctx: &Ctx<'_>,
@@ -729,8 +732,14 @@ pub fn rewrite_refused(
    before: &Links,
    after: &Links,
 ) -> bool {
+   let registry = ctx.userdata::<Registry<'_>>();
+   let seen = |url: &str| {
+      registry
+         .as_ref()
+         .is_some_and(|registry| registry.seen.borrow().contains(url))
+   };
    let Some(host) = granted(ctx, plugin).map_or(Some(UrlHost::Unreadable), |permissions| {
-      permissions.added(before, after)
+      permissions.added(before, after, seen)
    }) else {
       return false;
    };

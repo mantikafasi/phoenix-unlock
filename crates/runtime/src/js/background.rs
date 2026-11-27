@@ -14,7 +14,9 @@ use crate::{
       Engine,
       Registry,
       http::response_object,
+      saw,
    },
+   permissions::Links,
    store,
 };
 
@@ -30,7 +32,13 @@ impl Engine {
             return;
          };
          let value: rquickjs::Result<Result<Value<'_>, String>> = match settlement {
-            Settlement::Fetch(Ok(response)) | Settlement::Discord(Ok(response)) => {
+            Settlement::Fetch(Ok(response)) => {
+               response_object(&ctx, &response).map(|object| Ok(object.into_value()))
+            },
+            Settlement::Discord(Ok(response)) => {
+               // Discord's reply, so its URLs vouch for a plugin's rewrites as the
+               // app's own replies do.
+               saw(&ctx, &Links::scan(&String::from_utf8_lossy(&response.body)));
                response_object(&ctx, &response).map(|object| Ok(object.into_value()))
             },
             Settlement::Int(Ok(number)) => Ok(Ok(Value::new_int(ctx.clone(), number))),
