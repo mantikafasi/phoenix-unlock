@@ -771,6 +771,7 @@ fn add_gif_action<'js>(
          priority,
          visible: None,
          on_press,
+         parent: None,
       });
       crate::gif_menu::sync_actions(list.iter().map(gif_meta).collect());
    }
