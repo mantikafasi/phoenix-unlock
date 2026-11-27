@@ -3225,6 +3225,139 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageContextMenu> {
    })
 }
 
+/// The GIF picker's right-click menu builder (`Expression Picker Actions`,
+/// holding only `Copy Link`) and the Mana `hosted::context_menu` helpers it
+/// builds that item with, for `phoenix.ui.addGifAction`.
+#[derive(Debug, Clone, Copy)]
+pub struct GifMenu {
+   /// `fn(sret: *mut Menu, url: &String) -> *mut Menu`.
+   pub build_fn:       usize,
+   /// `MenuItem::new(sret, id_ptr, id_len, label: SharedString)`.
+   pub item_new:       usize,
+   /// `MenuItem::icon(sret, item, icon: &Icon)`.
+   pub item_icon:      usize,
+   /// `on_click(sret, old_handler, rc_data, rc_vtable)` over an item's handler.
+   pub set_click:      usize,
+   /// `Menu::item(sret, menu, item)`.
+   pub menu_push:      usize,
+   /// Where the item keeps the handler [`GifMenu::set_click`] rewrites.
+   pub handler_offset: usize,
+   /// `Icon`'s tag word for a Mana icon id, which sits after it.
+   pub icon_tag:       u32,
+   /// The URL `String`'s pointer and length within `build_fn`'s argument.
+   pub url_ptr:        usize,
+   pub url_len:        usize,
+}
+
+/// `MenuItem`'s size, which `Menu::item` copies with `rep movsb`.
+pub const GIF_MENU_ITEM_SIZE: usize = 0xC8;
+/// `Menu`'s size, which `Menu::item` copies out.
+pub const GIF_MENU_SIZE: usize = 0xA8;
+
+/// The direct `call` targets in `func`, in address order.
+fn direct_calls(image: &Image<'_>, func: usize) -> Found<Vec<usize>> {
+   let code = function_code(image, func, "function")?;
+   Ok(phoenix_hook::x86::disasm(code, func, usize::MAX)
+      .into_iter()
+      .filter(|line| line.text.starts_with("call ") && !line.text.contains('['))
+      .filter_map(|line| line.target)
+      .collect())
+}
+
+/// Locates the GIF picker's menu builder by its `gif-picker-copy-link` item id
+/// and decodes the item helpers from the calls that build `Copy Link`.
+pub fn gif_menu(image: &Image<'_>) -> Found<GifMenu> {
+   let id = one(
+      "gif-picker-copy-link string",
+      &literal(image, b"gif-picker-copy-link"),
+   )?;
+   let id_lea = one("gif-picker-copy-link xref", &lea_refs(image, id))?;
+   let (build_fn, build_end) = image
+      .function_bounds(id_lea)
+      .ok_or("GIF menu has no unwind entry")?;
+   let code = image
+      .read(build_fn, build_end - build_fn)
+      .ok_or("GIF menu is unmapped")?;
+   // clone(url), Menu id, label, Menu::new, label, MenuItem::new, icon,
+   // on_click, Menu::item.
+   let calls = direct_calls(image, build_fn)?;
+   let [
+      clone,
+      _,
+      label_a,
+      _,
+      label_b,
+      item_new,
+      item_icon,
+      on_click,
+      menu_push,
+   ] = calls[..]
+   else {
+      return Err(format!("GIF menu makes {} calls, not 9", calls.len()));
+   };
+   if label_a != label_b {
+      return Err("GIF menu labels come from different helpers".to_owned());
+   }
+
+   // The URL clone reads `[rdx + len]` and `[rdx + ptr]` first.
+   let clone_head = image.read(clone, 0x30).ok_or("URL clone is unmapped")?;
+   let rdx_loads = mem_operands(clone_head, 0x8B)
+      .filter(|&(_, base, _)| base == number(Register::RDX))
+      .map(|(.., disp)| disp)
+      .collect::<Vec<_>>();
+   let [url_len, url_ptr] = rdx_loads[..] else {
+      return Err(format!("URL clone loads {rdx_loads:x?} from its argument"));
+   };
+
+   // `mov qword [r8], tag` then `mov word [r8 + 8], icon` build the icon.
+   let icon_tag = code
+      .windows(7)
+      .find_map(|w| {
+         (w[..3] == [0x49, 0xC7, 0x00]).then(|| u32::from_le_bytes([w[3], w[4], w[5], w[6]]))
+      })
+      .ok_or("GIF menu icon tag not found")?;
+   if !code.windows(5).any(|w| w == [0x66, 0x41, 0xC7, 0x40, 0x08]) {
+      return Err("GIF menu icon id is not at +8".to_owned());
+   }
+
+   // on_click -> composer (allocates the Rc) -> the generic handler setter,
+   // its last call. on_click reads the old handler from `[item + offset]`.
+   let composer = *direct_calls(image, on_click)?
+      .first()
+      .ok_or("GIF on_click makes no call")?;
+   let set_click = *direct_calls(image, composer)?
+      .last()
+      .ok_or("GIF click composer makes no call")?;
+   let on_click_head = image
+      .read(on_click, 0x40)
+      .ok_or("GIF on_click is unmapped")?;
+   let handler_offset = mem_operands(on_click_head, 0x8B)
+      .find(|&(reg, base, disp)| {
+         reg == number(Register::RAX) && base == number(Register::RDX) && disp > 0x20
+      })
+      .map(|(.., disp)| disp)
+      .ok_or("GIF on_click handler offset not found")?
+      .checked_sub(0x30)
+      .ok_or("GIF on_click handler offset too small")?;
+   if handler_offset + 0x38 > GIF_MENU_ITEM_SIZE {
+      return Err(format!(
+         "GIF handler at {handler_offset:#x} overruns the item"
+      ));
+   }
+
+   Ok(GifMenu {
+      build_fn,
+      item_new,
+      item_icon,
+      set_click,
+      menu_push,
+      handler_offset,
+      icon_tag,
+      url_ptr,
+      url_len,
+   })
+}
+
 /// Reads [`MenuLayout`] from the `MenuItem::Action` core constructor and
 /// `Vec<MenuItem>::push`.
 ///

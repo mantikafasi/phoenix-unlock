@@ -51,6 +51,8 @@ pub struct Desktop<'js> {
    pub headers:        RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageAction` callbacks.
    pub actions:        RefCell<Vec<DesktopAction<'js>>>,
+   /// `phoenix.ui.addGifAction` callbacks, `visible` unused.
+   pub gif_actions:    RefCell<Vec<DesktopAction<'js>>>,
    /// Active `phoenix.ui.openPage` button callbacks, keyed by button ID.
    pub page_buttons:   RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
    /// `phoenix.ui.notify` `onPress` callbacks, keyed by banner ID.
@@ -125,6 +127,14 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       context_menu::sync_actions(meta);
    }
    drop(actions);
+
+   let mut gif_actions = registry.gif_actions.borrow_mut();
+   let before_gif = gif_actions.len();
+   gif_actions.retain(|entry| entry.plugin != name);
+   if gif_actions.len() != before_gif {
+      crate::gif_menu::sync_actions(gif_actions.iter().map(ui::gif_meta).collect());
+   }
+   drop(gif_actions);
 
    registry
       .page_buttons

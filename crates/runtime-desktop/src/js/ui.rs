@@ -635,6 +635,76 @@ fn add_message_action<'js>(
    Ok(remove)
 }
 
+pub fn gif_meta(action: &DesktopAction<'_>) -> crate::gif_menu::GifActionMeta {
+   crate::gif_menu::GifActionMeta {
+      id:       action.id,
+      label:    action.label.clone(),
+      icon:     action.icon.clone(),
+      priority: action.priority,
+   }
+}
+
+/// Runs a `phoenix.ui.addGifAction`'s `onPress` with the GIF's URL.
+pub fn invoke_gif_action(engine: &Engine, action_id: u64, url: &str) {
+   engine.with(|ctx| {
+      let Some((plugin, on_press)) = ctx.userdata::<Desktop<'_>>().and_then(|registry| {
+         let list = registry.gif_actions.borrow();
+         let entry = list.iter().find(|e| e.id == action_id)?;
+         Some((entry.plugin.clone(), entry.on_press.clone()))
+      }) else {
+         return;
+      };
+      let arg = Object::new(ctx.clone()).and_then(|arg| {
+         arg.set("url", url)?;
+         Ok(arg)
+      });
+      let Ok(arg) = arg else {
+         return;
+      };
+      if let Err(err) = on_press.call::<_, Value<'_>>((arg,)).catch(&ctx) {
+         log::error!("[{plugin}] addGifAction onPress: {err}");
+      }
+   });
+}
+
+fn add_gif_action<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   let label = options.get::<_, String>("label")?;
+   let icon = checked_icon(ctx, plugin, options.get::<_, Option<String>>("icon")?)?;
+   let priority = options.get::<_, Option<i32>>("priority")?.unwrap_or(0);
+   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let id = NEXT_ACTION.fetch_add(1, Ordering::Relaxed);
+   {
+      let registry = ctx
+         .userdata::<Desktop<'js>>()
+         .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+      let mut list = registry.gif_actions.borrow_mut();
+      list.push(DesktopAction {
+         id,
+         plugin: plugin.to_owned(),
+         label,
+         icon,
+         danger: false,
+         priority,
+         visible: None,
+         on_press,
+      });
+      crate::gif_menu::sync_actions(list.iter().map(gif_meta).collect());
+   }
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'_>>() {
+         let mut list = registry.gif_actions.borrow_mut();
+         list.retain(|entry| entry.id != id);
+         crate::gif_menu::sync_actions(list.iter().map(gif_meta).collect());
+      }
+   })?;
+   remove.set("update", Function::new(ctx.clone(), || {})?)?;
+   Ok(remove)
+}
+
 static NEXT_PAGE: AtomicU64 = AtomicU64::new(1);
 static NEXT_BTN: AtomicU64 = AtomicU64::new(1);
 
@@ -1560,6 +1630,16 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          add_message_action(&ctx, &action_owner, &options)
       })?,
    )?;
+
+   if crate::gif_menu::supported() {
+      let gif_owner = plugin.to_owned();
+      ui.set(
+         "addGifAction",
+         Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+            add_gif_action(&ctx, &gif_owner, &options)
+         })?,
+      )?;
+   }
 
    let page_owner = plugin.to_owned();
    ui.set(
