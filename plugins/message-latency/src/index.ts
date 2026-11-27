@@ -1,8 +1,3 @@
-// @description Flags messages with high send latency
-// @version 0.1.1
-// @author amaanq
-// @gateway messageCreate
-
 const { gateway } = phoenix;
 
 const settings = phoenix.settings.define({

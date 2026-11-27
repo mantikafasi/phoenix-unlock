@@ -1,17 +1,3 @@
-// @description Sends custom and animated emojis as links, and renders fake emojis, stickers, and GIFs as real ones
-// @version 0.4.4
-// @author mantikafasi
-// @gateway ready readySupplemental userUpdate guildCreate channelCreate guildEmojisUpdate guildStickersUpdate messageCreate messageUpdate
-// @stores
-// @messages
-// @discord GET /users/@me
-// @discord POST /channels/*/messages
-// @discord GET /channels/*/messages
-// @discord PATCH /channels/*/messages/*
-// @discord GET /channels/*/pins
-// @discord GET /channels/*/messages/search
-// @discord GET /guilds/*/messages/search
-
 const { gateway } = phoenix;
 
 const settings = phoenix.settings.define({

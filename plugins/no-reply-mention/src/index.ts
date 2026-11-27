@@ -1,8 +1,3 @@
-// @description Stops your replies from pinging the person you reply to
-// @version 0.1.1
-// @author amaanq
-// @discord POST /channels/*/messages
-
 interface AllowedMentions {
    parse?: string[];
    users?: string[];

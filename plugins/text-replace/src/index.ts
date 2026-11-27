@@ -1,8 +1,3 @@
-// @description Rewrites your outgoing messages by find and replace rules
-// @version 0.1.2
-// @author amaanq
-// @messages
-
 const KEY = "rules";
 
 interface Rule {

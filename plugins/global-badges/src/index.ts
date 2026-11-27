@@ -1,12 +1,3 @@
-// @description Shows user badges from other Discord client mods on profiles
-// @version 0.5.8
-// @author iFlex0x, wolfieeeeeeee
-// @warning Fetches badges from Equibadges (badges.equicord.org)
-// @fetch badges.equicord.org
-// @discord GET /users/@me
-// @discord GET /users/*/profile
-// @discord GET /users/*/badges
-
 const API = "https://badges.equicord.org/users";
 const TTL = 6 * 60 * 60 * 1000;
 const RETRY_DELAY = 30 * 1000;

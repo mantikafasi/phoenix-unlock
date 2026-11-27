@@ -1,9 +1,3 @@
-// @description Hides messages from blocked (and optionally ignored) users completely
-// @version 1.0.2
-// @author Nachtasyl
-// @gateway messageCreate messageUpdate relationshipAdd relationshipUpdate relationshipRemove
-// @discord GET /**
-
 const { gateway } = phoenix;
 
 const settings = phoenix.settings.define({

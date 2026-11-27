@@ -1077,6 +1077,38 @@ declare namespace Phoenix {
     openThemesDir(): void;
   }
 
+  /// What `plugins/<name>/manifest.ts` exports as default. `web/tools/bundle-plugins.ts` writes it
+  /// as the `// @` lines that open the bundle, which the runtime and the site read without running
+  /// the plugin. A plugin installed from elsewhere can carry those lines by hand.
+  interface Manifest {
+    description: string;
+    version: string;
+    author: string;
+    /// Stays off until the user turns it on.
+    enabled?: false;
+    /// Shown on the site before the user installs it.
+    warning?: string;
+    /// Ships only in dev builds, never on the site or in its updates.
+    unlisted?: true;
+    permissions?: Permissions;
+  }
+
+  /// What the plugin's `phoenix` object reaches. Anything left out is missing or refused.
+  interface Permissions {
+    /// Hook points for `on`, `hook`, `dispatch` and `enqueue`.
+    gateway?: (keyof GatewayPayloads | (string & {}))[];
+    /// Outgoing opcodes for `phoenix.gateway.onSend`.
+    gatewaySend?: number[];
+    /// Routes for `phoenix.discord` requests and interceptors. `*` is one path segment, a final
+    /// `**` the rest, and `*` as the method any method.
+    discord?: `${"GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "*"} /${string}`[];
+    /// Hosts for `phoenix.fetch`, like `api.example.com` or `*.example.org`.
+    fetch?: string[];
+    stores?: true;
+    messages?: true;
+    bridge?: true;
+  }
+
   interface Bridge {
     /// Invokes a native Phoenix host module method by its `hh.jb` numeric IDs (see
     /// `docs/phoenix-356207.md`). Keys in `args` may be numeric `hh.jb` field IDs as strings

@@ -1,10 +1,3 @@
-// @description Shows which devices people are online from: desktop, mobile, web or console
-// @version 1.0.1
-// @author yuax
-// @gateway messageCreate presenceUpdate presencesReplace guildMembersChunk guildMemberListUpdate readySupplemental sessionsReplace
-// @discord GET /users/@me
-// @discord GET /users/*/profile
-
 type Status = "online" | "idle" | "dnd";
 type Platform = "desktop" | "mobile" | "web" | "embedded" | "vr";
 type Presence = { status: Status; platforms: Partial<Record<Platform, Status>> };

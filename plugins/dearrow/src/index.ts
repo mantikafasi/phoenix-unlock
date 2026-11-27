@@ -1,10 +1,3 @@
-// @description Replaces YouTube titles and thumbnails in embeds using DeArrow
-// @version 0.2.1
-// @author amaanq
-// @gateway messageCreate messageUpdate
-// @fetch sponsor.ajay.app
-// @discord GET /channels/*/messages
-
 const { gateway } = phoenix;
 
 const settings = phoenix.settings.define({

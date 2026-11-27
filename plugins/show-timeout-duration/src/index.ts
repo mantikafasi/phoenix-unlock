@@ -1,12 +1,3 @@
-// @description Shows remaining timeout duration beside usernames
-// @version 0.1.1
-// @author hakuxyz, port of Valenced "Show Timeout Duration" by Palm
-// @gateway messageCreate messageUpdate messageDelete messageDeleteBulk
-// @stores
-// @discord * /guilds/*/members/**
-// @discord * /channels/*/messages/**
-// @discord * /guilds/*/messages/**
-
 const { gateway, discord, ui } = phoenix;
 const RED = 0xffed4245;
 const ICON = "res://design_components_icon_native_redesign_generated_images_clockwarningicon";
