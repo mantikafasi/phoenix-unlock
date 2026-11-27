@@ -105,6 +105,10 @@ const HEAP_LIMIT: usize = 128 << 20;
 
 const SEEN_HOSTS: usize = 4096;
 
+/// The name the debug shell's `phoenix` object goes by, which no plugin may
+/// take, since grants are looked up by name.
+const CONSOLE: &str = "console";
+
 pub struct Engine {
    runtime: Runtime,
    context: Context,
@@ -389,10 +393,14 @@ impl Engine {
          return;
       };
       let source = loaded.source.as_str();
-      let outcome = loaded
-         .source
-         .parse::<Permissions>()
-         .map_err(|err| Error::Js(err.to_string()))
+      let outcome = (name != CONSOLE)
+         .then_some(source)
+         .ok_or_else(|| Error::Js(format!("the name {CONSOLE} belongs to the debug shell")))
+         .and_then(|source| {
+            source
+               .parse::<Permissions>()
+               .map_err(|err| Error::Js(err.to_string()))
+         })
          .and_then(|permissions| {
             let permissions = Arc::new(permissions);
             self.with(|ctx| {
@@ -587,7 +595,7 @@ impl Engine {
       let result = self.console.with(|ctx| {
          let run = || -> rquickjs::Result<String> {
             if !ctx.globals().contains_key("phoenix")? {
-               let phoenix = api(&ctx, "console", &Arc::new(Permissions::Console))?;
+               let phoenix = api(&ctx, CONSOLE, &Arc::new(Permissions::Console))?;
                if let Some(platform) = crate::platform() {
                   platform.console(&ctx, &phoenix)?;
                }
