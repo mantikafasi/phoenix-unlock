@@ -71,6 +71,7 @@ use phoenix_runtime::{
       Request,
       Response,
    },
+   permissions::Permissions,
    remote::{
       self,
       Done,
@@ -429,6 +430,7 @@ impl Platform for Desktop {
       &self,
       ctx: &Ctx<'js>,
       plugin: &str,
+      _permissions: &Permissions,
       api: &Object<'js>,
       messages: &Object<'js>,
    ) -> rquickjs::Result<()> {

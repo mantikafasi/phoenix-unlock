@@ -688,6 +688,13 @@ struct PluginJson<'a> {
    author:      Option<&'a str>,
    description: Option<&'a str>,
    settings:    Vec<SettingJson<'a>>,
+   permissions: Vec<GrantJson>,
+}
+
+#[derive(Serialize)]
+struct GrantJson {
+   label: &'static str,
+   value: String,
 }
 
 #[derive(Serialize)]
@@ -777,6 +784,16 @@ impl<'a> From<&'a PluginInfo> for PluginJson<'a> {
          author:      plugin.header.author.as_deref(),
          description: plugin.header.description.as_deref(),
          settings:    plugin.settings.iter().map(SettingJson::from).collect(),
+         permissions: plugin
+            .permissions
+            .iter()
+            .map(|grant| {
+               GrantJson {
+                  label: grant.label(),
+                  value: grant.to_string(),
+               }
+            })
+            .collect(),
       }
    }
 }
