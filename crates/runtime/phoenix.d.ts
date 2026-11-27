@@ -1052,6 +1052,18 @@ declare namespace Phoenix {
     readonly bridge: Bridge;
     /// `.theme.css` themes on Desktop Phoenix.
     readonly themes?: Themes;
+    /// Spotify behaviors to turn off, on Desktop Phoenix.
+    readonly spotify?: Spotify;
+  }
+
+  /// Each method is absent when this build's code for it was not found. The change applies while
+  /// any plugin holds it, until the returned function runs.
+  interface Spotify {
+    /// Spotify keeps playing after 30 seconds of talking in voice, instead of pausing.
+    keepPlayingInVoice?(): Remover;
+    /// The Spotify activity stays in your presence while you are idle. Discord's setting for
+    /// showing Spotify still applies.
+    keepActivityWhenIdle?(): Remover;
   }
 
   interface InstalledTheme {

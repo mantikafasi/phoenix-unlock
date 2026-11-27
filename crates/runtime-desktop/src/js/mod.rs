@@ -36,6 +36,10 @@ use crate::{
    members::Place,
    shortcuts,
    sidebar,
+   spotify::{
+      self,
+      Tweak,
+   },
    toolbar,
 };
 
@@ -64,6 +68,8 @@ pub struct Desktop<'js> {
    pub hides:          RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.collapseChannels` holds by id and plugin.
    pub collapses:      RefCell<Vec<(u64, String)>>,
+   /// `phoenix.spotify` holds by id, plugin and tweak.
+   pub spotify:        RefCell<Vec<(u64, String, Tweak)>>,
    /// `phoenix.ui.addHeaderButton` handlers by id and plugin.
    pub header_buttons: RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.addShortcut` handlers by id and plugin.
@@ -158,6 +164,14 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       let held = plugin == name;
       if held {
          sidebar::collapse(false);
+      }
+      !held
+   });
+
+   registry.spotify.borrow_mut().retain(|&(_, ref plugin, tweak)| {
+      let held = plugin == name;
+      if held {
+         spotify::hold(tweak, false);
       }
       !held
    });

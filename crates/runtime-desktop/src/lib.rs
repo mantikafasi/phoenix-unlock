@@ -39,6 +39,7 @@ mod restart;
 mod settings;
 mod shortcuts;
 mod sidebar;
+mod spotify;
 mod staff;
 mod theme_css;
 mod toolbar;
@@ -274,6 +275,7 @@ pub fn prepare() -> Result<(), Error> {
    }
    feature("icons", || icons::install(&image));
    feature("composer", || composer::install(&image));
+   feature("spotify", || spotify::install(&ix));
    feature("sidebar", || sidebar::install(&image));
    feature("toolbar", || toolbar::install(&image));
    feature("badges", || badges::install(&image, &ix));

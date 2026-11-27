@@ -83,6 +83,10 @@ use crate::{
    },
    shortcuts,
    sidebar,
+   spotify::{
+      self,
+      Tweak,
+   },
    toolbar,
 };
 
@@ -1147,6 +1151,56 @@ fn collapse_channels<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Func
    })
 }
 
+fn hold_spotify<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   tweak: Tweak,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_HOLD: AtomicU64 = AtomicU64::new(1);
+
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   if !spotify::hold(tweak, true) {
+      return noop_handle(ctx);
+   }
+   let hold = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
+   registry
+      .spotify
+      .borrow_mut()
+      .push((hold, plugin.to_owned(), tweak));
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut holds = registry.spotify.borrow_mut();
+      let before = holds.len();
+      holds.retain(|&(held, ..)| held != hold);
+      if holds.len() != before {
+         spotify::hold(tweak, false);
+      }
+   })
+}
+
+fn spotify_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
+   let object = Object::new(ctx.clone())?;
+   for (name, tweak) in [
+      ("keepPlayingInVoice", Tweak::NoAutoPause),
+      ("keepActivityWhenIdle", Tweak::IdleActivity),
+   ] {
+      if spotify::ready(tweak) {
+         let owner = plugin.to_owned();
+         object.set(
+            name,
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+               hold_spotify(&ctx, &owner, tweak)
+            })?,
+         )?;
+      }
+   }
+   Ok(object)
+}
+
 /// `phoenix.ui.addHeaderButton`: a button after the member list toggle in the
 /// channel header toolbar. `update` changes its icon or label.
 fn add_header_button<'js>(
@@ -1495,6 +1549,7 @@ pub fn desktop_patch_api<'js>(
    )?;
    api.set("commands", commands)?;
    api.set("themes", crate::js::themes::object(ctx, plugin)?)?;
+   api.set("spotify", spotify_object(ctx, plugin)?)?;
    api.set("ui", desktop_ui_object(ctx, plugin)?)
 }
 
