@@ -45,6 +45,7 @@ mod shortcuts;
 mod sidebar;
 mod spotify;
 mod staff;
+mod stream;
 mod theme_css;
 mod toolbar;
 
@@ -290,6 +291,7 @@ pub fn prepare() -> Result<(), Error> {
    feature("forward", || forward::install(&image, &ix));
    #[cfg(windows)]
    feature("gpui_theme", || gpui_theme::install(&image));
+   feature("stream", || stream::install(&image));
    feature("os_redraw", || <os::Os as os::DesktopOs>::install(&image));
    let registry = phoenix_runtime::hook(&image);
    critical(

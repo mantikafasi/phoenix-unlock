@@ -1038,6 +1038,8 @@ declare namespace Phoenix {
     enqueue<P>(sig: Sig<P>, payload: Partial<P>): void;
     /// Present with a `// @messages` line.
     readonly messages: Messages;
+    readonly stream: Stream;
+    readonly appearance: Appearance;
     /// The raw view tree methods are present with `permissions.uiTree`. Icon URLs must point at a
     /// `fetch` host or Discord's CDN.
     readonly ui: Ui;
@@ -1284,6 +1286,21 @@ declare namespace Phoenix {
     /// modal, so a plugin can split it. Phoenix's own counter then no longer shows a negative
     /// remainder. Release it to put the limits back. On a phone this does nothing.
     allowLongMessages(): Remover;
+  }
+
+  interface Stream {
+    /// Unlocks Go Live resolutions and framerates normally gated behind Nitro or server boost
+    /// tiers (1080p, 1440p, Source, 60 FPS) on Desktop Phoenix while the handle is active.
+    /// No-op on mobile.
+    unlockQuality(): Remover;
+  }
+
+  interface Appearance {
+    /// Unlocks Nitro color themes and app icons in User Settings, Appearance on Desktop Phoenix
+    /// while the handle is active. They apply on this client only. App icons stay locked when
+    /// Discord's premium feature lists differ from the ones their id was measured on. No-op on
+    /// mobile.
+    unlockNitro(): Remover;
   }
 
   /// `channelId` is the open channel, `reply` posts a local message there.
