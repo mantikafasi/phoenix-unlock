@@ -1,9 +1,13 @@
 //! `phoenix.commands`, send interceptors and emoji picks.
 
-use phoenix_runtime::js::{
-   Engine,
-   Registry,
-   restart_budget,
+use phoenix_runtime::{
+   js::{
+      Engine,
+      Registry,
+      checked_icon,
+      restart_budget,
+   },
+   permissions::Permissions,
 };
 use rquickjs::{
    CatchResultExt,
@@ -150,6 +154,7 @@ pub fn pick_emoji(engine: &Engine, id: &str, context: &UiContext) -> Option<Stri
 pub fn patch_api<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
+   permissions: &Permissions,
    api: &Object<'js>,
    messages: &Object<'js>,
 ) -> rquickjs::Result<()> {
@@ -169,7 +174,7 @@ pub fn patch_api<'js>(
          move |ctx: Ctx<'js>, function: Function<'js>| on_emoji_pick(&ctx, &name, function),
       )?,
    )?;
-   api.set("ui", ui_object(ctx, plugin)?)?;
+   api.set("ui", ui_object(ctx, plugin, permissions.ui_tree())?)?;
    api.set("commands", commands_object(ctx, plugin)?)
 }
 
@@ -201,7 +206,7 @@ fn commands_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object
             description: options
                .get::<_, Option<String>>("description")?
                .unwrap_or_default(),
-            icon:        options.get("icon")?,
+            icon:        checked_icon(&ctx, &owner, options.get("icon")?)?,
             plugin:      owner.clone(),
          });
          remover(

@@ -9,6 +9,11 @@
 //!   rest, and `*` in place of the method any method.
 //! - `// @fetch translate.googleapis.com *.example.com` for `phoenix.fetch`.
 //! - `// @stores`, `// @messages` and `// @bridge` for those namespaces whole.
+//! - `// @ui-tree` for the raw view tree, which holds whatever the screen
+//!   shows.
+//!
+//! Icon URLs a plugin draws reach the network too, so they must point at a
+//! `@fetch` host or Discord's CDN.
 
 use std::{
    collections::BTreeSet,
@@ -42,10 +47,20 @@ pub struct Declared {
    gateway_send: BTreeSet<u32>,
    discord:      Vec<Route>,
    fetch:        Vec<Host>,
-   stores:       bool,
-   messages:     bool,
-   bridge:       bool,
+   whole:        BTreeSet<Namespace>,
 }
+
+/// The namespaces a plugin reaches whole or not at all.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Namespace {
+   Stores,
+   Messages,
+   Bridge,
+   UiTree,
+}
+
+/// Hosts whose images any plugin may draw, since they reach only Discord.
+const DISCORD_CDN: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
 
 struct Route {
    method:   Option<String>,
@@ -62,6 +77,7 @@ pub enum Grant {
    Stores,
    Messages,
    Bridge,
+   UiTree,
 }
 
 impl Grant {
@@ -75,6 +91,7 @@ impl Grant {
          Self::Stores => "Message cache",
          Self::Messages => "Outgoing messages",
          Self::Bridge => "Host modules",
+         Self::UiTree => "Screen contents",
       }
    }
 }
@@ -91,6 +108,7 @@ impl fmt::Display for Grant {
          Self::Stores => formatter.write_str("read"),
          Self::Messages => formatter.write_str("read and rewrite"),
          Self::Bridge => formatter.write_str("full access"),
+         Self::UiTree => formatter.write_str("read and change"),
       }
    }
 }
@@ -158,9 +176,10 @@ impl FromStr for Permissions {
                   declared.fetch.push(host.parse()?);
                }
             },
-            "stores" => declared.stores = true,
-            "messages" => declared.messages = true,
-            "bridge" => declared.bridge = true,
+            "stores" => _ = declared.whole.insert(Namespace::Stores),
+            "messages" => _ = declared.whole.insert(Namespace::Messages),
+            "bridge" => _ = declared.whole.insert(Namespace::Bridge),
+            "ui-tree" => _ = declared.whole.insert(Namespace::UiTree),
             _ => {},
          }
       }
@@ -292,7 +311,9 @@ impl Permissions {
          grants.push(Grant::Events(declared.gateway.iter().cloned().collect()));
       }
       if !declared.gateway_send.is_empty() {
-         grants.push(Grant::GatewaySend(declared.gateway_send.iter().copied().collect()));
+         grants.push(Grant::GatewaySend(
+            declared.gateway_send.iter().copied().collect(),
+         ));
       }
       grants.extend(
          declared
@@ -301,17 +322,18 @@ impl Permissions {
             .map(|route| Grant::Discord(route.to_string())),
       );
       if !declared.fetch.is_empty() {
-         grants.push(Grant::Fetch(declared.fetch.iter().map(Host::to_string).collect()));
+         grants.push(Grant::Fetch(
+            declared.fetch.iter().map(Host::to_string).collect(),
+         ));
       }
-      for (granted, grant) in [
-         (declared.stores, Grant::Stores),
-         (declared.messages, Grant::Messages),
-         (declared.bridge, Grant::Bridge),
-      ] {
-         if granted {
-            grants.push(grant);
+      grants.extend(declared.whole.iter().map(|namespace| {
+         match namespace {
+            Namespace::Stores => Grant::Stores,
+            Namespace::Messages => Grant::Messages,
+            Namespace::Bridge => Grant::Bridge,
+            Namespace::UiTree => Grant::UiTree,
          }
-      }
+      }));
       grants
    }
 
@@ -356,26 +378,47 @@ impl Permissions {
    }
 
    #[must_use]
-   pub const fn stores(&self) -> bool {
-      match self {
-         Self::Console => true,
-         Self::Declared(declared) => declared.stores,
-      }
+   pub fn stores(&self) -> bool {
+      self.whole(Namespace::Stores)
    }
 
    #[must_use]
-   pub const fn messages(&self) -> bool {
-      match self {
-         Self::Console => true,
-         Self::Declared(declared) => declared.messages,
-      }
+   pub fn messages(&self) -> bool {
+      self.whole(Namespace::Messages)
    }
 
    #[must_use]
-   pub const fn bridge(&self) -> bool {
+   pub fn bridge(&self) -> bool {
+      self.whole(Namespace::Bridge)
+   }
+
+   #[must_use]
+   pub fn ui_tree(&self) -> bool {
+      self.whole(Namespace::UiTree)
+   }
+
+   fn whole(&self, namespace: Namespace) -> bool {
       match self {
          Self::Console => true,
-         Self::Declared(declared) => declared.bridge,
+         Self::Declared(declared) => declared.whole.contains(&namespace),
       }
+   }
+
+   /// Whether the plugin may draw an image from `uri`. Names like
+   /// `res://ic_mana_id` and inline SVG paths load nothing.
+   #[must_use]
+   pub fn image(&self, uri: &str) -> bool {
+      let lower = uri.trim_start().to_ascii_lowercase();
+      if !["http:", "https:", "//"]
+         .iter()
+         .any(|scheme| lower.starts_with(scheme))
+      {
+         return true;
+      }
+      // The mobile sink unwraps these badge paths to whatever URL they encode.
+      if lower.contains("phx_u_") {
+         return false;
+      }
+      url_host(uri).is_some_and(|host| DISCORD_CDN.contains(&host.as_str())) || self.fetch(uri)
    }
 }

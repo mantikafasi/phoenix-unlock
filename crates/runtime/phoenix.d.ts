@@ -1024,6 +1024,8 @@ declare namespace Phoenix {
     enqueue<P>(sig: Sig<P>, payload: Partial<P>): void;
     /// Present with a `// @messages` line.
     readonly messages: Messages;
+    /// The raw view tree methods are present with `permissions.uiTree`. Icon URLs must point at a
+    /// `fetch` host or Discord's CDN.
     readonly ui: Ui;
     readonly commands: Commands;
     readonly log: Log;
@@ -1102,11 +1104,15 @@ declare namespace Phoenix {
     /// Routes for `phoenix.discord` requests and interceptors. `*` is one path segment, a final
     /// `**` the rest, and `*` as the method any method.
     discord?: `${"GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "*"} /${string}`[];
-    /// Hosts for `phoenix.fetch`, like `api.example.com` or `*.example.org`.
+    /// Hosts for `phoenix.fetch`, like `api.example.com` or `*.example.org`. Icon and image URLs
+    /// the plugin draws must point at one of these or at Discord's CDN.
     fetch?: string[];
     stores?: true;
     messages?: true;
     bridge?: true;
+    /// `phoenix.ui`'s raw view tree (`onEvent`, `dispatch`, `onNode`, `patchProps`, `update`,
+    /// `find`, `findDown`, `node`, `root`, `mount`), which holds whatever the screen shows.
+    uiTree?: true;
   }
 
   interface Bridge {

@@ -65,10 +65,6 @@ use crate::{
    discord,
    gateway,
    io_error,
-   permissions::{
-      Permissions,
-      url_host,
-   },
    js::{
       hooks::{
          Hook,
@@ -89,6 +85,10 @@ use crate::{
          storage,
          stores_object,
       },
+   },
+   permissions::{
+      Permissions,
+      url_host,
    },
 };
 
@@ -226,6 +226,9 @@ pub struct Registry<'js> {
    /// `phoenix.discord.onResponse` interceptors, by id.
    response_hooks:     RefCell<HashMap<u64, (String, Function<'js>)>>,
    gateway_send_hooks: RefCell<HashMap<u64, (String, Function<'js>)>>,
+   /// What each loaded plugin may reach, for the checks platform code makes by
+   /// plugin name.
+   granted:            RefCell<HashMap<String, Arc<Permissions>>>,
    /// `phoenix.messages.onSend` interceptors in registration order, by id.
    pub interceptors:   RefCell<Vec<(u64, String, Function<'js>)>>,
 }
@@ -426,6 +429,7 @@ impl Engine {
             }
          }
          registry.defined.borrow_mut().remove(name);
+         registry.granted.borrow_mut().remove(name);
          registry
             .request_hooks
             .borrow_mut()
@@ -602,6 +606,35 @@ impl Engine {
    }
 }
 
+/// Whether `plugin` may draw an image from `uri`, false for a plugin not
+/// loaded.
+#[must_use]
+pub fn image_allowed(ctx: &Ctx<'_>, plugin: &str, uri: &str) -> bool {
+   ctx.userdata::<Registry<'_>>()
+      .and_then(|registry| registry.granted.borrow().get(plugin).cloned())
+      .is_some_and(|permissions| permissions.image(uri))
+}
+
+/// `icon` when `plugin` may draw it, else a `TypeError` naming the fix.
+pub fn checked_icon(
+   ctx: &Ctx<'_>,
+   plugin: &str,
+   icon: Option<String>,
+) -> rquickjs::Result<Option<String>> {
+   match icon {
+      Some(uri) if !image_allowed(ctx, plugin, &uri) => {
+         Err(Exception::throw_type(
+            ctx,
+            &format!(
+               "{}: images load only from Discord's CDN or a host on the plugin's // @fetch line",
+               url_host(&uri).as_deref().unwrap_or("icon")
+            ),
+         ))
+      },
+      icon => Ok(icon),
+   }
+}
+
 /// Gives the plugin callback about to run a budget of its own, so one that
 /// spins does not take the next plugin's time.
 pub fn restart_budget(ctx: &Ctx<'_>) {
@@ -639,6 +672,7 @@ fn registry<'js>(
       request_hooks: RefCell::default(),
       response_hooks: RefCell::default(),
       gateway_send_hooks: RefCell::default(),
+      granted: RefCell::default(),
       interceptors: RefCell::default(),
    })
 }
@@ -666,6 +700,11 @@ fn api<'js>(
    plugin: &str,
    permissions: &Arc<Permissions>,
 ) -> rquickjs::Result<Object<'js>> {
+   ctx.userdata::<Registry<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?
+      .granted
+      .borrow_mut()
+      .insert(plugin.to_owned(), Arc::clone(permissions));
    let api = Object::new(ctx.clone())?;
    api.set("gateway", gateway_object(ctx, plugin, permissions)?)?;
 

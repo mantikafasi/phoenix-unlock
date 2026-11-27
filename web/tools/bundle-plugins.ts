@@ -42,6 +42,7 @@ const banner = (manifest: Phoenix.Manifest): string => {
     granted.stores && '// @stores',
     granted.messages && '// @messages',
     granted.bridge && '// @bridge',
+    granted.uiTree && '// @ui-tree',
   ].filter((line): line is string => typeof line === 'string').join('\n');
 };
 

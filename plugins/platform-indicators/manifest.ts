@@ -13,5 +13,6 @@ export default {
          "sessionsReplace",
       ],
       discord: ["GET /users/@me", "GET /users/*/profile"],
+      fetch: ["assets.sunbird.tools"],
    },
 } satisfies Phoenix.Manifest;

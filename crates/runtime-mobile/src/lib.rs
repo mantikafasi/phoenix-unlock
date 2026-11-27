@@ -122,7 +122,7 @@ impl Platform for Mobile {
       api: &Object<'js>,
       messages: &Object<'js>,
    ) -> rquickjs::Result<()> {
-      js::messages::patch_api(ctx, plugin, api, messages)?;
+      js::messages::patch_api(ctx, plugin, permissions, api, messages)?;
       if permissions.bridge() {
          api.set("bridge", js::bridge::bridge_object(ctx)?)?;
       }

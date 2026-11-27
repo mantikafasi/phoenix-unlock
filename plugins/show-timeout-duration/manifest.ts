@@ -6,5 +6,6 @@ export default {
       gateway: ["messageCreate", "messageUpdate", "messageDelete", "messageDeleteBulk"],
       discord: ["* /guilds/*/members/**", "* /channels/*/messages/**", "* /guilds/*/messages/**"],
       stores: true,
+      uiTree: true,
    },
 } satisfies Phoenix.Manifest;

@@ -148,7 +148,12 @@ pub fn node_created(engine: &Engine, watcher_ids: &[u64], info: &NodeInfo) {
    });
 }
 
-pub fn add_view_hooks<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rquickjs::Result<()> {
+pub fn add_view_hooks<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   ui: &Object<'js>,
+   tree: bool,
+) -> rquickjs::Result<()> {
    let owner = plugin.to_owned();
    ui.set(
       "hide",
@@ -157,6 +162,9 @@ pub fn add_view_hooks<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rq
          remover(&ctx, move |_| patches::hidden::unhide(handle), None)
       })?,
    )?;
+   if !tree {
+      return Ok(());
+   }
    let owner = plugin.to_owned();
    ui.set(
       "onEvent",
