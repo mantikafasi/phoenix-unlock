@@ -43,14 +43,21 @@ use phoenix_sigs::{
    },
    gateway_send::DesktopGatewaySend,
    http::DesktopHttpTransport,
+   index::{
+      Index,
+      Isa,
+   },
    ios,
+   locate::{
+      Family,
+      LOCATORS,
+   },
    mobile,
    registry::GatewayRegistry,
 };
 
 const USAGE: &str = "usage: sigscan <library.so | Discord.exe | Discord | PhoenixFatClient | \
-                     main.jsbundle> \
-                     [check | strings <text> | refs <addr> | dis <addr> [count]]";
+                     main.jsbundle> [check | strings <text> | refs <addr> | dis <addr> [count]]";
 
 fn main() -> misstep::Result<()> {
    misstep::install_panic_hook();
@@ -88,6 +95,39 @@ fn main() -> misstep::Result<()> {
             matches!(parsed, BinaryFile::MachO(_)),
          )
       },
+      Some("anchors") => {
+         anchors(image, isa_of(image, parsed.machine()));
+         Ok(())
+      },
+      Some("unified") => {
+         let ix = Index::new(image, isa_of(image, parsed.machine()));
+         let desktop = parsed.machine() == Machine::X86_64
+            || (matches!(parsed, BinaryFile::MachO(_))
+               && !image.find_bytes(MACOS_DESKTOP).is_empty());
+         unified(
+            &ix,
+            if desktop {
+               Family::Desktop
+            } else {
+               Family::Mobile
+            },
+         )
+      },
+      Some("ops") => {
+         let ix = Index::new(image, isa_of(image, parsed.machine()));
+         let at = addr(2)?;
+         let count = args.get(3).map_or(Ok(24), |count| count.parse::<usize>()).context(USAGE)?;
+         let end = ix.function(at).map_or(at + count * 4, |func| func.end);
+         for step in phoenix_sigs::index::op::decode(image, ix.isa, at, end).iter().take(count) {
+            println!("{:#x}  {:?}", step.at, step.op);
+         }
+         Ok(())
+      },
+      Some("explain") => {
+         let ix = Index::new(image, isa_of(image, parsed.machine()));
+         explain(&ix, addr(2)?, base);
+         Ok(())
+      },
       Some("strings") => tools.strings(args.get(2).context(USAGE)?),
       Some("scan") => tools.scan(&args[2..].join(" ")),
       Some("refs") => {
@@ -109,6 +149,149 @@ fn main() -> misstep::Result<()> {
          Ok(())
       },
       Some(_) => Err(misstep::Report::msg(USAGE)),
+   }
+}
+
+const fn isa_of(image: &Image<'_>, machine: Machine) -> Isa {
+   match machine {
+      Machine::X86_64 => {
+         Isa::X86_64 {
+            win64: image.pdata.is_some(),
+         }
+      },
+      Machine::Aarch64 => Isa::Aarch64,
+      Machine::Arm => Isa::Thumb2,
+   }
+}
+
+/// How much of the binary the source-level anchors reach.
+fn anchors(image: &Image<'_>, isa: Isa) {
+   let started = std::time::Instant::now();
+   let ix = Index::new(image, isa);
+   let listed = started.elapsed();
+   let (calls, addrs) = ix.ref_counts();
+   let tables = started.elapsed();
+   let strs = ix.strs().len();
+   let indexed = started.elapsed();
+   println!(
+      "{} functions ({listed:.2?}), {calls} calls and {addrs} address loads ({:.2?}), {strs} \
+       stored strs ({:.2?})",
+      ix.function_count(),
+      tables.checked_sub(listed).unwrap(),
+      indexed.checked_sub(tables).unwrap(),
+   );
+   let locations: Vec<_> = ix.locations().collect();
+   let mut files: Vec<&str> = locations.iter().map(|loc| ix.str_of(loc.file)).collect();
+   files.sort_unstable();
+   files.dedup();
+   let discord = files
+      .iter()
+      .filter(|file| file.contains("libdiscord"))
+      .count();
+   let mut reached: Vec<usize> = locations
+      .iter()
+      .flat_map(|loc| ix.loads_of(loc.file.slot..loc.file.slot + 1))
+      .filter_map(|(site, _)| ix.function(site).map(|func| func.start))
+      .collect();
+   reached.sort_unstable();
+   reached.dedup();
+   println!(
+      "{} panic locations in {} files ({discord} under libdiscord), loaded by {} functions",
+      locations.len(),
+      files.len(),
+      reached.len(),
+   );
+
+   let target = "libdiscord_media::fetch";
+   println!(
+      "tracing {target}: {:?}",
+      ix.tracing(target).iter().collect::<Vec<_>>()
+   );
+}
+
+/// Runs every [`LOCATORS`] entry for `family`, with the time each took.
+fn unified(ix: &Index<'_>, family: Family) -> misstep::Result<()> {
+   let started = std::time::Instant::now();
+   ix.warm();
+   println!("index    {:.2?}", started.elapsed());
+   let mut missed = 0;
+   for locator in LOCATORS.iter().filter(|locator| locator.families.contains(&family)) {
+      let started = std::time::Instant::now();
+      match (locator.run)(ix) {
+         Ok(found) => {
+            println!(
+               "ok    {:<20} {found} ({:.2?})",
+               locator.name,
+               started.elapsed()
+            );
+         },
+         Err(why) => {
+            missed += 1;
+            println!("MISS  {:<20} {why}", locator.name);
+         },
+      }
+   }
+   if missed > 0 {
+      return Err(misstep::Report::msg(format!(
+         "{missed} locators missed this build"
+      )));
+   }
+   Ok(())
+}
+
+/// What the function holding `addr` is reachable from: the panic locations,
+/// literals and callsites it loads, and its callers and callees.
+fn explain(ix: &Index<'_>, addr: usize, base: usize) {
+   let Some(func) = ix.function(addr) else {
+      println!("{addr:#x} is in no function");
+      return;
+   };
+   let locations: HashMap<usize, String> = ix
+      .locations()
+      .map(|loc| {
+         (
+            loc.file.slot,
+            format!("{}:{}", ix.str_of(loc.file), loc.line),
+         )
+      })
+      .collect();
+   let describe = |target: usize| -> String {
+      if let Some(location) = locations.get(&target) {
+         return format!("panic {location}");
+      }
+      let bytes = ix.image.read(target, 48).unwrap_or_default();
+      let text: String = bytes
+         .iter()
+         .take_while(|byte| byte.is_ascii_graphic() || **byte == b' ')
+         .map(|&byte| char::from(byte))
+         .collect();
+      if text.len() >= 4 {
+         format!("str {text:?}")
+      } else if ix.image.is_code(target) {
+         "code".to_owned()
+      } else {
+         "data".to_owned()
+      }
+   };
+   let rva = |at: usize| at.wrapping_sub(base);
+   let callers = func.callers();
+   println!(
+      "{:#x} (+{:#x}), {} bytes, {} callers, {} calls",
+      func.start,
+      rva(func.start),
+      func.size(),
+      callers.len(),
+      func.calls().len(),
+   );
+   for caller in callers.iter().take(8) {
+      println!("  caller {:#x}, {} bytes", caller.start, caller.size());
+   }
+   for target in func.loads() {
+      println!("  loads {target:#x} {}", describe(target));
+   }
+   for callee in func.calls() {
+      let size = ix.function(callee).map_or(0, |callee| callee.size());
+      println!("  calls {callee:#x}, {size} bytes");
    }
 }
 

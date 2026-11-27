@@ -15,7 +15,9 @@ pub mod desktop;
 pub mod gateway_send;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod http;
+pub mod index;
 pub mod ios;
+pub mod locate;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod macos;
 pub mod mobile;
