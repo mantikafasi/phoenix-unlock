@@ -298,9 +298,15 @@ struct UiState {
    filter:           PluginFilter,
    expanded_plugins: HashSet<String>,
    open_select:      Option<(String, String)>,
-   cat_desktop_open: bool,
-   cat_partial_open: bool,
-   cat_mobile_open:  bool,
+   open_groups:      HashSet<CatalogGroup>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+enum CatalogGroup {
+   Desktop,
+   Partial,
+   Other,
 }
 
 impl Default for UiState {
@@ -310,9 +316,7 @@ impl Default for UiState {
          filter:           PluginFilter::All,
          expanded_plugins: HashSet::new(),
          open_select:      None,
-         cat_desktop_open: true,
-         cat_partial_open: false,
-         cat_mobile_open:  false,
+         open_groups:      HashSet::from([CatalogGroup::Desktop]),
       }
    }
 }
@@ -333,7 +337,7 @@ enum Action {
       key:    String,
       value:  String,
    },
-   ToggleCatalogGroup(u8),
+   ToggleCatalogGroup(CatalogGroup),
    ToggleStaff,
    ReloadAll,
    OpenDevTools,
@@ -458,10 +462,8 @@ unsafe extern "C" fn button_callback(
          },
          Action::ToggleCatalogGroup(group) => {
             let mut ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
-            match group {
-               0 => ui.cat_desktop_open = !ui.cat_desktop_open,
-               1 => ui.cat_partial_open = !ui.cat_partial_open,
-               _ => ui.cat_mobile_open = !ui.cat_mobile_open,
+            if !ui.open_groups.remove(&group) {
+               ui.open_groups.insert(group);
             }
          },
          Action::ReloadAll => phoenix_runtime::reload_all(),
@@ -1537,16 +1539,14 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
       .unwrap_or_else(PoisonError::into_inner)
       .clear();
 
-   let (tab, filter, expanded_plugins, open_select, cat_desktop, cat_partial, cat_mobile) = {
+   let (tab, filter, expanded_plugins, open_select, open_groups) = {
       let ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
       (
          ui.tab,
          ui.filter,
          ui.expanded_plugins.clone(),
          ui.open_select.clone(),
-         ui.cat_desktop_open,
-         ui.cat_partial_open,
-         ui.cat_mobile_open,
+         ui.open_groups.clone(),
       )
    };
 
@@ -1616,7 +1616,7 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
       },
       Tab::Catalog => {
          let installed: HashSet<String> = plugins.iter().map(|p| p.name.clone()).collect();
-         root = render_catalog_tab(&b, root, &installed, cat_desktop, cat_partial, cat_mobile);
+         root = render_catalog_tab(&b, root, &installed, &open_groups);
       },
       Tab::General => {
          root = render_general_tab(&b, root);
@@ -2000,7 +2000,7 @@ fn render_plugins_tab(
 fn render_catalog_group(
    b: &Builder,
    mut root: RawDiv,
-   group_id: u8,
+   group: CatalogGroup,
    title: &str,
    subtitle: &str,
    items: &[&Listed],
@@ -2019,13 +2019,13 @@ fn render_catalog_group(
    section = b.push_div(
       section,
       b.action_row(
-         &format!("sunbird-cat-group-{group_id}"),
+         &format!("sunbird-cat-group-{}", group as u8),
          title,
          subtitle,
          &btn_lbl,
          BtnVariant::Secondary,
          BtnSize::Small,
-         Action::ToggleCatalogGroup(group_id),
+         Action::ToggleCatalogGroup(group),
       ),
    );
    if open {
@@ -2075,9 +2075,7 @@ fn render_catalog_tab(
    b: &Builder,
    mut root: RawDiv,
    installed: &HashSet<String>,
-   desktop_open: bool,
-   partial_open: bool,
-   mobile_open: bool,
+   open_groups: &HashSet<CatalogGroup>,
 ) -> RawDiv {
    root = b.push_div(
       root,
@@ -2155,32 +2153,32 @@ fn render_catalog_tab(
          root = render_catalog_group(
             b,
             root,
-            0,
+            CatalogGroup::Desktop,
             "Desktop Ready",
             "Confirmed working on Desktop Phoenix.",
             &desktop,
             installed,
-            desktop_open,
+            open_groups.contains(&CatalogGroup::Desktop),
          );
          root = render_catalog_group(
             b,
             root,
-            1,
+            CatalogGroup::Partial,
             "Partial Desktop Support",
             "Core hooks work on desktop; some features are still pending or unconfirmed.",
             &partial,
             installed,
-            partial_open,
+            open_groups.contains(&CatalogGroup::Partial),
          );
          root = render_catalog_group(
             b,
             root,
-            2,
+            CatalogGroup::Other,
             "Mobile Only & Unverified",
             "Targets Android Phoenix's UI tree or has not been confirmed on desktop yet.",
             &other,
             installed,
-            mobile_open,
+            open_groups.contains(&CatalogGroup::Other),
          );
       },
    }
