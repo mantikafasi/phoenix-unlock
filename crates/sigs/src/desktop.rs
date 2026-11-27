@@ -4598,12 +4598,9 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
 
    // Set C: every function referencing any copy of the `RichTextState` "read"
    // panic string (may appear in multiple CGUs).
-   // COFF merges the panic's verb into the type name's literal, ELF loads the
-   // bare name.
-   let read_panic = match abi {
-      Abi::Win64 => READ_PANIC,
-      Abi::SysV => &READ_PANIC[b"read".len()..],
-   };
+   // The panic passes the verb and the type name as two pointers. COFF shares
+   // the verb with any literal starting "read", so only the name marks C.
+   let read_panic = &READ_PANIC[b"read".len()..];
    let leas = string_leas(image, &[read_panic, TEXT_INPUT_TYPE, TEXT_AREA_TYPE]);
    let read_panics = image.find_bytes(read_panic);
    if read_panics.is_empty() {
@@ -4764,10 +4761,19 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
    };
    // ELF can keep two copies of `set_value` from different codegen units,
    // one with its drops outlined, each calling its own `Arc<str>::drop_slow`.
-   let resolved = set_value_hits
+   let (resolved, failed): (Vec<_>, Vec<_>) = set_value_hits
       .iter()
-      .map(|&(func, calls)| Ok((func, set_value_callees(calls)?)))
-      .collect::<Found<Vec<(usize, (usize, bool, usize))>>>()?;
+      .map(|&(func, calls)| set_value_callees(calls).map(|found| (func, found)))
+      .partition(Result::is_ok);
+   let resolved = resolved
+      .into_iter()
+      .filter_map(Result::ok)
+      .collect::<Vec<(usize, (usize, bool, usize))>>();
+   if resolved.is_empty()
+      && let Some(Err(err)) = failed.into_iter().next()
+   {
+      return Err(err);
+   }
    let Some(&(set_value, (arc_drop_slow, _, update_entity_dyn))) = resolved
       .iter()
       .find(|(_, (_, inline, _))| *inline)
