@@ -230,11 +230,12 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
    const PUSHES: usize = 3;
 
    let sidebar = ix.literal(ID).one("us-logout load")?;
-   let ids = ix.text(ID);
    let steps = sidebar.steps();
    let load = steps
       .iter()
-      .position(|step| matches!(step.op, Op::Addr { target, .. } if ids.contains(&target)))
+      .position(|step| {
+         matches!(step.op, Op::Addr { target, .. } if ix.image.read(target, ID.len()) == Some(ID))
+      })
       .ok_or("the sidebar never takes us-logout's address")?;
    let mut calls = steps[load..].iter().filter_map(|step| {
       match step.op {
@@ -361,11 +362,17 @@ fn mana_icon(ix: &Index<'_>, name: &str) -> Found<u16> {
          .is_some_and(|at| image.read(at, 1).is_some())
    };
    let text = |at: Option<usize>, len: Option<usize>| image.read(at?, len?);
-   for slot in ix
-      .text(ANCHOR)
-      .into_iter()
-      .flat_map(|at| image.pointers_to(at))
-   {
+   // Record tables are `(ptr, len)` pairs the index already holds; only
+   // Windows' split tables need the whole-image scans.
+   let records = ix
+      .strs()
+      .iter()
+      .filter(|slot| slot.len == ANCHOR.len() && image.read(slot.ptr, slot.len) == Some(ANCHOR))
+      .map(|slot| slot.slot);
+   let anywhere = std::iter::once(ANCHOR)
+      .flat_map(|anchor| ix.text(anchor))
+      .flat_map(|at| image.pointers_to(at));
+   for slot in records.chain(anywhere) {
       // Windows: a run of pointers right after a run of as many lengths.
       let mut start = slot;
       while start.checked_sub(width).is_some_and(points) {
