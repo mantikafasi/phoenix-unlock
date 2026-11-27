@@ -280,7 +280,7 @@ pub fn prepare() -> Result<(), Error> {
    }
    feature("icons", || icons::install(&image));
    feature("composer", || composer::install(&image));
-   feature("spotify", || spotify::install(&image));
+   feature("spotify", || spotify::install(&ix));
    feature("sidebar", || sidebar::install(&image));
    feature("toolbar", || toolbar::install(&image));
    feature("badges", || badges::install(&image, &ix));

@@ -5,6 +5,7 @@
 pub mod message;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod settings;
+pub mod spotify;
 pub mod staff;
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
@@ -50,6 +51,16 @@ pub const LOCATORS: &[Locator] = &[
       name:     "media fetch",
       families: DESKTOP,
       run:      |ix| media_fetch(ix).map(|func| format!("{func:?}")),
+   },
+   Locator {
+      name:     "spotify auto pause",
+      families: DESKTOP,
+      run:      |ix| spotify::auto_pause(ix).map(|patch| format!("{patch:x?}")),
+   },
+   Locator {
+      name:     "spotify idle activity",
+      families: DESKTOP,
+      run:      |ix| spotify::idle_activity(ix).map(|patch| format!("{patch:x?}")),
    },
    #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
    Locator {
