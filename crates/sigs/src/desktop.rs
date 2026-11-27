@@ -2753,38 +2753,43 @@ pub fn composer_gift(image: &Image<'_>) -> Found<usize> {
 ///
 /// Both callers are its timer's poll, which passes `&Arc<state>` and drops the
 /// `Arc` itself afterwards, so a `ret` (`C3`) over its first byte skips the
-/// pause and leaves nothing owned behind. The head must be `push rbp; push rsi;
-/// push rdi; sub rsp, imm32`, before which nothing has run.
+/// pause and leaves nothing owned behind. Linux logs the line from two sites
+/// in the same function. The entry must be a register push, so nothing has
+/// run before the `ret`.
 pub fn spotify_auto_pause(image: &Image<'_>) -> Found<usize> {
-   const HEAD: [u8; 6] = [0x55, 0x56, 0x57, 0x48, 0x81, 0xEC];
-
-   let logs = literal(image, b"spotify: playback auto paused")
+   let starts = literal(image, b"spotify: playback auto paused")
       .into_iter()
       .flat_map(|text| lea_refs(image, text))
+      .filter_map(|log| Some(image.function_bounds(log)?.0))
+      .collect::<HashSet<_>>()
+      .into_iter()
       .collect::<Vec<_>>();
-   let log = one("spotify auto pause log", &logs)?;
-   let (start, _) = image
-      .function_bounds(log)
-      .ok_or("spotify auto pause has no function bounds")?;
-   image
-      .read(start, HEAD.len())
-      .filter(|head| *head == HEAD)
-      .map(|_| start)
-      .ok_or_else(|| format!("spotify auto pause at {start:#x} has an unknown head"))
+   let start = one("spotify auto pause function", &starts)?;
+   if matches!(image.read(start, 2), Some(&[0x50..=0x57, _] | &[0x41, 0x50..=0x57])) {
+      Ok(start)
+   } else {
+      Err(format!("spotify auto pause at {start:#x} starts with no push"))
+   }
 }
 
 /// The `test r64, r64` that hides the Spotify activity while you are idle.
 ///
 /// Presence building computes the activity's flag as `since == 0 && shown`
-/// with `test since, since; sete al; and al, [rsp + shown]; mov [rsp + d8],
-/// al`, and drops Spotify activities when it is false. `since` is the idle
-/// time, nonzero only while idle. Turning the `test` (`85`) into `cmp` (`39`)
-/// on the same register sets ZF, so the flag is `shown` alone. The opcode is
-/// one byte, so the rewrite is atomic.
+/// with `test since, since; sete al; and al, shown; mov [rsp + d8], al`, and
+/// drops Spotify activities when it is false. `since` is the idle time,
+/// nonzero only while idle, and `shown` is the sixth argument: a stack slot on
+/// Windows, `r9b` on Linux. Turning the `test` (`85`) into `cmp` (`39`) on the
+/// same register sets ZF, so the flag is `shown` alone. The opcode is one
+/// byte, so the rewrite is atomic.
 pub fn spotify_idle_activity(image: &Image<'_>) -> Found<usize> {
-   const FLAG: Pattern = Pattern::new("?? 85 ?? 0F 94 C0 22 84 24 ?? ?? 00 00 88 44 24");
+   const WIN64: Pattern = Pattern::new("?? 85 ?? 0F 94 C0 22 84 24 ?? ?? 00 00 88 44 24");
+   const SYSV: Pattern = Pattern::new("?? 85 ?? 0F 94 C0 44 20 C8 88 44 24");
 
-   let site = one("spotify idle flag", &image.scan(FLAG))?;
+   let flag = match Abi::of(image) {
+      Abi::Win64 => WIN64,
+      Abi::SysV => SYSV,
+   };
+   let site = one("spotify idle flag", &image.scan(flag))?;
    let code = image.read(site, 3).ok_or("spotify idle flag is unmapped")?;
    let (rex, modrm) = (code[0], code[2]);
    let same_reg = (rex & 0xF8) == 0x48
