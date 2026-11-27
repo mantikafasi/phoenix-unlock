@@ -10,6 +10,10 @@
 use std::{
    ffi::c_void,
    mem::MaybeUninit,
+   ops::{
+      Deref,
+      DerefMut,
+   },
    ptr,
    slice,
    str,
@@ -18,6 +22,7 @@ use std::{
       Condvar,
       LazyLock,
       Mutex,
+      MutexGuard,
       OnceLock,
       PoisonError,
       atomic::{
@@ -173,7 +178,24 @@ pub struct ChoiceOption {
 struct CodeEditorModal {
    plugin:       String,
    pending_init: Option<String>,
-   status:       Option<(String, bool)>,
+   status:       FieldStatus,
+}
+
+#[derive(Clone)]
+enum FieldStatus {
+   Idle,
+   Working(String),
+   Failed(String),
+}
+
+impl FieldStatus {
+   fn line(&self) -> Option<(&str, u32)> {
+      match self {
+         Self::Idle => None,
+         Self::Working(msg) => Some((msg, COL_OK)),
+         Self::Failed(msg) => Some((msg, COL_ERROR)),
+      }
+   }
 }
 
 /// What a plugin's text, number or secret setting holds.
@@ -218,8 +240,7 @@ enum FieldTarget {
 struct InstallUrlModal {
    target:       FieldTarget,
    pending_init: Option<String>,
-   status:       Option<(String, bool)>,
-   busy:         bool,
+   status:       FieldStatus,
 }
 
 #[derive(Clone)]
@@ -410,6 +431,34 @@ static WINDOW_VAL_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static MODAL_OPEN: AtomicBool = AtomicBool::new(false);
 static NEXT_PAGE_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_MODAL: LazyLock<Mutex<Option<ActiveModal>>> = LazyLock::new(|| Mutex::new(None));
+
+struct ActiveGuard(MutexGuard<'static, Option<ActiveModal>>);
+
+impl Deref for ActiveGuard {
+   type Target = Option<ActiveModal>;
+
+   fn deref(&self) -> &Self::Target {
+      &self.0
+   }
+}
+
+impl DerefMut for ActiveGuard {
+   fn deref_mut(&mut self) -> &mut Self::Target {
+      &mut self.0
+   }
+}
+
+impl Drop for ActiveGuard {
+   /// `MODAL_OPEN` changes under the same lock, so a close racing an open
+   /// cannot leave a held modal undrawn.
+   fn drop(&mut self) {
+      MODAL_OPEN.store(self.0.is_some(), Ordering::Release);
+   }
+}
+
+fn active_modal() -> ActiveGuard {
+   ActiveGuard(ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner))
+}
 
 /// Main-thread-owned GPUI `Entity<FieldState>` handles, lazily created on first
 /// render when `window` and `app` are live.
@@ -702,7 +751,7 @@ unsafe extern "C" fn modal_button_callback(
          },
          ModalAction::SaveCode(plugin) => {
             let Some(code) = read_code_field(app) else {
-               set_editor_status("Could not read text field", true);
+               set_editor_status(FieldStatus::Failed("Could not read text field".to_owned()));
                return;
             };
             match phoenix_runtime::save_source(&plugin, code) {
@@ -711,16 +760,12 @@ unsafe extern "C" fn modal_button_callback(
                   phoenix_ui_desktop::toast(&format!("Saved & reloaded {plugin}"));
                },
                Err(err) => {
-                  set_editor_status(&format!("Save failed: {err}"), true);
+                  set_editor_status(FieldStatus::Failed(format!("Save failed: {err}")));
                },
             }
          },
          ModalAction::SubmitInstallUrl => {
-            let target = match ACTIVE_MODAL
-               .lock()
-               .unwrap_or_else(PoisonError::into_inner)
-               .as_ref()
-            {
+            let target = match active_modal().as_ref() {
                Some(ActiveModal::InstallUrl(inst)) => inst.target.clone(),
                _ => return,
             };
@@ -732,7 +777,9 @@ unsafe extern "C" fn modal_button_callback(
                },
                FieldTarget::Prompt(prompt) => {
                   let Some(raw) = read_url_field(app) else {
-                     set_install_status("Could not read the text field", true, false);
+                     set_install_status(FieldStatus::Failed(
+                        "Could not read the text field".to_owned(),
+                     ));
                      return;
                   };
                   let text = raw.trim().to_owned();
@@ -745,15 +792,19 @@ unsafe extern "C" fn modal_button_callback(
                },
             }
             let Some(raw) = read_url_field(app) else {
-               set_install_status("Could not read URL field", true, false);
+               set_install_status(FieldStatus::Failed("Could not read URL field".to_owned()));
                return;
             };
             let url = raw.trim().to_owned();
             if url.is_empty() {
-               set_install_status("Enter an https:// link to a plugin .js file", true, false);
+               set_install_status(FieldStatus::Failed(
+                  "Enter an https:// link to a plugin .js file".to_owned(),
+               ));
                return;
             }
-            set_install_status("Downloading and installing plugin...", false, true);
+            set_install_status(FieldStatus::Working(
+               "Downloading and installing plugin...".to_owned(),
+            ));
             std::thread::spawn(move || {
                match phoenix_runtime::install(&url) {
                   Ok(installed) => {
@@ -761,7 +812,7 @@ unsafe extern "C" fn modal_button_callback(
                      phoenix_ui_desktop::toast(&installed.to_string());
                   },
                   Err(err) => {
-                     set_install_status(&format!("{err}"), true, false);
+                     set_install_status(FieldStatus::Failed(err.to_string()));
                   },
                }
             });
@@ -898,11 +949,8 @@ fn open_panel(_spec: PageModalSpec) -> u64 {
    0
 }
 
-/// Replaces the active modal. `MODAL_OPEN` changes under the same lock, so a
-/// close racing an open cannot leave a held modal undrawn.
 fn set_active(modal: Option<ActiveModal>) {
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-   MODAL_OPEN.store(modal.is_some(), Ordering::Release);
+   let mut guard = active_modal();
    *guard = modal;
    drop(guard);
    force_redraw();
@@ -928,11 +976,7 @@ pub fn open_choice(
       return choice;
    }
    resolve_pending_choice();
-   let under = match ACTIVE_MODAL
-      .lock()
-      .unwrap_or_else(PoisonError::into_inner)
-      .as_ref()
-   {
+   let under = match active_modal().as_ref() {
       Some(ActiveModal::Page { id, spec }) => Some((*id, spec.clone())),
       Some(ActiveModal::Choice { under, .. }) => under.clone(),
       _ => None,
@@ -997,12 +1041,11 @@ pub fn dismiss_choice(choice: &Arc<Choice>) {
 /// Answers `choice` with `index` and closes its dialog, leaving any dialog
 /// that already replaced it open.
 fn finish_choice(choice: &Arc<Choice>, index: i32) {
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
+   let mut guard = active_modal();
    let current = matches!(guard.as_ref(), Some(ActiveModal::Choice { choice: active, .. }) if Arc::ptr_eq(active, choice));
    choice.pick(index);
    if current {
       *guard = uncover(guard.take());
-      MODAL_OPEN.store(guard.is_some(), Ordering::Release);
    }
    drop(guard);
    if current {
@@ -1012,7 +1055,7 @@ fn finish_choice(choice: &Arc<Choice>, index: i32) {
 
 /// Answers any open choose dialog with -1 before it is replaced.
 fn resolve_pending_choice() {
-   let guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
+   let guard = active_modal();
    if let Some(ActiveModal::Choice { choice, .. }) = guard.as_ref() {
       choice.pick(-1);
    }
@@ -1032,7 +1075,7 @@ fn uncover(closing: Option<ActiveModal>) -> Option<ActiveModal> {
 /// Swaps the sections of page `id`, on screen or under a choose dialog.
 /// False when that page is gone.
 pub fn replace_page(id: u64, spec: PageModalSpec) -> bool {
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
+   let mut guard = active_modal();
    let slot = match guard.as_mut() {
       Some(
          ActiveModal::Page { id: cur, spec }
@@ -1056,10 +1099,9 @@ pub fn close_page(id: u64) {
       phoenix_ui_desktop::close_panel(id);
       return;
    }
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
+   let mut guard = active_modal();
    if matches!(&*guard, Some(ActiveModal::Page { id: cur, .. }) if *cur == id) {
       *guard = None;
-      MODAL_OPEN.store(false, Ordering::Release);
       drop(guard);
       force_redraw();
    }
@@ -1071,7 +1113,7 @@ pub fn open_code_editor(plugin: String, initial_source: String) {
    set_active(Some(ActiveModal::CodeEditor(CodeEditorModal {
       plugin,
       pending_init: Some(initial_source),
-      status: None,
+      status: FieldStatus::Idle,
    })));
 }
 
@@ -1081,8 +1123,7 @@ pub fn open_install_url() {
    set_active(Some(ActiveModal::InstallUrl(InstallUrlModal {
       target:       FieldTarget::Install,
       pending_init: Some(String::new()),
-      status:       None,
-      busy:         false,
+      status:       FieldStatus::Idle,
    })));
 }
 
@@ -1092,8 +1133,7 @@ pub fn open_setting_editor(field: SettingField) {
    set_active(Some(ActiveModal::InstallUrl(InstallUrlModal {
       pending_init: Some(field.initial.clone()),
       target:       FieldTarget::Setting(field),
-      status:       None,
-      busy:         false,
+      status:       FieldStatus::Idle,
    })));
 }
 
@@ -1104,8 +1144,7 @@ pub fn open_prompt(prompt: Prompt) {
    set_active(Some(ActiveModal::InstallUrl(InstallUrlModal {
       target:       FieldTarget::Prompt(prompt),
       pending_init: Some(String::new()),
-      status:       None,
-      busy:         false,
+      status:       FieldStatus::Idle,
    })));
 }
 
@@ -1118,7 +1157,9 @@ fn save_setting(app: *mut c_void, field: &SettingField) {
       read_url_field(app)
    };
    let Some(raw) = raw else {
-      set_install_status("Could not read the text field", true, false);
+      set_install_status(FieldStatus::Failed(
+         "Could not read the text field".to_owned(),
+      ));
       return;
    };
    let text = raw.trim();
@@ -1126,7 +1167,7 @@ fn save_setting(app: *mut c_void, field: &SettingField) {
       match text.parse::<f64>() {
          Ok(number) if number.is_finite() => phoenix_runtime::Chosen::Number(number),
          _ => {
-            set_install_status("Enter a number", true, false);
+            set_install_status(FieldStatus::Failed("Enter a number".to_owned()));
             return;
          },
       }
@@ -1139,27 +1180,25 @@ fn save_setting(app: *mut c_void, field: &SettingField) {
 
 fn close_active() {
    resolve_pending_choice();
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
+   let mut guard = active_modal();
    *guard = uncover(guard.take());
-   MODAL_OPEN.store(guard.is_some(), Ordering::Release);
    drop(guard);
    force_redraw();
 }
 
-fn set_editor_status(msg: &str, is_error: bool) {
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
+fn set_editor_status(status: FieldStatus) {
+   let mut guard = active_modal();
    if let Some(ActiveModal::CodeEditor(ed)) = guard.as_mut() {
-      ed.status = Some((msg.to_owned(), is_error));
+      ed.status = status;
    }
    drop(guard);
    force_redraw();
 }
 
-fn set_install_status(msg: &str, is_error: bool, busy: bool) {
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
+fn set_install_status(status: FieldStatus) {
+   let mut guard = active_modal();
    if let Some(ActiveModal::InstallUrl(inst)) = guard.as_mut() {
-      inst.status = Some((msg.to_owned(), is_error));
-      inst.busy = busy;
+      inst.status = status;
    }
    drop(guard);
    force_redraw();
@@ -1990,11 +2029,8 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
    // Snapshot active modal & take any one-shot `pending_init` text to push into
    // the native GPUI `FieldState`.
    let modal_snapshot = {
-      let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-      let Some(active) = guard.as_mut() else {
-         MODAL_OPEN.store(false, Ordering::Release);
-         return None;
-      };
+      let mut guard = active_modal();
+      let active = guard.as_mut()?;
       let snapshot = match active {
          ActiveModal::Page { spec, .. } | ActiveModal::Choice { spec, .. } => {
             Snapshot::Page(spec.clone())
@@ -2011,7 +2047,6 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                target:       inst.target.clone(),
                pending_init: inst.pending_init.take(),
                status:       inst.status.clone(),
-               busy:         inst.busy,
             })
          },
       };
@@ -2049,9 +2084,8 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
          let mut body = gpui::v_stack(10.0);
          if let Some(ref mut b) = body {
             gpui::style_div(b, |s| s.length(s.at.size[0], W_FULL));
-            if let Some((msg, is_err)) = &ed.status
-               && let Some(st) =
-                  plain_text_div(msg, Some(if *is_err { COL_ERROR } else { COL_OK }), 13.0)
+            if let Some((msg, color)) = ed.status.line()
+               && let Some(st) = plain_text_div(msg, Some(color), 13.0)
             {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), st);
             }
@@ -2185,9 +2219,8 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
             ) {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), msg);
             }
-            if let Some((msg, is_err)) = &inst.status
-               && let Some(st) =
-                  plain_text_div(msg, Some(if *is_err { COL_ERROR } else { COL_OK }), 13.0)
+            if let Some((msg, color)) = inst.status.line()
+               && let Some(st) = plain_text_div(msg, Some(color), 13.0)
             {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), st);
             }
@@ -2202,7 +2235,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
          ) {
             footer.push(btn);
          }
-         if !inst.busy
+         if !matches!(inst.status, FieldStatus::Working(_))
             && let Some(btn) = make_modal_button(
                "sunbird-url-install",
                match inst.target {
