@@ -134,7 +134,7 @@ impl Target {
                place:  seen
                   .long_pressed
                   .clone()
-                  .map_or(Place::Screen, Place::Message),
+                  .unwrap_or(Place::Screen),
             })
          },
          Self::Profile => {
@@ -257,7 +257,7 @@ pub fn tab_row(mirror: &Mirror, pager: i32) -> Option<(i32, i32)> {
 /// What the dispatches and batches showed about the screen.
 #[derive(Default)]
 pub struct Seen {
-   pub long_pressed: Option<String>,
+   pub long_pressed: Option<Place>,
    pub profile_user: Option<String>,
 }
 

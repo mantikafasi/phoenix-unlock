@@ -136,6 +136,11 @@ pub struct Contribution {
 pub enum Place {
    Screen,
    Message(String),
+   /// A row with no message id, `offset` message rows after `anchor`'s.
+   MessageNear {
+      anchor: String,
+      offset: i32,
+   },
    User(Option<String>),
    /// A DM, whose one recipient member decorations are about.
    Channel(String),

@@ -5,6 +5,7 @@ pub const SEARCH_ENTRY: &str = "search.entry";
 pub const COMPOSER_EXPRESSIONS: &str = "composer.expressions";
 pub const MESSAGE_ACTIONS: &str = "message.actions.root";
 pub const MESSAGE_DELETE: &str = "message.actions.delete";
+pub const MESSAGE_ROW: &str = "message-row";
 pub const PROFILE_TAB_PAGES: &str = "profile-tab-pages";
 pub const SUGGESTIONS: &str = "suggestions";
 pub const AVATAR: &str = "Avatar";
