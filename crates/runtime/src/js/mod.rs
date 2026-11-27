@@ -183,12 +183,14 @@ impl Budget {
    }
 }
 
+#[derive(Clone)]
 struct Loaded {
    source: String,
    origin: Origin,
    state:  PluginState,
 }
 
+#[derive(Clone)]
 enum Origin {
    Bundled,
    /// Read from `home/plugins`, so the user can delete it.
@@ -583,7 +585,12 @@ impl Engine {
 
    /// Adds `name` or replaces its source, then runs it unless the user turned
    /// it off.
-   pub fn install(&mut self, name: &str, source: String) {
+   ///
+   /// New code that throws while starting is dropped and its error returned.
+   /// The version that ran before runs again, and a new plugin is not added.
+   /// Over a version that already failed, the new code stays.
+   pub fn install(&mut self, name: &str, source: String) -> Result<(), String> {
+      let previous = self.plugins.get(name).cloned();
       let enabled = if let Some(loaded) = self.plugins.get_mut(name) {
          loaded.install(source);
          loaded.state.is_on()
@@ -593,9 +600,32 @@ impl Engine {
          self.plugins.insert(name.to_owned(), loaded);
          true
       };
-      if enabled {
-         self.unload(name);
-         self.eval(name);
+      if !enabled {
+         return Ok(());
+      }
+      self.unload(name);
+      self.eval(name);
+      let Some(error) = self
+         .plugins
+         .get(name)
+         .and_then(|loaded| loaded.state.error())
+         .map(str::to_owned)
+      else {
+         return Ok(());
+      };
+      match previous {
+         Some(previous) if matches!(previous.state, PluginState::On) => {
+            self.unload(name);
+            self.plugins.insert(name.to_owned(), previous);
+            self.eval(name);
+            Err(error)
+         },
+         Some(_) => Ok(()),
+         None => {
+            self.unload(name);
+            self.plugins.remove(name);
+            Err(error)
+         },
       }
    }
 
@@ -1081,4 +1111,24 @@ mod tests {
       assert_eq!(installed(&dir).unwrap(), Vec::<(String, String)>::new());
    }
 
+   fn loaded(state: PluginState) -> Loaded {
+      let mut loaded = Loaded::new("const works = 1;".to_owned(), Origin::Installed);
+      loaded.state = state;
+      loaded
+   }
+
+   #[test]
+   fn code_for_a_plugin_that_is_off_is_saved_without_running() {
+      let mut engine = Engine::new(&GatewayRegistry::default()).expect("engine initializes");
+      engine
+         .plugins
+         .insert("p".to_owned(), loaded(PluginState::Off));
+      let broken = "throw new Error('boom');";
+      assert!(engine.install("p", broken.to_owned()).is_ok());
+      assert_eq!(engine.source("p").as_deref(), Some(broken));
+      assert!(matches!(
+         engine.plugins.get("p").map(|loaded| &loaded.state),
+         Some(PluginState::Off)
+      ));
+   }
 }
