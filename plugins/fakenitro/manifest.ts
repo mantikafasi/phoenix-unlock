@@ -1,7 +1,7 @@
 export default {
    description:
       "Unlocks Nitro stream quality, themes and app icons, sends custom emojis and stickers as links, and renders fake emojis, stickers, and GIFs as real ones",
-   version: "0.6.0",
+   version: "0.7.0",
    author: "mantikafasi",
    permissions: {
       gateway: [

@@ -622,12 +622,65 @@ const restoreResponse = (res: Phoenix.InterceptedResponse) => {
 phoenix.discord.onResponse({ method: "PATCH", ...SETTINGS_PROTO }, restoreResponse);
 phoenix.discord.onResponse({ method: "GET", ...SETTINGS_PROTO }, restoreResponse);
 
+// --- Perks fallback: where this build has no native unlock (Linux, macOS, or a
+// Windows build a locator missed), grant the perks the client reads itself ---
+
+const PERK_STREAM_MID_QUALITY = 9;
+const PERK_STREAM_HIGH_QUALITY = 10;
+const PERK_CLIENT_THEMES = 17;
+const PERK_APP_ICONS = 27;
+
+type Perks = { active_perks_bitmask?: unknown; config_by_perk?: Record<string, unknown> | null };
+
+const fallbackPerks = () => {
+  const perks: number[] = [];
+  if (settings.enableStreamQualityBypass && !phoenix.stream?.native) {
+    perks.push(PERK_STREAM_MID_QUALITY, PERK_STREAM_HIGH_QUALITY);
+  }
+  if (settings.enableAppearanceBypass && !phoenix.appearance?.native) {
+    perks.push(PERK_CLIENT_THEMES, PERK_APP_ICONS);
+  }
+  return perks;
+};
+
+// Each word holds 64 perks: `|` keeps only 32 bits, and a double holds the rest
+// exactly only up to 2^53, so bits are added and an unsafe word is left alone.
+const grantPerks = (user: unknown): boolean => {
+  const perks = (user as { perks?: Perks } | null | undefined)?.perks;
+  const words = perks?.active_perks_bitmask;
+  if (!perks || !Array.isArray(words)) return false;
+  let changed = false;
+  for (const perk of fallbackPerks()) {
+    const at = Math.floor(perk / 64);
+    while (words.length <= at) words.push(0);
+    const word: unknown = words[at];
+    const value = 2 ** (perk % 64);
+    if (typeof word !== "number" || !Number.isSafeInteger(word)) continue;
+    if (Math.floor(word / value) % 2 === 0) {
+      if (!Number.isSafeInteger(word + value)) continue;
+      words[at] = word + value;
+      changed = true;
+    }
+    // A promotion grants a perk limited to a few options, like one theme or
+    // one icon, which would keep the others locked.
+    if (perks.config_by_perk && String(perk) in perks.config_by_perk) {
+      delete perks.config_by_perk[String(perk)];
+      changed = true;
+    }
+  }
+  return changed;
+};
+
+if (fallbackPerks().length) {
+  phoenix.log.info(`no native unlock for perks ${fallbackPerks().join(", ")}, granting them client-side`);
+}
+
 if (gateway.ready) {
   phoenix.hook(gateway.ready, {
     before(ready) {
-      if (!settings.enableAppearanceBypass) return;
-      const payload = ready as { user_settings_proto?: string };
-      if (!payload.user_settings_proto) return;
+      const payload = ready as { user?: unknown; user_settings_proto?: string };
+      grantPerks(payload.user);
+      if (!settings.enableAppearanceBypass || !payload.user_settings_proto) return;
       try {
         const restored = restoreTheme(payload.user_settings_proto);
         if (restored) payload.user_settings_proto = restored;
@@ -637,6 +690,20 @@ if (gateway.ready) {
     },
   });
 }
+
+if (gateway.userUpdate) {
+  phoenix.hook(gateway.userUpdate, {
+    before(user) {
+      grantPerks(user);
+    },
+  });
+}
+
+phoenix.discord.onResponse({ method: "GET", pathPrefix: "/users/@me" }, (res) => {
+  if (res.path.split("?")[0] !== "/users/@me" || res.status !== 200) return;
+  const user = res.json<object>();
+  return user && grantPerks(user) ? { body: user } : undefined;
+});
 
 syncStreamUnlock(settings.enableStreamQualityBypass);
 syncAppearanceUnlock(settings.enableAppearanceBypass);
