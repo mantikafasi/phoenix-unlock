@@ -1293,6 +1293,10 @@ declare namespace Phoenix {
     /// tiers (1080p, 1440p, Source, 60 FPS) on Desktop Phoenix while the handle is active.
     /// No-op on mobile.
     unlockQuality(): Remover;
+    /// Whether this build's quality check and HD feature are hooked, so `unlockQuality` reaches
+    /// the whole Go Live picker. False on mobile and where a locator missed (Linux and macOS
+    /// so far).
+    readonly native: boolean;
   }
 
   interface Appearance {
@@ -1301,6 +1305,9 @@ declare namespace Phoenix {
     /// Discord's premium feature lists differ from the ones their id was measured on. No-op on
     /// mobile.
     unlockNitro(): Remover;
+    /// Whether this build's theme perk and app icon feature are hooked, so `unlockNitro` reaches
+    /// both. False on mobile and where a locator missed (Linux and macOS so far).
+    readonly native: boolean;
   }
 
   /// `channelId` is the open channel, `reply` posts a local message there.

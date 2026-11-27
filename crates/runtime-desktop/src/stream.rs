@@ -281,6 +281,20 @@ pub fn unlock(on: bool) {
    }
 }
 
+/// Whether this build's quality check and HD feature are hooked, so
+/// [`unlock`] reaches the whole Go Live picker.
+pub fn quality_hooked() -> bool {
+   CHECK.get().is_some() && FEATURE_ORIGINAL.load(Ordering::Acquire) != 0
+}
+
+/// Whether this build's theme perk and app icon feature are hooked, so
+/// [`unlock_appearance`] reaches both.
+pub fn appearance_hooked() -> bool {
+   PERKS.get().is_some()
+      && APP_ICONS.get().is_some()
+      && FEATURE_ORIGINAL.load(Ordering::Acquire) != 0
+}
+
 /// While `on`, Nitro color themes and app icons count as available.
 pub fn unlock_appearance(on: bool) {
    THEMES_UNLOCKED.store(on, Ordering::Release);
