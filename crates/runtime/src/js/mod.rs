@@ -412,6 +412,15 @@ impl Engine {
       self.plugins.get(name).map(|loaded| loaded.source.clone())
    }
 
+   /// The bundled copy an installed one replaced.
+   #[must_use]
+   pub fn bundled(&self, name: &str) -> Option<String> {
+      match &self.plugins.get(name)?.origin {
+         Origin::Replacing(bundled) => Some(bundled.clone()),
+         Origin::Bundled | Origin::Installed => None,
+      }
+   }
+
    #[must_use]
    pub fn plugins(&self) -> Vec<PluginInfo> {
       self.with(|ctx| {

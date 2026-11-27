@@ -479,6 +479,12 @@ pub fn source(name: &str) -> Option<String> {
    engine()?.source(name)
 }
 
+/// The bundled copy an installed plugin replaced.
+#[must_use]
+pub fn bundled_source(name: &str) -> Option<String> {
+   engine()?.bundled(name)
+}
+
 /// What an uninstall left in the plugin's place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Uninstalled {
