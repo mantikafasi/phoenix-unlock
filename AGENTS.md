@@ -50,6 +50,7 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `scripts/*.nu` | `phoenix.nu` builds, patches, and installs on a phone; `site.nu` builds the site's native libs and wasm. |
 | `scripts/sunbird-{linux,macos}.sh` | Desktop installers served by the site. Each creates a launcher that fetches the loader before every start and leaves Discord's own files untouched. |
 | `scripts/dev.ps1` | Windows dev loop (details below). |
+| `scripts/dev-macos.sh` | macOS dev loop: builds, copies plugins, relaunches the installed `Sunbird.app` copy with the new dylib, and wraps the debug shell (`help` lists commands). |
 
 ## Building
 
