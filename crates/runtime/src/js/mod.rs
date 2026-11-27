@@ -326,16 +326,35 @@ impl Engine {
    }
 
    /// Runs promise reactions until none are left. `QuickJS` queues them, and
-   /// nothing else runs the queue.
+   /// nothing else runs the queue. They share one budget.
    fn drain(&self) {
-      loop {
-         self.budget.restart();
+      self.budget.restart();
+      while !self.budget.spent() {
          match self.runtime.execute_pending_job() {
             Ok(true) => {},
-            Ok(false) => break,
+            Ok(false) => return,
             Err(err) => log::error!("a promise job threw: {err}"),
          }
       }
+      self.starve();
+   }
+
+   /// Runs out the queue with every allocation failing. A job that would
+   /// queue another cannot, so the queue only shrinks, where a promise that
+   /// queues two more on every run would outgrow the budget forever. A cap at
+   /// the heap's current size let each job reuse what the last one freed.
+   fn starve(&self) {
+      self.runtime.set_memory_limit(1);
+      let mut failed = 0_u64;
+      loop {
+         match self.runtime.execute_pending_job() {
+            Ok(true) => {},
+            Ok(false) => break,
+            Err(_) => failed += 1,
+         }
+      }
+      self.runtime.set_memory_limit(HEAP_LIMIT);
+      log::error!("promise jobs ran past {BUDGET:?}, {failed} more failed to finish");
    }
 
    #[must_use]
