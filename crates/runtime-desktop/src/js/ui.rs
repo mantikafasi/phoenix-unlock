@@ -72,6 +72,7 @@ use crate::{
    },
    double_click,
    emoji,
+   forward,
    icons,
    js::Desktop,
    members::Place,
@@ -1765,6 +1766,15 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          disable_call_idle(&ctx, &idle_owner, &name)
       })?,
    )?;
+   if forward::ready() {
+      let forward_owner = plugin.to_owned();
+      ui.set(
+         "disableForwardFollow",
+         Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+            disable_forward_follow(&ctx, &forward_owner)
+         })?,
+      )?;
+   }
 
    let owner = plugin.to_owned();
    ui.set(
@@ -2117,6 +2127,26 @@ fn disable_call_idle<'js>(
       let mut off = registry.idle_off.borrow_mut();
       off.retain(|&(held, ..)| held != hold);
       call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
+   })
+}
+
+/// `phoenix.ui.disableForwardFollow`, until the returned remover runs.
+fn disable_forward_follow<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function<'js>> {
+   static NEXT_HOLD: AtomicU64 = AtomicU64::new(1);
+
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   let hold = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
+   registry.forward_off.borrow_mut().push((hold, plugin.to_owned()));
+   forward::turn_off(true);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut off = registry.forward_off.borrow_mut();
+      off.retain(|&(held, _)| held != hold);
+      forward::turn_off(!off.is_empty());
    })
 }
 

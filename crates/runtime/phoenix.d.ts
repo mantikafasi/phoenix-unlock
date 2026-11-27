@@ -1566,6 +1566,9 @@ declare namespace Phoenix {
     /// way Discord's member list toggle hides members. The width the user dragged it to comes
     /// back on restore. Available on Desktop Phoenix builds with a recognized sidebar.
     collapseChannels?(): Remover;
+    /// Keeps the current channel open after forwarding a message to one destination, which
+    /// Discord otherwise switches to, until the returned function runs. Desktop only.
+    disableForwardFollow?(): Remover;
     /// Runs `run` when `key` (one letter or digit) is pressed with the given modifiers while
     /// Discord is focused, and keeps the key from Discord. `ctrl` or `alt` is required.
     /// Desktop Phoenix only. On macOS `ctrl` is Command and `alt` is Option. Linux and macOS
