@@ -83,6 +83,7 @@ use crate::{
    },
    shortcuts,
    sidebar,
+   stream,
    toolbar,
 };
 
@@ -1495,6 +1496,26 @@ pub fn desktop_patch_api<'js>(
    )?;
    api.set("commands", commands)?;
    api.set("themes", crate::js::themes::object(ctx, plugin)?)?;
+   let stream_obj = Object::new(ctx.clone())?;
+   let name = plugin.to_owned();
+   stream_obj.set(
+      "unlockQuality",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+         unlock_stream_quality(&ctx, &name)
+      })?,
+   )?;
+   stream_obj.set("native", stream::quality_hooked())?;
+   api.set("stream", stream_obj)?;
+   let appearance = Object::new(ctx.clone())?;
+   let name = plugin.to_owned();
+   appearance.set(
+      "unlockNitro",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+         unlock_appearance(&ctx, &name)
+      })?,
+   )?;
+   appearance.set("native", stream::appearance_hooked())?;
+   api.set("appearance", appearance)?;
    api.set("ui", desktop_ui_object(ctx, plugin)?)
 }
 
@@ -1856,6 +1877,54 @@ fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result
 #[cfg(not(target_arch = "x86_64"))]
 fn hide_count<'js>(ctx: &Ctx<'js>, _plugin: &str, _name: &str) -> rquickjs::Result<Function<'js>> {
    noop_handle(ctx)
+}
+
+/// Unlocks Nitro and boost-gated Go Live stream resolutions and framerates
+/// while at least one handle is alive.
+fn unlock_stream_quality<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function<'js>> {
+   static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+   let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+   let registry = ctx
+      .userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .stream_unlocks
+      .borrow_mut()
+      .push((id, plugin.to_owned()));
+   stream::unlock(true);
+   drop(registry);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut unlocks = registry.stream_unlocks.borrow_mut();
+         unlocks.retain(|(existing, _)| *existing != id);
+         stream::unlock(!unlocks.is_empty());
+      }
+   })
+}
+
+/// Unlocks Nitro color themes and app icons while at least one handle is
+/// alive.
+fn unlock_appearance<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function<'js>> {
+   static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+   let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+   let registry = ctx
+      .userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .appearance_unlocks
+      .borrow_mut()
+      .push((id, plugin.to_owned()));
+   stream::unlock_appearance(true);
+   drop(registry);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut unlocks = registry.appearance_unlocks.borrow_mut();
+         unlocks.retain(|(existing, _)| *existing != id);
+         stream::unlock_appearance(!unlocks.is_empty());
+      }
+   })
 }
 
 pub fn on_send<'js>(

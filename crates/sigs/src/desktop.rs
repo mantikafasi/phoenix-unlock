@@ -103,20 +103,30 @@ impl Prologue {
 #[derive(Clone, Copy)]
 pub struct Prologues {
    /// `MessageRow::render`, `build_message_body` and `MessageContextMenu`.
-   pub row:         Prologue,
+   pub row:             Prologue,
    /// `host::section`, `Workspace::render_overlays`, `Store::delete_message`
    /// and `ReqwestTransport::send`.
-   pub frame:       Prologue,
-   pub media_fetch: Prologue,
+   pub frame:           Prologue,
+   pub media_fetch:     Prologue,
    /// The asset loader, [`asset_load`].
-   pub asset_load:  Prologue,
+   pub asset_load:      Prologue,
    /// `getEmojiUnavailableReason`, a leaf: its first four instructions on
    /// Win64, five on System V, up to the `jne`.
-   pub emoji_check: Prologue,
+   pub emoji_check:     Prologue,
    /// READY's parse, [`ready_parse`]. Only seen on Win64 so far.
-   pub ready_parse: Option<Prologue>,
+   pub ready_parse:     Option<Prologue>,
    /// [`ready_text`], Win64 only.
-   pub ready_text:  Option<Prologue>,
+   pub ready_text:      Option<Prologue>,
+   /// `meetsApplicationStreamRequirements`, a leaf checking stream resolution
+   /// and FPS against Nitro and boost tiers. Its System V entry has not been
+   /// measured, and the hook stays off where there is no prologue.
+   pub stream_quality:  Option<Prologue>,
+   /// `canUsePremiumFeature`, a leaf: up to the first `jne`. Its System V
+   /// entry has not been measured either.
+   pub premium_feature: Option<Prologue>,
+   /// The premium perks accessor: three pushes, `sub rsp, 50h`, the frame
+   /// pointer and its unwind marker.
+   pub perks:           Option<Prologue>,
 }
 
 impl Prologues {
@@ -131,59 +141,75 @@ impl Prologues {
       match abi {
          Abi::Win64 => {
             Self {
-               row:         Prologue {
+               row:             Prologue {
                   pattern: ROW_PROLOGUE,
                   len:     ROW_PROLOGUE_LEN,
                },
-               frame:       Prologue {
+               frame:           Prologue {
                   pattern: FRAME_PROLOGUE,
                   len:     FRAME_PROLOGUE_LEN,
                },
-               media_fetch: Prologue {
+               media_fetch:     Prologue {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
-               asset_load:  Prologue {
+               asset_load:      Prologue {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
-               emoji_check: Prologue {
+               emoji_check:     Prologue {
                   pattern: Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02"),
                   len:     14,
                },
                // `push rbp; push rsi; sub rsp, imm32; lea rbp, [rsp + imm32]`.
-               ready_parse: Some(Prologue {
+               ready_parse:     Some(Prologue {
                   pattern: Pattern::new("55 56 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ??"),
                   len:     17,
                }),
-               ready_text:  Some(Prologue {
+               ready_text:      Some(Prologue {
                   pattern: Pattern::new("41 56 56 57 53 48 81 EC ?? ?? ?? ?? 4C 89 C7"),
                   len:     15,
+               }),
+               stream_quality:  Some(Prologue {
+                  pattern: Pattern::new("56 57 55 53 44 8B 54 24 ?? 44 8B 5C 24 ??"),
+                  len:     14,
+               }),
+               premium_feature: Some(Prologue {
+                  pattern: Pattern::new("80 FA ?? 0F 95 C0 4D 85 C0 41 0F 94 C2 41 08 C2"),
+                  len:     16,
+               }),
+               perks:           Some(Prologue {
+                  pattern: Pattern::new(
+                     "55 56 57 48 83 EC ?? 48 8D 6C 24 ?? 48 C7 45 F8 FE FF FF FF",
+                  ),
+                  len:     20,
                }),
             }
          },
          Abi::SysV => {
             Self {
-               row:         SYSV_FRAME,
-               frame:       SYSV_FRAME,
-               media_fetch: SYSV_FRAME,
+               row:             SYSV_FRAME,
+               frame:           SYSV_FRAME,
+               media_fetch:     SYSV_FRAME,
                // Four pushes and `sub rsp, imm32`.
-               asset_load:  Prologue {
+               asset_load:      Prologue {
                   pattern: Pattern::new("41 57 41 56 41 54 53 48 81 EC ?? ?? ?? ??"),
                   len:     14,
                },
-               emoji_check: Prologue {
+               emoji_check:     Prologue {
                   pattern: Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E"),
                   len:     14,
                },
-               ready_parse: None,
-               ready_text:  None,
+               ready_parse:     None,
+               ready_text:      None,
+               stream_quality:  None,
+               premium_feature: None,
+               perks:           None,
             }
          },
       }
    }
 }
-
 const fn prologues(image: &Image<'_>) -> Prologues {
    Prologues::of(Abi::of(image))
 }
@@ -1049,6 +1075,186 @@ pub fn entry_prologue(image: &Image<'_>, func: usize) -> Found<Prologue> {
       return Ok(Prologue { pattern, len });
    }
    Err(format!("{func:#x} opens with less than a jump's bytes"))
+}
+
+/// Phoenix's Go Live stream quality check:
+/// `bool f(&User, has_guild, guild_tier, preset, resolution, fps)`.
+///
+/// Found from the static 18-entry `ApplicationStreamSettingRequirements` table
+/// (starting with Source at 60, 30, and 15 FPS, each requiring full Nitro). The
+/// check loads the table in each of its Nitro and guild branches.
+pub fn stream_quality(image: &Image<'_>) -> Found<usize> {
+   const TABLE_HEAD: [u8; 48] = [
+      0x00, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00,
+      0x00, 0x00, 0x00,
+   ];
+   let tables = image.find_bytes(&TABLE_HEAD);
+   let mut counts: HashMap<usize, usize> = HashMap::new();
+   for sites in lea_refs_many(image, &tables).into_values() {
+      for site in sites {
+         if let Some((func, _)) = image.function_bounds(site) {
+            *counts.entry(func).or_default() += 1;
+         }
+      }
+   }
+   let candidates: Vec<usize> = counts
+      .into_iter()
+      .filter(|&(_, count)| count >= 2)
+      .map(|(func, _)| func)
+      .collect();
+   one("stream quality check", &candidates)
+}
+
+/// Phoenix's `canUsePremiumFeature(feature, tier, ..) -> bool`, and the
+/// feature the Go Live picker asks it for before HD.
+#[derive(Clone, Copy, Debug)]
+pub struct PremiumFeature {
+   pub func:        usize,
+   /// `STREAM_HIGH_QUALITY`: the HD preset, its upsell and the picker's Nitro
+   /// banner all ask for it.
+   pub stream_high: u8,
+   /// The feature User Settings, Appearance, App Icon asks for, when the tier
+   /// lists are the ones it was measured on.
+   pub app_icons:   Option<u8>,
+}
+
+/// Nitro Basic's and Classic's feature lists on the build where unlocking one
+/// feature at a time showed app icons as 0x17. No code passes the id as a
+/// constant, so it is trusted only while the lists around it stay the same: a
+/// new or renumbered feature changes them.
+const BASIC_FEATURES: [u8; 11] = [
+   0x00, 0x01, 0x05, 0x06, 0x08, 0x0B, 0x0D, 0x0F, 0x15, 0x16, 0x17,
+];
+const CLASSIC_FEATURES: [u8; 8] = [0x00, 0x01, 0x02, 0x08, 0x12, 0x15, 0x16, 0x17];
+const MEASURED_APP_ICONS: u8 = 0x17;
+
+/// The tier lists the check loads, each as `mov edx, len; lea r8, [list]`.
+fn tier_lists(image: &Image<'_>, func: usize) -> Vec<Vec<u8>> {
+   const BODY: usize = 0x120;
+   const LOAD: Pattern = Pattern::new("BA ?? 00 00 00 4C 8D 05 ?? ?? ?? ??");
+   let Some(body) = image.read(func, BODY) else {
+      return Vec::new();
+   };
+   LOAD
+      .find_in(body)
+      .into_iter()
+      .filter_map(|at| {
+         let len = usize::from(body[at + 1]);
+         let list = rel32_target(image, func + at + 8)?;
+         Some(image.read(list, len)?.to_vec())
+      })
+      .collect()
+}
+
+/// The premium feature check and its stream feature.
+///
+/// The check keeps a static list of features per tier, Nitro's being every
+/// feature in order, `00 01 .. 1B`, and loads it in one place. The stream
+/// feature comes from the picker's "Stream in HD resolution" banner, which
+/// opens with a call to a gate doing `mov dl, feature; call`.
+pub fn premium_feature(image: &Image<'_>) -> Found<PremiumFeature> {
+   const BACK: usize = 0x100;
+   const GATE: Pattern = Pattern::new("B2 ?? E8");
+   if Abi::of(image) != Abi::Win64 {
+      return Err("the stream feature gate is only decoded on Win64".to_owned());
+   }
+   // A leaf has no unwind entry, so its start is the prologue closest before
+   // the load, after `int3` padding. Other enums list `00 .. 1B` too, in
+   // functions that open differently.
+   let prologue = prologues(image)
+      .premium_feature
+      .ok_or("no premium feature prologue")?;
+   let every: Vec<u8> = (0..0x1C).collect();
+   let lists = image.find_bytes(&every);
+   let funcs: HashSet<usize> = lea_refs_many(image, &lists)
+      .into_values()
+      .flatten()
+      .filter_map(|site| {
+         let start = site.checked_sub(BACK)?;
+         let at = *prologue.pattern.find_in(image.read(start, BACK)?).last()?;
+         let func = start + at;
+         (image.read(func - 1, 1)? == [0xCC]).then_some(func)
+      })
+      .collect();
+   let func = one(
+      "premium feature check",
+      &funcs.into_iter().collect::<Vec<_>>(),
+   )?;
+
+   let banners: HashSet<usize> =
+      lea_refs_many(image, &image.find_bytes(b"Stream in HD resolution"))
+         .into_values()
+         .flatten()
+         .filter_map(|site| Some(image.function_bounds(site)?.0))
+         .collect();
+   let banner = one("HD stream banner", &banners.into_iter().collect::<Vec<_>>())?;
+   let features: Vec<u8> = calls_in(image, banner, 0x60)
+      .into_iter()
+      .filter_map(|(_, callee)| {
+         let body = image.read(callee, 0x30)?;
+         let at = *GATE.find_in(body).first()?;
+         Some(body[at + 1])
+      })
+      .collect();
+   let stream_high = *features
+      .first()
+      .ok_or("the HD stream banner opens with no feature gate")?;
+
+   let lists = tier_lists(image, func);
+   let measured = lists.len() == 3
+      && lists.contains(&every)
+      && lists.iter().any(|list| list.as_slice() == BASIC_FEATURES)
+      && lists.iter().any(|list| list.as_slice() == CLASSIC_FEATURES);
+   Ok(PremiumFeature {
+      func,
+      stream_high,
+      app_icons: measured.then_some(MEASURED_APP_ICONS),
+   })
+}
+
+/// The accessor that copies the account's premium perks out of Phoenix's
+/// store, `fn(out: &mut Perks, store) -> &mut Perks`, and the perks byte that
+/// unlocks Nitro color themes.
+#[derive(Clone, Copy, Debug)]
+pub struct ThemePerk {
+   pub accessor: usize,
+   pub field:    u8,
+}
+
+/// The premium perks accessor and the byte Appearance, Theme reads from it.
+///
+/// The section opens with `call accessor; mov r14b, [rbx + field]`, and picks
+/// between "Unlock more themes with Nitro" and the Nitro page on that byte.
+/// The perks hold the tier's upload limit and its booleans, built from the
+/// tier, not from `canUsePremiumFeature`.
+pub fn theme_perk(image: &Image<'_>) -> Found<ThemePerk> {
+   const LOAD: Pattern = Pattern::new("E8 ?? ?? ?? ?? 44 8A 73 ??");
+   if Abi::of(image) != Abi::Win64 {
+      return Err("the theme perk is only decoded on Win64".to_owned());
+   }
+   let sections: HashSet<usize> =
+      lea_refs_many(image, &image.find_bytes(b"Unlock more themes with"))
+         .into_values()
+         .flatten()
+         .filter_map(|site| Some(image.function_bounds(site)?.0))
+         .collect();
+   let found: Vec<(usize, u8)> = sections
+      .into_iter()
+      .filter_map(|section| {
+         let head = image.read(section, 0xC0)?;
+         let at = *LOAD.find_in(head).first()?;
+         let accessor = rel32_target(image, section + at + 1)?;
+         Some((accessor, head[at + 8]))
+      })
+      .collect();
+   let (accessor, field) = one("theme perk load", &found)?;
+   let prologue = prologues(image).perks.ok_or("no perks accessor prologue")?;
+   if !prologue.at(image, accessor) {
+      return Err(format!("perks accessor at {accessor:#x} opens differently"));
+   }
+   Ok(ThemePerk { accessor, field })
 }
 
 /// How the runtime sends a function's calls to a detour.

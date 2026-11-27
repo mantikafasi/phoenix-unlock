@@ -583,6 +583,45 @@ fn check(
          );
          let json = desktop::message_json(image);
          report(
+            "stream quality",
+            desktop::stream_quality(image).and_then(|func| {
+               prologues
+                  .stream_quality
+                  .is_none_or(|prologue| prologue.at(image, func))
+                  .then(|| at(func))
+                  .ok_or_else(|| "prologue changed".to_owned())
+            }),
+         );
+         // Only Win64's entries are measured, and the runtime leaves both off
+         // elsewhere.
+         if abi == x86::Abi::Win64 {
+            report(
+               "premium feature",
+               desktop::premium_feature(image).and_then(|found| {
+                  prologues
+                     .premium_feature
+                     .is_none_or(|prologue| prologue.at(image, found.func))
+                     .then(|| {
+                        let app_icons = found.app_icons.map_or_else(
+                           || "app_icons=off (tier lists changed)".to_owned(),
+                           |id| format!("app_icons={id:#x}"),
+                        );
+                        format!(
+                           "{} stream_high={:#x} {app_icons}",
+                           at(found.func),
+                           found.stream_high
+                        )
+                     })
+                     .ok_or_else(|| "prologue changed".to_owned())
+               }),
+            );
+            report(
+               "theme perk",
+               desktop::theme_perk(image)
+                  .map(|perk| format!("{} field +{:#x}", at(perk.accessor), perk.field)),
+            );
+         }
+         report(
             "message json",
             json
                .as_ref()
