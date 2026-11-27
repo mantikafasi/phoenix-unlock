@@ -255,7 +255,7 @@ fn check(
       }
    };
    let at = |addr: usize| format!("{addr:#x}");
-   let registry = GatewayRegistry::locate(image).map_err(|err| err.to_string());
+   let registry = ix.registry();
    report(
       "gateway registry",
       registry

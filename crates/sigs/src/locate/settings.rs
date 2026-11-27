@@ -16,7 +16,6 @@ use crate::{
       Value,
    },
    one,
-   registry::GatewayRegistry,
 };
 
 /// Page 24's sidebar name `Phoenix` and its id, both relabeled in place.
@@ -592,7 +591,7 @@ pub fn optimistic_delete<'ix>(ix: &'ix Index<'ix>, handler: Func<'ix>) -> Found<
 
 /// [`optimistic_delete`] from the gateway registry's `MESSAGE_DELETE` entry.
 pub fn optimistic_delete_of<'ix>(ix: &'ix Index<'ix>) -> Found<OptimisticDelete> {
-   let registry = GatewayRegistry::locate(ix.image).map_err(|err| err.to_string())?;
+   let registry = ix.registry()?;
    let id = registry.id("MESSAGE_DELETE").ok_or("no MESSAGE_DELETE")?;
    optimistic_delete(ix, ix.func(registry.entry(id).handler)?)
 }
