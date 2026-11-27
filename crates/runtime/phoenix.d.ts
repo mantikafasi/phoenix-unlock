@@ -1524,6 +1524,9 @@ declare namespace Phoenix {
       message?: string;
       options?: (string | { label: string; icon?: Icon; danger?: boolean })[];
     }): Promise<number>;
+    /// A one-line text field in a dialog, starting with `initial`. Resolves to the submitted
+    /// text, or null when the dialog closes without a submit. Desktop only, absent elsewhere.
+    prompt?(options: { title?: string; initial?: string }): Promise<string | null>;
     /// Shows a scrollable text/code viewer sheet (with optional syntax highlighting and action
     /// rows such as Copy). Resolves to the chosen option index, or -1 when dismissed.
     showSheet(options: {

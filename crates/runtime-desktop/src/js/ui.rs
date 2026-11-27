@@ -1061,6 +1061,7 @@ fn profile_sections<'js>(
                   on_press: Arc::new(move || {
                      modal::open_prompt(Prompt {
                         title:     title.clone(),
+                        initial:   String::new(),
                         on_submit: Arc::new(move |text| invoke_page_button(btn_id, Some(text))),
                      });
                   }),
@@ -1659,6 +1660,12 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       })?,
    )?;
    ui.set(
+      "prompt",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
+         prompt_dialog(&ctx, &options)
+      })?,
+   )?;
+   ui.set(
       "showSheet",
       Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
          sheet_dialog(&ctx, &options)
@@ -1685,6 +1692,37 @@ fn choose_dialog<'js>(
    let body = message.map(|text| ModalSection::Text { title: None, text });
    let title = title.unwrap_or_else(|| "Sunbird".to_owned());
    in_background(ctx, move || answer(title, body, items))
+}
+
+/// `phoenix.ui.prompt` as the native one-line field: the submitted text, or
+/// null once the field closes without a submit.
+fn prompt_dialog<'js>(
+   ctx: &Ctx<'js>,
+   options: &Object<'js>,
+) -> rquickjs::Result<rquickjs::Promise<'js>> {
+   let title = options
+      .get::<_, Option<String>>("title")?
+      .unwrap_or_else(|| "Sunbird".to_owned());
+   let initial = options
+      .get::<_, Option<String>>("initial")?
+      .unwrap_or_default();
+   in_background(ctx, move || {
+      let (tx, rx) = std::sync::mpsc::channel::<String>();
+      // The sender lives only in the modal, so closing it without a submit
+      // drops it and ends the wait.
+      let tx = std::sync::Mutex::new(Some(tx));
+      modal::open_prompt(Prompt {
+         title,
+         initial,
+         on_submit: Arc::new(move |text| {
+            if let Some(tx) = tx.lock().ok().and_then(|mut tx| tx.take()) {
+               let _ = tx.send(text);
+            }
+         }),
+      });
+      let text = rx.recv_timeout(Duration::from_secs(600)).ok();
+      Settlement::Json(Ok(text.and_then(|text| serde_json::to_string(&text).ok())))
+   })
 }
 
 /// `phoenix.ui.showSheet` as a native Mana modal with the code viewer.
