@@ -1,13 +1,14 @@
 name: check
 # Runs every locator the runtime uses (`sigscan check`) against current Discord
-# builds, so an update that breaks one shows up here before users hit it.
+# builds, so an update that breaks one shows up here before users hit it, and
+# compares Android's dex side with the props and host names the runtime reads.
 # Android builds are the tracker's latest alpha, the channel Phoenix ships on.
 # Desktop Phoenix sits behind Discord's tester access, so it is checked only when
 # the DISCORD_EXE_URL and DISCORD_APPIMAGE_URL repository variables point at
 # copies of its Discord.exe and Linux AppImage.
 on:
   pull_request:
-    paths: ['crates/hook/**', 'crates/sigs/**', 'crates/sigscan/**', 'crates/loader/**', 'Cargo.*', 'flake.*', '.github/workflows/check.yml']
+    paths: ['crates/hook/**', 'crates/sigs/**', 'crates/sigscan/**', 'crates/loader/**', 'Cargo.*', 'flake.*', 'crates/patcher/**', 'crates/ui-mobile/src/props.in', 'crates/runtime-mobile/src/host.rs', 'scripts/check-compatibility.py', 'scripts/extract-schema.py', '.github/workflows/check.yml']
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:
@@ -57,6 +58,19 @@ jobs:
             echo "::notice::DISCORD_APPIMAGE_URL is unset, linux skipped"
           fi
           exit $missed
+  names:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+      - run: nix develop --command cargo build --release -p patcher
+      - name: check-compatibility
+        run: |
+          alpha=$(curl -fsS "$TRACKER/index" | jq -r .latest.alpha)
+          curl -fsSL "$TRACKER/download/$alpha/base" -o base.apk
+          python3 scripts/check-compatibility.py base.apk --version "$alpha"
   # The macOS loader opens Desktop Phoenix's access gate by rewriting signed
   # code, which only a Mac can build and test.
   macos:
