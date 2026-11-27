@@ -21,6 +21,7 @@ mod discord;
 mod double_click;
 mod emoji;
 mod fetch;
+mod forward;
 mod gateway_send;
 mod gpui;
 mod gpui_theme;
@@ -286,6 +287,7 @@ pub fn prepare() -> Result<(), Error> {
    feature("badges", || badges::install(&image, &ix));
    feature("emoji", || emoji::install(&image, &ix));
    feature("limits", || limits::install(&image));
+   feature("forward", || forward::install(&image, &ix));
    #[cfg(windows)]
    feature("gpui_theme", || gpui_theme::install(&image));
    feature("os_redraw", || <os::Os as os::DesktopOs>::install(&image));

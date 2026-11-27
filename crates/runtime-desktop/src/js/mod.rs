@@ -29,6 +29,7 @@ use crate::{
    double_click,
    emoji,
    limits,
+   forward,
    js::ui::{
       DesktopAccessory,
       DesktopAction,
@@ -78,6 +79,8 @@ pub struct Desktop<'js> {
    pub collapses:      RefCell<Vec<(u64, String)>>,
    /// `phoenix.spotify` holds by id, plugin and tweak.
    pub spotify:        RefCell<Vec<(u64, String, Tweak)>>,
+   /// `phoenix.ui.disableForwardFollow` holds by id and plugin.
+   pub forward_follows: RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.addHeaderButton` handlers by id and plugin.
    pub header_buttons: RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.addShortcut` handlers by id and plugin.
@@ -106,6 +109,7 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
 /// callbacks, banners, emoji pick handlers, hidden counts, sidebar collapses,
 /// header buttons and shortcuts `name` registered and redraws Discord without
 /// them.
+#[expect(clippy::too_many_lines, reason = "one release per hold a plugin can leave behind")]
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -182,6 +186,14 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       let held = plugin == name;
       if held {
          spotify::hold(tweak, false);
+      }
+      !held
+   });
+
+   registry.forward_follows.borrow_mut().retain(|(_, plugin)| {
+      let held = plugin == name;
+      if held {
+         forward::disable(false);
       }
       !held
    });

@@ -9,6 +9,8 @@ pub mod spotify;
 pub mod staff;
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod forward;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod gpui;
 
 use crate::{
@@ -176,6 +178,20 @@ pub const LOCATORS: &[Locator] = &[
                deletes.collect::<Vec<_>>().join(", "),
                found.sibling
             )
+         })
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "forward follow",
+      families: DESKTOP,
+      run:      |ix| {
+         forward::forward_follow(ix).and_then(|found| {
+            let nav = hookable(ix, found.navigate)?;
+            match found.clips {
+               Some(clips) => Ok(format!("{nav}, clips {clips:#x}")),
+               None => Ok(nav),
+            }
          })
       },
    },
