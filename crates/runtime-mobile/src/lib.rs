@@ -23,6 +23,12 @@ mod socket;
 
 pub(crate) use phoenix_runtime::highlight;
 
+#[cfg(target_os = "android")]
+use std::sync::{
+   Arc,
+   Mutex,
+   PoisonError,
+};
 use std::{
    ffi::c_void,
    path::{
@@ -59,6 +65,11 @@ use phoenix_runtime::{
       StoreError,
    },
 };
+#[cfg(target_os = "android")]
+use phoenix_sigs::index::{
+   Index,
+   Isa,
+};
 use rquickjs::{
    Ctx,
    Object,
@@ -70,6 +81,35 @@ use crate::patches::banners::{
 };
 
 struct Mobile;
+
+/// The index the emoji and staff locators share, built by whichever runs first
+/// and freed once both have, since it holds tens of MB.
+#[cfg(target_os = "android")]
+static INDEX: Mutex<(Option<Arc<Index<'static>>>, usize)> = Mutex::new((None, 0));
+
+/// Runs `locate` on the shared index of `image`.
+#[cfg(target_os = "android")]
+fn with_index<T>(
+   image: &'static Image<'static>,
+   locate: impl FnOnce(&Index<'static>) -> phoenix_sigs::Found<T>,
+) -> phoenix_sigs::Found<T> {
+   const USERS: usize = 2;
+   let index = {
+      let mut shared = INDEX.lock().unwrap_or_else(PoisonError::into_inner);
+      Arc::clone(
+         shared
+            .0
+            .get_or_insert_with(|| Arc::new(Index::new(image, Isa::HOST))),
+      )
+   };
+   let found = locate(&index);
+   let mut shared = INDEX.lock().unwrap_or_else(PoisonError::into_inner);
+   shared.1 += 1;
+   if shared.1 >= USERS {
+      shared.0 = None;
+   }
+   found
+}
 
 /// Starts phoenix inside Phoenix's mobile client.
 pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {

@@ -9,10 +9,6 @@ use phoenix_hook::{
    arm64::{
       self,
       Insn,
-      cond::{
-         HI,
-         NE,
-      },
       decode_at,
    },
    image::Image,
@@ -24,12 +20,9 @@ use crate::{
    desktop::{
       ButtonLayout,
       DivLayout,
-      EmojiCheck,
       Gpui,
       GpuiLayout,
       MenuLayout,
-      Section,
-      SettingsLabel,
       SwitchLayout,
       layout,
    },
@@ -54,63 +47,6 @@ macro_rules! pick {
    ($($arms:tt)+) => {
       |value| pick!(in value, $($arms)+)
    };
-}
-
-/// The function `ClientAccessGate` reads through (1 blocked, 2 no gate).
-///
-/// The runtime makes it answer "no gate", as on x86. Its small caller is
-/// `signed_in && access(..) != 2`: `ldr x8, [x0, #state]; cmp x8, #3; b.ne;
-/// stp; mov x29, sp; bl access; bl stub; cset w0, ne`, the stub being
-/// `and w8, w0, #0xff; cmp w8, #2; ret`. Those two may also be inline.
-pub fn access_gate(image: &Image<'_>) -> Found<usize> {
-   const CMP_X8_3: u32 = 0xF100_0D1F;
-   const AND_W8_W0_FF: Insn = Insn::Other(0x1200_1C08);
-   const CMP_W8_2: Insn = Insn::CmpImm {
-      rn:   8,
-      imm:  2,
-      wide: false,
-   };
-   const CSET_W0_NE: Insn = Insn::Cset { rd: 0, cond: NE };
-   const REACH: usize = 8;
-
-   let compares_with_2 =
-      |stub: usize| decoded(image, stub, 3) == [AND_W8_W0_FF, CMP_W8_2, Insn::Ret];
-   let gates = code_words(image)
-      .filter(|&(_, word)| word == CMP_X8_3)
-      .filter_map(|(cmp, _)| {
-         let insns = decoded(image, cmp, REACH + 4);
-         let [_, Insn::BCond { cond: NE, .. }, ref rest @ ..] = insns[..] else {
-            return None;
-         };
-         let at = rest[..rest.len().saturating_sub(2)]
-            .iter()
-            .position(|insn| matches!(insn, Insn::Bl { .. }))?;
-         let access = match rest[at..] {
-            [
-               Insn::Bl { target },
-               Insn::Bl { target: stub },
-               CSET_W0_NE,
-               ..,
-            ] if compares_with_2(stub) => target,
-            [Insn::Bl { target }, AND_W8_W0_FF, CMP_W8_2, CSET_W0_NE, ..] => target,
-            _ => return None,
-         };
-         image.is_function(access).then_some(access)
-      });
-   one("access gate", &sorted(gates.collect()))
-}
-
-/// The emoji check, which opens like x86's: `ldrb wN, [x1, #intention];
-/// orr w8, wN, #2; cmp w8, #0xe; b.ne; mov w0, #3; ret`.
-pub fn emoji_check(image: &Image<'_>) -> Found<EmojiCheck> {
-   const CHECK: Pattern =
-      Pattern::new("?? ?? 40 39 ?? ?? 1F 32 1F 39 00 71 ?? ?? 00 54 60 00 80 52 C0 03 5F D6");
-   let func = one("emoji check", &image.scan(CHECK))?;
-   decode_at(image, func)
-      .and_then(pick!(Insn::Load { rn: 1, size: 1, offset, .. } => offset))
-      .filter(|_| image.is_function(func))
-      .map(|intention| EmojiCheck { func, intention })
-      .ok_or_else(|| format!("emoji check at {func:#x} reads no context byte"))
 }
 
 /// The shell script Discord's updater runs to start Discord again once it has
@@ -167,131 +103,6 @@ fn loaders(image: &Image<'_>, anchors: &[usize]) -> Vec<usize> {
          .filter_map(|(site, _)| image.function_containing(site))
          .collect(),
    )
-}
-
-/// `libdiscord_media::fetch` on arm64, the one function that loads its
-/// tracing callsite.
-pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
-   let callsite = crate::desktop::media_fetch_callsite(image)?;
-   one("libdiscord_media::fetch", &loaders(image, &[callsite]))
-}
-
-/// `Store::delete_message` on arm64, the deletes a client runs on its own
-/// message before Discord answers.
-///
-/// Finds callers that share rare callees (2..=8 uses) with the `MESSAGE_DELETE`
-/// handler and take the store lock with the third argument before loading the
-/// `[&channel_id, &message_id]` pair from the second.
-pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<Vec<usize>> {
-   let (handler, _) = image
-      .function_bounds(message_delete)
-      .ok_or("MESSAGE_DELETE handler has no bounds")?;
-   let callees: Vec<usize> = real_callees(image, handler).into_iter().collect();
-   let refs = refs_to(image, &callees);
-   // The removals themselves are called from few places; shared helpers like
-   // the lock or a hash, from hundreds.
-   let rare: std::collections::HashSet<usize> = callees
-      .iter()
-      .copied()
-      .filter(|&callee| {
-         let uses = refs.iter().filter(|&&(_, target)| target == callee).count();
-         (2..=8).contains(&uses)
-      })
-      .collect();
-   let parents = sorted(
-      refs
-         .iter()
-         .filter(|(_, target)| rare.contains(target))
-         .filter_map(|&(site, _)| image.function_containing(site))
-         .filter(|&parent| parent != handler)
-         .collect(),
-   );
-   let found: Vec<(usize, usize, usize)> = parents
-      .into_iter()
-      .filter_map(|func| optimistic_delete_shape(image, func).map(|(lock, field)| (func, lock, field)))
-      .collect();
-   let Some(&(_, lock, field)) = found.first() else {
-      return Err("optimistic delete not found".to_owned());
-   };
-   if found.len() > 2 || found.iter().any(|&(_, l, f)| l != lock || f != field) {
-      return Err(format!("optimistic delete matched {found:x?}"));
-   }
-   Ok(sorted(found.into_iter().map(|(func, _, _)| func).collect()))
-}
-
-/// [`optimistic_delete`]'s shape: loads the store map at `[store, #0] ->
-/// [.. + field]`, calls the lock with the third argument first, then loads the
-/// dereferenced id pair from the second. Returns `(lock_fn, store_field)`.
-fn optimistic_delete_shape(image: &Image<'_>, func: usize) -> Option<(usize, usize)> {
-   let code = flattened(image, func);
-   let head = &code[..code.len().min(40)];
-   let args = head
-      .iter()
-      .find_map(pick!(&Insn::MovReg { rd, rm: 1, wide: true } if rd >= 19 => rd))?;
-   let (lock_at, lock_fn) = head
-      .iter()
-      .enumerate()
-      .find_map(|(at, &insn)| pick!(in insn, Insn::Bl { target } => (at, target)))?;
-   if !head[..lock_at].iter().any(|insn| {
-      matches!(
-         insn,
-         Insn::MovReg {
-            rd:   1,
-            rm:   2,
-            wide: true,
-         }
-      )
-   }) {
-      return None;
-   }
-   let store_field = head[..lock_at].windows(2).find_map(|w| {
-      match (w[0], w[1]) {
-         (
-            Insn::Load {
-               rt,
-               rn: 0,
-               offset: 0,
-               size: 8,
-            },
-            Insn::Load {
-               rn,
-               offset,
-               size: 8,
-               ..
-            },
-         ) if rn == rt && offset > 0 => Some(offset),
-         _ => None,
-      }
-   })?;
-   let loads_pair = code[lock_at..code.len().min(lock_at + 12)]
-      .windows(3)
-      .any(|window| {
-         let Some((true, first, second, rn, 0)) = pair(window[0]) else {
-            return false;
-         };
-         let loads = |reg: u8| {
-            window[1..]
-               .iter()
-               .any(|insn| matches!(*insn, Insn::Load { rn, offset: 0, size: 8, .. } if rn == reg))
-         };
-         rn == args && loads(first) && loads(second)
-      });
-   loads_pair.then_some((lock_fn, store_field))
-}
-
-fn real_callees(image: &Image<'_>, func: usize) -> std::collections::HashSet<usize> {
-   let end = image.function_bounds(func).map_or(func, |(_, end)| end);
-   flattened_at(image, func)
-      .into_iter()
-      .filter_map(|(_, insn)| {
-         match insn {
-            Insn::Bl { target } => Some(target),
-            Insn::B { target } if !(func..end).contains(&target) => Some(target),
-            _ => None,
-         }
-      })
-      .filter(|&target| image.is_function(target))
-      .collect()
 }
 
 /// `mov w0, #2; ret`: the access function's "no gate".
@@ -825,84 +636,10 @@ fn future_vtables(image: &Image<'_>, bounds: &[(usize, usize)]) -> Vec<(usize, u
    sorted(found)
 }
 
-/// [`crate::desktop::settings_label_parts`] for arm64: the packed literal
-/// `PhoenixDESKTOP_PHOENIX` whose name and id one function loads.
-pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
-   const NAME: usize = b"Phoenix".len();
-   let mut found = image.find_bytes(b"PhoenixDESKTOP_PHOENIX");
-   found.retain(|&name| {
-      let names = loaders(image, &[name]);
-      loaders(image, &[name + NAME])
-         .iter()
-         .any(|func| names.contains(func))
-   });
-   let name = one("settings label loader", &found)?;
-   Ok(SettingsLabel {
-      name,
-      id: name + NAME,
-   })
-}
-
-/// Every copy of `is_page_visible`'s page-range guard, which the runtime
-/// lowers so page 24 is always shown.
-///
-/// Pages 9 to 24 take a switch on flags and the rest are visible. The function
-/// is also inlined, into the sidebar among others, so each copy is matched by
-/// what it does: `sub wA, wB, #9; cmp wA, #0xf; b.hi visible`, where `visible`
-/// is `cmp wB, #0; cset wN, ne`. The `cmp` addresses are returned.
-pub fn settings_visibility(image: &Image<'_>) -> Found<Vec<usize>> {
-   // `sub wA, wB, #9`.
-   let subs = code_words(image).filter(|&(_, word)| word & 0xFFFF_FC00 == 0x5100_2400);
-   let found = subs
-      .filter_map(|(sub_at, sub)| {
-         let (page, range) = (((sub >> 5) & 0x1F) as u8, (sub & 0x1F) as u8);
-         let guard = (decode_at(image, sub_at + 4)?, decode_at(image, sub_at + 8)?);
-         let visible = pick!(in guard,
-            (Insn::CmpImm { rn, imm: 0xF, wide: false }, Insn::BCond { cond: HI, target })
-               if rn == range => target
-         )?;
-         let answer = (decode_at(image, visible)?, decode_at(image, visible + 4)?);
-         let returns_nonzero = matches!(
-            answer,
-            (Insn::CmpImm { rn, imm: 0, wide: false }, Insn::Cset { cond: NE, .. }) if rn == page
-         );
-         returns_nonzero.then_some(sub_at + 4)
-      })
-      .collect::<Vec<_>>();
-   match found.len() {
-      1..=4 => Ok(found),
-      count => Err(format!("settings visibility guard matched {count} times")),
-   }
-}
-
 /// `cmp wN, #0xe`, written over the visibility guard's `cmp wN, #0xf`.
 #[must_use]
 pub const fn lowered_guard(cmp: u32) -> u32 {
    (cmp & !(0xFFF << 10)) | (0xE << 10)
-}
-
-/// [`crate::desktop::settings_section`] for arm64.
-///
-/// `host::section` loads `account-loading`, and early on reads the active page
-/// off its first argument, through whichever register it copied that into:
-/// `mov xS, x0 ... ldrb wN, [xS, #page]`.
-pub fn settings_section(image: &Image<'_>) -> Found<Section> {
-   let anchor = one("account-loading", &image.find_bytes(b"account-loading"))?;
-   let func = one("account-loading load", &loaders(image, &[anchor]))?;
-   let (_, body) = arm64::function(image, func).ok_or("settings section has no bounds")?;
-   let mut state = vec![0];
-   let page_offset = body
-      .iter()
-      .take(0x60)
-      .find_map(|&(_, insn)| {
-         state.extend(pick!(in insn, Insn::MovReg { rd, rm: 0, wide: true } => rd));
-         pick!(in insn,
-            Insn::Load { rn, offset, size: 1, .. }
-               if state.contains(&rn) && (0x100..0x2000).contains(&offset) => offset
-         )
-      })
-      .ok_or("settings section active page load not found")?;
-   Ok(Section { func, page_offset })
 }
 
 /// What a register holds while a function body is read: an offset into a base
@@ -1102,79 +839,6 @@ pub fn style_fields(image: &Image<'_>) -> Found<HashMap<String, usize>> {
       1 => Ok(found.remove(0)),
       count => Err(format!("StyleRefinement Debug matched {count} functions")),
    }
-}
-
-/// [`crate::desktop::staff`] for arm64.
-///
-/// `flag_override: Option<u64>` in the store state, read by the staff check
-/// `(user.flags | override) & 1` as
-/// `ldr wT, [state, #tag]; tbz wT, #0; ldr xV, [state, #tag + 8]; ...; orr;
-/// tbnz #0`. Every reader must agree on the offset, counted from before an
-/// `add xB, xS, #page` that sets the base.
-pub fn staff(image: &Image<'_>) -> Found<crate::StaffField> {
-   const LOCK_HEADER: usize = 0x10;
-   let mut tags = Vec::new();
-   // `ldr wT, [xN, #imm]`, matched raw before decoding.
-   let loads_w = code_words(image).filter(|&(_, word)| word & 0xFFC0_0000 == 0xB940_0000);
-   for (pc, word) in loads_w {
-      let Some((rt, rn, tag)) = pick!(in arm64::decode(word, pc),
-         Insn::Load { rt, rn, offset, size: 4 } if rn != 31 && offset >= 0x100 => (rt, rn, offset)
-      ) else {
-         continue;
-      };
-      let raw = |delta: isize| image.read_u32(pc.wrapping_add_signed(delta * 4));
-      let insn = |delta: isize| decode_at(image, pc.wrapping_add_signed(delta * 4));
-      // `Some` is tag 1, tested as `tbz/tbnz wT, #0` straight after.
-      if !matches!(insn(1), Some(Insn::Tbz { rt: tested, bit: 0, .. }) if tested == rt) {
-         continue;
-      }
-      let Some((value_at, value)) = (-6..6).find_map(|at| {
-         pick!(in insn(at)?,
-            Insn::Load { rt: value, rn: base, offset, size: 8 } if base == rn && offset == tag + 8
-               => (at, u32::from(value))
-         )
-      }) else {
-         continue;
-      };
-      // `(flags | override) & 1`: an `orr xD, xN, xM` with the value as an
-      // operand, then a bit-0 test or mask, shortly after. `mov` is the same
-      // encoding from `xzr`, which is not an OR of two values.
-      let ors = |word: u32| {
-         let (rn, rm) = ((word >> 5) & 0x1F, (word >> 16) & 0x1F);
-         word & 0xFF20_0000 == 0xAA00_0000 && rn != 31 && (rn == value || rm == value)
-      };
-      let tests_bit0 = |at: isize| {
-         raw(at).is_some_and(|test| {
-            matches!(insn(at), Some(Insn::Tbz { bit: 0, .. }))
-               || test & 0xFFFF_FC00 == 0x9240_0000
-               || test & 0xFFFF_FC1F == 0xF240_001F
-               || test & 0xFFFF_FC00 == 0x1200_0000
-               || test & 0xFFFF_FC1F == 0x7200_001F
-         })
-      };
-      let ors_then_tests_bit0 = (value_at + 1..value_at + 16)
-         .any(|at| raw(at).is_some_and(ors) && (at + 1..at + 6).any(tests_bit0));
-      if !ors_then_tests_bit0 {
-         continue;
-      }
-      // The state is huge, so the base is often `add xB, xS, #page, lsl #12`
-      // just before; the offset counts from `xS`.
-      let base = (-8..0).rev().find_map(|at| {
-         let add = insn(at)?;
-         pick!(in add, Insn::AddImm { rd, rn: source, imm } if rd == rn && source != 31 => imm)
-      });
-      tags.push(base.unwrap_or(0) + tag);
-   }
-   let found = sorted(tags);
-   let tag = match found[..] {
-      [only] => only,
-      [direct, locked] if locked == direct + LOCK_HEADER => direct,
-      _ => return Err(format!("staff flag reads disagree: {found:#x?}")),
-   };
-   Ok(crate::StaffField {
-      tag,
-      value: tag + 8,
-   })
 }
 
 /// What `phoenix.ui.addMessageAction` needs from `MessageContextMenu` on
@@ -1608,194 +1272,10 @@ pub fn message_writer(image: &Image<'_>) -> Found<MessageWriter> {
    })
 }
 
-/// A call that returns a value through a stack slot: `x8` was pointed at the
-/// stack since the call before.
-#[derive(Clone, Copy)]
-struct Built {
-   at:     usize,
-   target: usize,
-}
-
-/// The [`Built`] calls of a [`flattened_at`] stream, besides the i18n lookups,
-/// which load a 64-bit key hash into `x2` first.
-fn built(insns: &[(usize, Insn)]) -> Vec<Built> {
-   let mut out = Vec::new();
-   let (mut sret, mut hashed) = (false, false);
-   for (index, &(_, insn)) in insns.iter().enumerate() {
-      match insn {
-         Insn::AddImm { rd: 8, rn: 31, .. } => sret = true,
-         Insn::MovZ {
-            rd: 2, wide: true, ..
-         } => hashed = true,
-         Insn::Bl { target } => {
-            if sret && !hashed {
-               out.push(Built { at: index, target });
-            }
-            (sret, hashed) = (false, false);
-         },
-         _ => {},
-      }
-   }
-   out
-}
-
-/// The function holding the one code reference to the exact bytes `name`,
-/// flattened, and the index the reference completes at.
-fn anchored(image: &Image<'_>, name: &[u8], what: &str) -> Found<(Vec<(usize, Insn)>, usize)> {
-   let refs = refs_to(image, &image.find_bytes(name)).into_iter();
-   let sites = sorted(
-      refs
-         .filter_map(|(site, target)| Some((image.function_containing(site)?, target)))
-         .collect(),
-   );
-   let &[(func, target)] = sites.as_slice() else {
-      return Err(format!("{what}: {} references", sites.len()));
-   };
-   let insns = flattened_at(image, func);
-   let index = loaded(&insns)
-      .iter()
-      .position(|load| load.is_some_and(|(_, addr)| addr == target))
-      .ok_or_else(|| format!("{what} load not found"))?;
-   Ok((insns, index))
-}
-
 fn calls(code: &[Insn]) -> impl Iterator<Item = usize> + '_ {
    code
       .iter()
       .filter_map(pick!(&Insn::Bl { target } => target))
-}
-
-/// [`Gpui`] for arm64, from the same two call sites as x86.
-///
-/// They are the Developer Mode switch row of `host::section`, and the
-/// `TesterUpdates` sign-in button and the `ActionRow` it goes into. The
-/// order of calls holds once i18n lookups, copies and getters, the calls that
-/// return nothing through a stack slot, are left out.
-pub fn gpui(image: &Image<'_>) -> Found<Gpui> {
-   let (dev, anchor) = anchored(image, b"set-devmodeDeveloper Mode", "set-devmode")?;
-   let calls_built = built(&dev);
-   let (before, after): (Vec<&Built>, Vec<&Built>) = calls_built
-      .iter()
-      .filter(|call| call.at != anchor)
-      .partition(|call| call.at < anchor);
-   let [.., new_call, flex, flex_col] = before[..] else {
-      return Err("Developer Mode row has no Div before it".to_owned());
-   };
-   let caller_loc = loaded(&dev)[..new_call.at]
-      .iter()
-      .rev()
-      .take(8)
-      .find_map(|load| load.and_then(pick!((0, addr) => addr)))
-      .ok_or("div_new Location not found")?;
-   let [switch, label, desc, on_change, into_div, ..] = after[..] else {
-      return Err(format!("{} Developer Mode row calls", after.len()));
-   };
-   let alloc_or_oom = allocs(&flattened(image, on_change.target))
-      .next()
-      .map(|(.., target)| target)
-      .ok_or("alloc_or_oom not found in Switch::on_change")?;
-
-   let (tester, anchor) = anchored(image, b"tester-updates-sign-in", "tester-updates-sign-in")?;
-   let mut after_btn = built(&tester);
-   after_btn.retain(|call| call.at > anchor);
-   let button_new = after_btn.first().ok_or("Button::new not found")?.target;
-   // `ActionRow` opens with `div_new` and `flex`.
-   let opens_row = |call: &Built| {
-      let inner = built(&flattened_at(image, call.target));
-      let mut head = inner.iter().take(4);
-      inner.first().map(|first| first.target) == Some(new_call.target)
-         && head.any(|early| early.target == flex.target)
-   };
-   let row_at = after_btn
-      .iter()
-      .position(opens_row)
-      .filter(|&at| at >= 1)
-      .ok_or("ActionRow no longer calls div_new and flex first")?;
-   let action_row = after_btn[row_at].target;
-   let button_on_click = after_btn[row_at - 1].target;
-   let div_into_any = after_btn
-      .get(row_at + 1)
-      .ok_or("Div::into_any_element not found after ActionRow")?
-      .target;
-
-   let row = flattened_at(image, action_row);
-   let row_built = built(&row);
-   let second = row_built[1..]
-      .iter()
-      .position(|call| call.target == new_call.target)
-      .ok_or("ActionRow builds one Div")?
-      + 1;
-   if second < 4 {
-      return Err("ActionRow's text column moved".to_owned());
-   }
-   let div_child_div = row_built[second - 1].target;
-   let text_block = row_built[second - 4].target;
-   // Copies (`mov w2, #size; bl memcpy`) aside, the child added before the
-   // last `div_child_div` is the button.
-   let row_calls = row
-      .windows(2)
-      .filter_map(pick!(
-         &[(_, before), (_, Insn::Bl { target })]
-            if !matches!(before, Insn::MovZ { rd: 2, wide: false, .. }) => target
-      ))
-      .collect::<Vec<_>>();
-   let last_child = row_calls
-      .iter()
-      .rposition(|&target| target == div_child_div)
-      .filter(|&at| at >= 1)
-      .ok_or("ActionRow no longer adds its children with div_child_div")?;
-   let styled = row_built[..second]
-      .iter()
-      .filter(|call| call.target != new_call.target);
-   let firsts = styled.filter_map(|call| calls(&flattened(image, call.target)).next());
-   let div_style_mut = most_common(firsts, 3).ok_or("div_style_mut not found")?;
-
-   Ok(Gpui {
-      caller_loc,
-      div_new: new_call.target,
-      div_flex: flex.target,
-      div_flex_col: flex_col.target,
-      div_style_mut,
-      div_child_div,
-      div_child_button: row_calls[last_child - 1],
-      div_into_any,
-      div_push_any: children_push(&flattened(image, div_child_div)).map(|(_, push)| push),
-      str_into_any: shared_string_into_any(image, div_child_div),
-      text_block,
-      switch_new: switch.target,
-      switch_into_div: into_div.target,
-      button_new,
-      action_row,
-      alloc_or_oom,
-      switch_label: label.target,
-      switch_desc: desc.target,
-      switch_on_change: on_change.target,
-      button_on_click,
-   })
-}
-
-/// `<SharedString as IntoElement>::into_any_element`, which `Div::child` for
-/// a `SharedString` (a neighbour of `div_child_div`) calls. It drops the
-/// string it moved: `cmp w8, #0xff` (`None`), then `cmp w8, #0x19` (`Arc`).
-fn shared_string_into_any(image: &Image<'_>, div_child_div: usize) -> Option<usize> {
-   let drops_string = |func: usize| {
-      flattened(image, func).windows(3).any(|window| {
-         matches!(window, [Insn::CmpImm { imm: 0xFF, .. }, _, Insn::CmpImm {
-            imm: 0x19,
-            ..
-         }])
-      })
-   };
-   let mut at = image.function_bounds(div_child_div)?.1;
-   for _ in 0..6 {
-      let (start, end) = image.function_bounds(at)?;
-      let found = calls(&flattened(image, start)).find(|&target| drops_string(target));
-      if found.is_some() {
-         return found;
-      }
-      at = end;
-   }
-   None
 }
 
 /// `div_child_div`'s push of the child onto `self.children`: `add x0, xS,
@@ -1927,7 +1407,7 @@ fn post_ctor_byte_stores(image: &Image<'_>, ctor: usize, size: usize) -> Vec<(us
    ranked
 }
 
-/// [`GpuiLayout`] for arm64, from the builders [`gpui`] found.
+/// [`GpuiLayout`] for arm64, from the builders [`crate::locate::gpui::gpui`] found.
 pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
    // `div_child_div` pushes the child at `self + children`, then copies `self`
    // out through its `x8` copy field by field; the last store is the end.
@@ -2031,136 +1511,6 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
          variant,
          scale,
       },
-   })
-}
-
-/// `build_message_body` on arm64, which `MessageRow::render` calls as
-/// `fn(x0 view, x1 config, x2..x5) -> x0`.
-#[derive(Debug, Clone)]
-pub struct MessageBody {
-   pub func:       usize,
-   pub message_id: usize,
-   /// Every `u32` color in the config the body picks its text colors from.
-   pub colors:     Vec<usize>,
-}
-
-/// [`MessageBody`], the one function the row render calls that loads the
-/// `message-edited-` template.
-///
-/// Its head picks one of four color triples by the message's state, `mov w8,
-/// #c; mov w9, #b; mov w10, #a` each, read as `ldr wN, [config, xN]`, and
-/// loads the id as the first word off `x0`.
-pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> {
-   let mut found = loaders(image, &image.find_bytes(b"\x0fmessage-edited-"));
-   found.retain(|&func| loaders(image, &[func]).contains(&render_row));
-   let func = one("message body builder", &found)?;
-   let mut head = flattened(image, func);
-   head.truncate(0x60);
-   let message_id = head
-      .iter()
-      .find_map(pick!(
-         &Insn::Load { rn: 0, offset, size: 8, .. } if (0x100..0x800).contains(&offset) => offset
-      ))
-      .ok_or("message body id load not found")?;
-   let offsets = head
-      .windows(3)
-      .filter_map(pick!(
-         &[
-            Insn::MovZ { rd: 8, imm: c, .. },
-            Insn::MovZ { rd: 9, imm: b, .. },
-            Insn::MovZ { rd: 10, imm: a, .. },
-         ] => [a, b, c]
-      ))
-      .flatten()
-      .map(|imm| usize::try_from(imm).map_err(|err| err.to_string()))
-      .collect::<Found<Vec<_>>>()?;
-   let colors = sorted(offsets);
-   if colors.len() < 6 || colors.iter().any(|offset| !(0x100..0x400).contains(offset)) {
-      return Err(format!("message body colors don't decode: {colors:x?}"));
-   }
-   Ok(MessageBody {
-      func,
-      message_id,
-      colors,
-   })
-}
-
-/// `MessageRow::render` on arm64, and the path from its row to the message id.
-#[derive(Debug, Clone, Copy)]
-pub struct MessageRow {
-   /// `fn(x0 row, x1..x7, d0, one stack word) -> AnyElement` through `x8`.
-   pub func:       usize,
-   /// `row + rc` holds the message's `Rc`.
-   pub rc:         usize,
-   /// The message inside the `Rc` allocation.
-   pub value:      usize,
-   pub message_id: usize,
-}
-
-/// [`MessageRow`], the one caller of both `message-content-` helpers.
-///
-/// The helper takes the message in `x0`, and formats `&message.id` (`ldr x8,
-/// [sp, #msg]; add x8, x8, #id`). The render passes `ldr x9, [sp, #slot]; add
-/// x0, x9, #value`, with the slot filled from `ldr x8, [row, #rc]`.
-pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
-   // A format piece: its length byte, then the text.
-   let mut refs = refs_to(image, &image.find_bytes(b"\x10message-content-"))
-      .into_iter()
-      .filter_map(|(site, target)| Some((image.function_containing(site)?, site, target)))
-      .collect::<Vec<_>>();
-   refs.sort_unstable();
-   refs.dedup_by_key(|&mut (func, ..)| func);
-   if refs.len() < 2 {
-      return Err(format!("{} message-content template loaders", refs.len()));
-   }
-   let mut common = loaders(image, &[refs[0].0]);
-   for &(helper, ..) in &refs[1..] {
-      let parents = loaders(image, &[helper]);
-      common.retain(|func| parents.contains(func));
-   }
-   let func = one("MessageRow::render", &common)?;
-
-   // A helper whose template load is preceded by `add x8, xM, #id`, and
-   // whose call in the render builds `x0` from a stack slot.
-   let render = flattened_at(image, func);
-   let decodes = |&(helper, site, _): &(usize, usize, usize)| {
-      let insns = flattened_at(image, helper);
-      let at = insns.iter().position(|&(pc, _)| pc >= site)?;
-      let id = insns[at.saturating_sub(40)..at].iter().rev().find_map(pick!(
-         &(_, Insn::AddImm { rd: 8, rn, imm }) if rn != 31 && (0x100..=0x800).contains(&imm) => imm
-      ))?;
-      let call = render
-         .iter()
-         .position(|&(_, insn)| insn == Insn::Bl { target: helper })?;
-      let (slot, value) = render[call.saturating_sub(24)..call]
-         .windows(2)
-         .rev()
-         .find_map(pick!(
-            &[
-               (_, Insn::Load { rt, rn: 31, offset: slot, size: 8 }),
-               (_, Insn::AddImm { rd: 0, rn, imm }),
-            ] if rn == rt && imm < 0x40 => (slot, imm)
-         ))?;
-      Some((id, slot, value))
-   };
-   let (message_id, slot, value) = refs
-      .iter()
-      .find_map(decodes)
-      .ok_or("no message-content helper's message argument decodes")?;
-   let rc = render
-      .windows(2)
-      .find_map(pick!(
-         &[
-            (_, Insn::Load { rt, offset: rc, size: 8, rn }),
-            (_, Insn::Store { rt: stored, rn: 31, offset, size: 8 }),
-         ] if stored == rt && offset == slot && rn != 31 => rc
-      ))
-      .ok_or("the row's message Rc not found")?;
-   Ok(MessageRow {
-      func,
-      rc,
-      value,
-      message_id,
    })
 }
 

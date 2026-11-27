@@ -20,7 +20,6 @@ pub mod ios;
 pub mod locate;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod macos;
-pub mod mobile;
 pub mod registry;
 
 /// What a locator found, or why this build does not match it.

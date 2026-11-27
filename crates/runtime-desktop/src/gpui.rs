@@ -30,11 +30,15 @@ use phoenix_runtime::{
       Listed,
    },
 };
-use phoenix_sigs::desktop::{
-   self,
-   GpuiLayout,
-   StyleOffsets,
-   layout,
+use phoenix_sigs::{
+   desktop::{
+      self,
+      GpuiLayout,
+      StyleOffsets,
+      layout,
+   },
+   index::Index,
+   locate,
 };
 
 use crate::modal::{
@@ -530,19 +534,19 @@ unsafe extern "C" fn button_callback(
 
 /// Resolves Discord's native GPUI / Mana widget builders from unique string
 /// anchors. Safe to call from `DllMain` (`prepare()`).
-pub fn locate(image: &Image<'static>) -> bool {
+pub fn locate(image: &Image<'static>, ix: &Index<'_>) -> bool {
    if SYMBOLS.get().is_some() {
       return true;
    }
 
    let found = if crate::X86_CODE {
-      desktop::gpui(image).and_then(|gpui| {
+      locate::gpui::gpui(ix).and_then(|gpui| {
          let layout = desktop::gpui_layouts(image, &gpui)?;
          let raw = gpui.div_into_any;
          Ok((gpui, layout, raw))
       })
    } else {
-      arm64_builders(image)
+      arm64_builders(image, ix)
    };
    let (
       desktop::Gpui {
@@ -610,12 +614,15 @@ pub fn locate(image: &Image<'static>) -> bool {
    true
 }
 
-/// The arm64 builders ([`phoenix_sigs::macos::gpui`]) with every one that
-/// returns through `x8` swapped for an `image::sret_caller` thunk, so they
+/// The arm64 builders ([`phoenix_sigs::locate::gpui::gpui`]) with every one
+/// that returns through `x8` swapped for an `image::sret_caller` thunk, so they
 /// are called the x86 way, result slot first, like the types here say.
 #[cfg(target_os = "macos")]
-fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
-   let gpui = phoenix_sigs::macos::gpui(image)?;
+fn arm64_builders(
+   image: &Image<'_>,
+   ix: &Index<'_>,
+) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
+   let gpui = locate::gpui::gpui(ix)?;
    let layout = phoenix_sigs::macos::gpui_layouts(image, &gpui)?;
    let raw = gpui.div_into_any;
    let thunk = |addr: usize| {
@@ -640,7 +647,10 @@ fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout, usize
 }
 
 #[cfg(not(target_os = "macos"))]
-fn arm64_builders(_image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
+fn arm64_builders(
+   _image: &Image<'_>,
+   _ix: &Index<'_>,
+) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
    Err("no arm64 builders off macOS".to_owned())
 }
 

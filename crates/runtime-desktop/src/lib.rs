@@ -87,6 +87,10 @@ use phoenix_sigs::{
       Prologue,
       Prologues,
    },
+   index::{
+      Index,
+      Isa,
+   },
    registry::GatewayRegistry,
 };
 use rquickjs::{
@@ -204,17 +208,18 @@ static PREPARED: Mutex<Option<(Image<'static>, &'static GatewayRegistry)>> = Mut
 pub fn prepare() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
    let image = phoenix_runtime::target()?;
-   open_access_gate(&image);
-   settings::install(&image);
+   let ix = Index::new(&image, Isa::HOST);
+   open_access_gate(&image, &ix);
+   settings::install(&image, &ix);
    #[cfg(windows)]
    restart::install(&image);
-   staff::prepare(&image);
+   staff::prepare(&ix);
    modal::install(&image);
    context_menu::install(&image);
    // Before accessories hooks `MessageRow::render`, whose prologue the header
    // locators check.
-   let header = X86_CODE.then(|| headers::locate(&image));
-   accessories::install(&image);
+   let header = X86_CODE.then(|| headers::locate(&image, &ix));
+   accessories::install(&image, &ix);
    members::install(&image);
    if let Some(header) = header {
       headers::install(&image, header);
@@ -229,8 +234,8 @@ pub fn prepare() -> Result<(), Error> {
    composer::install(&image);
    sidebar::install(&image);
    toolbar::install(&image);
-   badges::install(&image);
-   emoji::install(&image);
+   badges::install(&image, &ix);
+   emoji::install(&image, &ix);
    #[cfg(windows)]
    gpui_theme::install(&image);
    <os::Os as os::DesktopOs>::install(&image);
@@ -240,12 +245,13 @@ pub fn prepare() -> Result<(), Error> {
       route_direct_calls(&image);
       discord::install(&image);
       gateway_send::install(&image);
-      accessories::install_optimistic_delete(&image);
+      accessories::install_optimistic_delete(&image, &ix);
       ready::install(&image);
    }
    #[cfg(target_os = "macos")]
    message::writer::install(&image);
    // The indexes are tens of MB and nothing reads them after startup.
+   drop(ix);
    phoenix_sigs::desktop::release_call_index();
    phoenix_hook::arm64::release_ref_index();
    *PREPARED.lock().unwrap_or_else(PoisonError::into_inner) = Some((image, registry?));
@@ -256,7 +262,7 @@ pub fn prepare() -> Result<(), Error> {
 pub fn open_gate_only() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
    let image = phoenix_runtime::target()?;
-   open_access_gate(&image);
+   open_access_gate(&image, &Index::new(&image, Isa::HOST));
    #[cfg(windows)]
    restart::install(&image);
    Ok(())
@@ -287,18 +293,18 @@ pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
 /// its small caller is `signed_in && access(..) != 2`. This makes it return 2.
 /// Discord settles on the gate within its first frames, so the loader calls
 /// this from `DllMain` or the constructor, before Discord's own code.
-fn open_access_gate(image: &Image<'static>) {
+fn open_access_gate(image: &Image<'static>, ix: &Index<'_>) {
    /// `mov al, 2; ret`
    const ALLOWED: [u8; 3] = [0xB0, 0x02, 0xC3];
 
-   let found = if X86_CODE {
-      phoenix_sigs::desktop::access_gate(image).map(|access| (access, &ALLOWED[..]))
+   let allowed = if X86_CODE {
+      &ALLOWED[..]
    } else {
       close_enforced(image);
       keep_pages_over_frame(image);
-      phoenix_sigs::macos::access_gate(image)
-         .map(|access| (access, &phoenix_sigs::macos::NO_GATE[..]))
+      &phoenix_sigs::macos::NO_GATE[..]
    };
+   let found = phoenix_sigs::locate::access_gate(ix).map(|access| (access.start, allowed));
    let (access, allowed) = match found {
       Ok(found) => found,
       Err(err) => {
