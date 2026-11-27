@@ -18,7 +18,13 @@ use std::{
    thread,
 };
 
-use crate::Notice;
+use crate::{
+   Notice,
+   permissions::{
+      Declared,
+      Permissions,
+   },
+};
 /// This build's version, `<UTC commit date>-<short hash>` (`build.rs`).
 pub const VERSION: &str = env!("PHOENIX_VERSION");
 pub const SITE: &str = "https://sunbird.tools/";
@@ -381,7 +387,30 @@ pub fn apply() {
 
 fn update_plugin(name: &str, expected_crc: Option<u32>) -> Result<(), String> {
    let source = download_plugin(name, expected_crc)?;
+   same_reach(name, &source)?;
    crate::save_source(name, source).map_err(|err| err.to_string())
+}
+
+/// Refuses an update that declares more than the running copy, since the user
+/// agreed only to what that copy reaches.
+fn same_reach(name: &str, source: &str) -> Result<(), String> {
+   let Some(running) = crate::source(name) else {
+      return Ok(());
+   };
+   let newer = source
+      .parse::<Permissions>()
+      .map_err(|err| err.to_string())?;
+   let added = running
+      .parse::<Permissions>()
+      .unwrap_or_else(|_| Permissions::Declared(Declared::default()))
+      .widened(&newer);
+   if added.is_empty() {
+      return Ok(());
+   }
+   Err(format!(
+      "the update asks for {}, remove it and install it again from the plugin list to allow that",
+      added.join(", ")
+   ))
 }
 
 /// Verifies a downloaded loader binary against its exact embedded version
@@ -451,6 +480,7 @@ pub fn stage_plugins(version: &str, update: &Update) -> Vec<String> {
    for name in &update.plugins {
       let staged =
          download_plugin(name, update.plugin_crcs.get(name).copied()).and_then(|source| {
+            same_reach(name, &source)?;
             fs::write(dir.join(format!("{name}.js")), source).map_err(|err| err.to_string())
          });
       match staged {

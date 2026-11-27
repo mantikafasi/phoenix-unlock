@@ -60,6 +60,17 @@ enum Namespace {
    UiTree,
 }
 
+impl Namespace {
+   const fn key(self) -> &'static str {
+      match self {
+         Self::Stores => "stores",
+         Self::Messages => "messages",
+         Self::Bridge => "bridge",
+         Self::UiTree => "ui-tree",
+      }
+   }
+}
+
 /// Hosts any plugin may point Discord at, since they reach only Discord.
 fn discord_host(host: &str) -> bool {
    [
@@ -517,5 +528,55 @@ impl Permissions {
       hosts(after)
          .into_iter()
          .find(|host| !known.contains(host) && !self.host(host))
+   }
+
+   /// What `newer` declares that this does not, so an update cannot widen
+   /// what a plugin reaches unasked.
+   #[must_use]
+   pub fn widened(&self, newer: &Self) -> Vec<String> {
+      let (Self::Declared(old), Self::Declared(new)) = (self, newer) else {
+         return Vec::new();
+      };
+      let routes = old
+         .discord
+         .iter()
+         .map(Route::to_string)
+         .collect::<BTreeSet<_>>();
+      let hosts = old
+         .fetch
+         .iter()
+         .map(Host::to_string)
+         .collect::<BTreeSet<_>>();
+      let mut added = Vec::new();
+      added.extend(
+         new.gateway
+            .difference(&old.gateway)
+            .map(|event| format!("@gateway {event}")),
+      );
+      added.extend(
+         new.gateway_send
+            .difference(&old.gateway_send)
+            .map(|op| format!("@gateway-send {op}")),
+      );
+      added.extend(
+         new.discord
+            .iter()
+            .map(Route::to_string)
+            .filter(|route| !routes.contains(route))
+            .map(|route| format!("@discord {route}")),
+      );
+      added.extend(
+         new.fetch
+            .iter()
+            .map(Host::to_string)
+            .filter(|host| !hosts.contains(host))
+            .map(|host| format!("@fetch {host}")),
+      );
+      added.extend(
+         new.whole
+            .difference(&old.whole)
+            .map(|namespace| format!("@{}", namespace.key())),
+      );
+      added
    }
 }
