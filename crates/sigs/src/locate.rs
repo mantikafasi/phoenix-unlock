@@ -1,6 +1,9 @@
 //! Locators written once per source tree on [`Index`] queries. Each runs on
 //! every binary of its [`Family`], whatever the ISA.
 
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod message;
+
 use crate::{
    Found,
    index::{
@@ -46,6 +49,22 @@ pub const LOCATORS: &[Locator] = &[
       run:      |ix| {
          emoji_check(ix)
             .map(|check| format!("{:#x}, intention +{:#x}", check.func, check.intention))
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "message row",
+      families: DESKTOP,
+      run:      |ix| message::message_row(ix).map(|row| format!("{row:x?}")),
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "message body",
+      families: DESKTOP,
+      run:      |ix| {
+         message::message_row(ix)
+            .and_then(|row| message::message_body(ix, row.func))
+            .map(|body| format!("{body:x?}"))
       },
    },
 ];

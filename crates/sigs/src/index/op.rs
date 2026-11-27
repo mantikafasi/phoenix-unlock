@@ -61,6 +61,17 @@ impl Isa {
       }
    }
 
+   /// The stack pointer.
+   #[must_use]
+   pub const fn sp(self) -> Reg {
+      match self {
+         #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+         Self::X86_64 { .. } => 4,
+         Self::Aarch64 => 31,
+         Self::Thumb2 => 13,
+      }
+   }
+
    /// The register a function returns an integer in.
    #[must_use]
    pub const fn ret(self) -> Reg {
@@ -80,6 +91,12 @@ pub enum Op {
    Addr {
       reg:    Reg,
       target: usize,
+   },
+   /// `reg = base + offset`, from `lea` or `add`, taking a field's address.
+   Offset {
+      reg:    Reg,
+      base:   Reg,
+      offset: isize,
    },
    /// `reg = [base + offset]`, `size` bytes.
    Load {
@@ -198,7 +215,7 @@ fn x86(image: &Image<'_>, code: &[u8], ip: usize) -> Vec<Step> {
          .flatten();
       let branch = addr(instruction.near_branch_target()).filter(|&target| target != 0);
       let op = match (instruction.flow_control(), instruction.mnemonic()) {
-         (FlowControl::Call, _) => {
+         (FlowControl::Call | FlowControl::IndirectCall, _) => {
             branch
                .or_else(|| rip_target.and_then(|slot| image.read_usize(slot)))
                .filter(|&callee| image.is_code(callee))
@@ -214,8 +231,17 @@ fn x86(image: &Image<'_>, code: &[u8], ip: usize) -> Vec<Step> {
          (FlowControl::ConditionalBranch, _) => branch.map_or(Op::Other, Op::Branch),
          (FlowControl::Return, _) => Op::Ret,
          (_, Mnemonic::Lea) => {
-            match (gpr(instruction.op0_register()), rip_target) {
-               (Some(reg), Some(target)) => Op::Addr { reg, target },
+            let base = gpr(instruction.memory_base())
+               .filter(|_| instruction.memory_index() == Register::None);
+            match (gpr(instruction.op0_register()), rip_target, base) {
+               (Some(reg), Some(target), _) => Op::Addr { reg, target },
+               (Some(reg), None, Some(base)) => {
+                  Op::Offset {
+                     reg,
+                     base,
+                     offset: instruction.memory_displacement64().cast_signed() as isize,
+                  }
+               },
                _ => Op::Other,
             }
          },
@@ -363,7 +389,13 @@ fn aarch64(code: &[u8], pc: usize) -> Vec<Step> {
                   }
                },
                None if imm == 0 => Op::Move { dst: rd, src: rn },
-               None => Op::Other,
+               None => {
+                  Op::Offset {
+                     reg:    rd,
+                     base:   rn,
+                     offset: imm.cast_signed(),
+                  }
+               },
             }
          },
          Insn::Load {
