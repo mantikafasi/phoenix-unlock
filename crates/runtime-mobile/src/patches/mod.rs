@@ -47,10 +47,7 @@ use std::{
          AtomicU64,
          Ordering,
       },
-      mpsc::{
-         self,
-         Sender,
-      },
+      mpsc::Sender,
    },
    thread,
    time::Instant,
@@ -90,9 +87,9 @@ use crate::{
       },
       worker::{
          Job,
-         WORKER,
          queue,
          run,
+         take_jobs,
       },
    },
 };
@@ -479,11 +476,10 @@ fn patches() -> MutexGuard<'static, Patches> {
 
 /// Hooks the UI bridge and starts the worker that runs plugin callbacks.
 pub fn start() {
-   let (sender, receiver) = mpsc::channel::<Job>();
-   if WORKER.set(sender).is_err() {
+   let Some(receiver) = take_jobs() else {
       log::warn!("patches: already started");
       return;
-   }
+   };
    emoji::install();
    bridge::install(Box::new(PatchSink));
    // The chat header and message box are built once, before the first
