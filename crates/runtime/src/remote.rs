@@ -770,9 +770,9 @@ impl<'a> From<&'a PluginInfo> for PluginJson<'a> {
    fn from(plugin: &'a PluginInfo) -> Self {
       Self {
          name:        &plugin.name,
-         enabled:     plugin.enabled,
+         enabled:     plugin.state.is_on(),
          installed:   plugin.installed,
-         error:       plugin.error.as_deref(),
+         error:       plugin.state.error(),
          version:     plugin.header.version.as_deref(),
          author:      plugin.header.author.as_deref(),
          description: plugin.header.description.as_deref(),

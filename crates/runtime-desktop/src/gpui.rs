@@ -1551,7 +1551,7 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
    };
 
    let plugins = phoenix_runtime::plugins();
-   let enabled_count = plugins.iter().filter(|p| p.enabled).count();
+   let enabled_count = plugins.iter().filter(|p| p.state.is_on()).count();
    let disabled_count = plugins.len().saturating_sub(enabled_count);
 
    let mut root = b.v_stack(16.0);
@@ -1712,8 +1712,8 @@ fn render_plugins_tab(
       .filter(|p| {
          match filter {
             PluginFilter::All => true,
-            PluginFilter::Enabled => p.enabled,
-            PluginFilter::Disabled => !p.enabled,
+            PluginFilter::Enabled => p.state.is_on(),
+            PluginFilter::Disabled => !p.state.is_on(),
          }
       })
       .collect();
@@ -1734,7 +1734,7 @@ fn render_plugins_tab(
       let is_open = expanded.contains(&plugin.name);
       let compat = DesktopCompat::of(&plugin.name);
       let badge = b.compat_badge(compat);
-      let mut card = b.card(10.0, 14.0, 8.0, if plugin.enabled { 0.22 } else { 0.14 });
+      let mut card = b.card(10.0, 14.0, 8.0, if plugin.state.is_on() { 0.22 } else { 0.14 });
 
       let mut title = plugin.header.version.as_ref().map_or_else(
          || plugin.name.clone(),
@@ -1764,7 +1764,7 @@ fn render_plugins_tab(
             DesktopCompat::Unverified => desc_parts.push("Unverified on desktop".to_owned()),
          }
       }
-      if let Some(err) = &plugin.error {
+      if let Some(err) = plugin.state.error() {
          desc_parts.push(format!("Error: {err}"));
       }
       let desc = desc_parts.join(" · ");
@@ -1775,12 +1775,12 @@ fn render_plugins_tab(
             &format!("sunbird-plugin-{}", plugin.name),
             &title,
             (!desc.is_empty()).then_some(desc.as_str()),
-            plugin.enabled,
+            plugin.state.is_on(),
             Action::TogglePlugin(plugin.name.clone()),
          ),
       );
 
-      let has_settings = plugin.enabled && !plugin.settings.is_empty();
+      let has_settings = plugin.state.is_on() && !plugin.settings.is_empty();
       let mut buttons = b.h_row(8.0, false);
       if has_settings {
          let lbl = if is_open {
@@ -1809,7 +1809,7 @@ fn render_plugins_tab(
          BtnSize::Small,
          Action::EditPluginCode(plugin.name.clone()),
       );
-      if plugin.enabled && plugin.installed {
+      if plugin.state.is_on() && plugin.installed {
          buttons = b.push_button(
             buttons,
             &format!("sunbird-reload-{}", plugin.name),
@@ -1819,7 +1819,7 @@ fn render_plugins_tab(
             Action::ReloadPlugin(plugin.name.clone()),
          );
       }
-      if !plugin.enabled && plugin.installed {
+      if !plugin.state.is_on() && plugin.installed {
          buttons = b.push_button(
             buttons,
             &format!("sunbird-remove-{}", plugin.name),

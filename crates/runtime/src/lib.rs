@@ -137,12 +137,38 @@ pub struct Plugin {
    pub source: String,
 }
 
+#[derive(Clone, Debug)]
+pub enum PluginState {
+   Off,
+   On,
+   /// On, and its last load threw.
+   Failed(String),
+}
+
+impl PluginState {
+   const fn from_switch(on: bool) -> Self {
+      if on { Self::On } else { Self::Off }
+   }
+
+   #[must_use]
+   pub const fn is_on(&self) -> bool {
+      !matches!(self, Self::Off)
+   }
+
+   #[must_use]
+   pub fn error(&self) -> Option<&str> {
+      match self {
+         Self::Failed(error) => Some(error),
+         Self::Off | Self::On => None,
+      }
+   }
+}
+
 /// A plugin as the settings page shows it.
 #[derive(Clone, Debug)]
 pub struct PluginInfo {
    pub name:      String,
-   pub enabled:   bool,
-   pub error:     Option<String>,
+   pub state:     PluginState,
    pub installed: bool,
    pub header:    Header,
    pub settings:  Vec<Setting>,
@@ -479,7 +505,7 @@ pub fn reload(name: &str) {
 pub fn reload_all() {
    let names = plugins()
       .into_iter()
-      .filter(|plugin| plugin.enabled)
+      .filter(|plugin| plugin.state.is_on())
       .map(|plugin| plugin.name)
       .collect::<Vec<_>>();
    for name in names {

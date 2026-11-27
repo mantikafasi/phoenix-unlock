@@ -46,6 +46,7 @@ use crate::{
    Header,
    Plugin,
    PluginInfo,
+   PluginState,
    STATE,
    Setting,
    State,
@@ -81,23 +82,34 @@ pub struct Engine {
 }
 
 struct Loaded {
-   source:    String,
-   /// The bundled source an installed copy replaced, put back when the copy
-   /// is uninstalled.
-   bundled:   Option<String>,
-   enabled:   bool,
-   error:     Option<String>,
+   source: String,
+   origin: Origin,
+   state:  PluginState,
+}
+
+enum Origin {
+   Bundled,
    /// Read from `home/plugins`, so the user can delete it.
-   installed: bool,
+   Installed,
+   /// Installed over a bundled plugin, whose source is put back when the copy
+   /// is uninstalled.
+   Replacing(String),
 }
 
 impl Loaded {
+   const fn new(source: String, origin: Origin) -> Self {
+      Self {
+         source,
+         origin,
+         state: PluginState::Off,
+      }
+   }
+
    fn install(&mut self, source: String) {
       let old = std::mem::replace(&mut self.source, source);
-      if !self.installed {
-         self.bundled = Some(old);
+      if matches!(self.origin, Origin::Bundled) {
+         self.origin = Origin::Replacing(old);
       }
-      self.installed = true;
    }
 }
 
@@ -257,9 +269,8 @@ impl Engine {
                   .collect();
                PluginInfo {
                   name: name.clone(),
-                  enabled: loaded.enabled,
-                  error: loaded.error.clone(),
-                  installed: loaded.installed,
+                  state: loaded.state.clone(),
+                  installed: !matches!(loaded.origin, Origin::Bundled),
                   header: Header::from(loaded.source.as_str()),
                   settings,
                }
@@ -285,11 +296,11 @@ impl Engine {
       match outcome {
          Ok(()) => {
             log::info!("loaded plugin {name}");
-            loaded.error = None;
+            loaded.state = PluginState::On;
          },
          Err(err) => {
             log::error!("plugin {name} failed to load: {err}");
-            loaded.error = Some(err.to_string());
+            loaded.state = PluginState::Failed(err.to_string());
          },
       }
    }
@@ -350,11 +361,10 @@ impl Engine {
       let Some(loaded) = self.plugins.get_mut(name) else {
          return;
       };
-      if loaded.enabled == enabled {
+      if loaded.state.is_on() == enabled {
          return;
       }
-      loaded.enabled = enabled;
-      loaded.error = None;
+      loaded.state = PluginState::from_switch(enabled);
       if enabled {
          self.eval(name);
       } else {
@@ -368,15 +378,11 @@ impl Engine {
    pub fn install(&mut self, name: &str, source: String) {
       let enabled = if let Some(loaded) = self.plugins.get_mut(name) {
          loaded.install(source);
-         loaded.enabled
+         loaded.state.is_on()
       } else {
-         self.plugins.insert(name.to_owned(), Loaded {
-            source,
-            bundled: None,
-            enabled: true,
-            error: None,
-            installed: true,
-         });
+         let mut loaded = Loaded::new(source, Origin::Installed);
+         loaded.state = PluginState::On;
+         self.plugins.insert(name.to_owned(), loaded);
          true
       };
       if enabled {
@@ -390,10 +396,13 @@ impl Engine {
    pub fn uninstall(&mut self, name: &str) -> crate::Uninstalled {
       self.unload(name);
       let restored = self.plugins.get_mut(name).and_then(|loaded| {
-         loaded.source = loaded.bundled.take()?;
-         loaded.installed = false;
-         loaded.error = None;
-         Some(loaded.enabled)
+         let Origin::Replacing(bundled) = std::mem::replace(&mut loaded.origin, Origin::Bundled)
+         else {
+            return None;
+         };
+         loaded.source = bundled;
+         loaded.state = PluginState::from_switch(loaded.state.is_on());
+         Some(loaded.state.is_on())
       });
       let outcome = if let Some(enabled) = restored {
          if enabled {
@@ -414,7 +423,11 @@ impl Engine {
    }
 
    pub fn reload(&mut self, name: &str) {
-      if self.plugins.get(name).is_some_and(|loaded| loaded.enabled) {
+      if self
+         .plugins
+         .get(name)
+         .is_some_and(|loaded| loaded.state.is_on())
+      {
          self.unload(name);
          self.eval(name);
       }
@@ -424,10 +437,10 @@ impl Engine {
       let (mut disabled, mut enabled) = (BTreeSet::new(), BTreeSet::new());
       for (name, loaded) in &self.plugins {
          if Header::from(loaded.source.as_str()).default_off {
-            if loaded.enabled {
+            if loaded.state.is_on() {
                enabled.insert(name.clone());
             }
-         } else if !loaded.enabled {
+         } else if !loaded.state.is_on() {
             disabled.insert(name.clone());
          }
       }
@@ -652,13 +665,7 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
    let mut plugins = bundled
       .into_iter()
       .map(|plugin| {
-         (plugin.name, Loaded {
-            source:    plugin.source,
-            bundled:   None,
-            enabled:   false,
-            error:     None,
-            installed: false,
-         })
+         (plugin.name, Loaded::new(plugin.source, Origin::Bundled))
       })
       .collect::<BTreeMap<String, Loaded>>();
    let paths = match fs::read_dir(&dir) {
@@ -682,22 +689,17 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
       match plugins.get_mut(name) {
          Some(loaded) => loaded.install(source),
          None => {
-            plugins.insert(name.to_owned(), Loaded {
-               source,
-               bundled: None,
-               enabled: false,
-               error: None,
-               installed: true,
-            });
+            plugins.insert(name.to_owned(), Loaded::new(source, Origin::Installed));
          },
       }
    }
    for (name, loaded) in &mut plugins {
-      loaded.enabled = if Header::from(loaded.source.as_str()).default_off {
+      let enabled = if Header::from(loaded.source.as_str()).default_off {
          choices.enabled.contains(name)
       } else {
          !choices.disabled.contains(name)
       };
+      loaded.state = PluginState::from_switch(enabled);
    }
 
    let mut engine = state
@@ -713,7 +715,7 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
    let enabled = engine
       .plugins
       .iter()
-      .filter(|(_, loaded)| loaded.enabled)
+      .filter(|(_, loaded)| loaded.state.is_on())
       .map(|(name, _)| name.clone())
       .collect::<Vec<String>>();
    for name in &enabled {
@@ -725,7 +727,7 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
          engine
             .plugins
             .get(name)
-            .is_some_and(|loaded| loaded.error.is_none())
+            .is_some_and(|loaded| matches!(loaded.state, PluginState::On))
       })
       .collect())
 }
