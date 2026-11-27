@@ -11,6 +11,7 @@
 //!   can install.
 
 mod arsc;
+mod brand;
 mod bytes;
 mod dex;
 pub mod frida;
@@ -312,7 +313,9 @@ fn patch_split<'a>(
          continue;
       }
       let name = &record.name;
-      if let Some(dir) = name
+      if let Some(data) = brand::replacement(name) {
+         replaced[index] = Some(Some(data.to_vec()));
+      } else if let Some(dir) = name
          .strip_suffix(host::LIBRARY)
          .filter(|dir| dir.starts_with("lib/"))
       {
@@ -581,7 +584,8 @@ pub fn merge<'a>(
                .map(Entry::data)
                .collect::<Result<Vec<Cow<'_, [u8]>>, Error>>()?;
             let rename = (!package.is_original()).then_some(package.0.as_str());
-            let merged = arsc::merge(&entry.data()?, &tables, rename)?;
+            let mut merged = arsc::merge(&entry.data()?, &tables, rename)?;
+            brand::arsc(&mut merged);
             log(&format!(
                "resources: merged {} config split table(s)",
                tables.len()
@@ -599,7 +603,11 @@ pub fn merge<'a>(
    let mut added = 0;
    for entry in config_entries.into_iter().flatten() {
       if entry.name.starts_with("res/") && names.insert(entry.name.clone()) {
-         out.push(entry);
+         if let Some(data) = brand::replacement(&entry.name) {
+            out.push(Entry::stored(entry.name.clone(), data)?);
+         } else {
+            out.push(entry);
+         }
          added += 1;
       }
    }

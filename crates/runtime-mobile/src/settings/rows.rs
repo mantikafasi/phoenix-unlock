@@ -4,6 +4,7 @@ use phoenix_ui_mobile::{
    Prop,
    Props,
    motion::Worklet,
+   prop,
    templates,
 };
 use phoenix_wire::Value;
@@ -80,6 +81,22 @@ pub fn button_row(title: &str, icon: &str, press: Option<Press>, chevron: bool) 
       root.set(Prop::ROLE, None);
    }
    root.press = press;
+   root
+}
+
+pub fn brand_row() -> Tree {
+   let mut root = button_row("Sunbird", "res://images_native_logo", None, false);
+   root.set(Prop::ACCESSIBILITY_ID, Some(text("phoenix-sunbird-brand")));
+   if let Some(row) = root.kids.first_mut() {
+      row.set(prop!("justify"), Some(text("center")));
+      row.set(prop!("minHeight"), Some(Value::F64(88.0)));
+      row.kids.truncate(1);
+      if let Some(icon) = row.kids.first_mut() {
+         icon.set(prop!("width"), Some(Value::F64(56.0)));
+         icon.set(prop!("height"), Some(Value::F64(56.0)));
+         icon.set(Prop::MARGIN, Some(Value::Rect([4.0, 4.0, 4.0, 4.0])));
+      }
+   }
    root
 }
 

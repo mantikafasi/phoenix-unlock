@@ -17,6 +17,7 @@ use crate::settings::{
    console::log_line,
    rows::{
       InputKind,
+      brand_row,
       button_row,
       section,
       switch_row,
@@ -52,8 +53,8 @@ pub fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
          .collect()
    };
    let enabled = plugins.iter().filter(|plugin| plugin.state.is_on()).count();
-   update_section()
-      .into_iter()
+   std::iter::once(section("", vec![brand_row()]))
+      .chain(update_section())
       .chain([
          section("Plugins", rows),
          section("", vec![
