@@ -3,9 +3,11 @@
 //!
 //! The friend requests count is answered with 0 where Phoenix computes it, for
 //! the DM list's Friends row and the inbox's Friends tab, and taken out of the
-//! Home button's count and the badge built like it. The message requests count
-//! also decides whether the Message Requests row shows, so only the DM list's
-//! badge for it draws 0.
+//! Home button's count and the badge built like it. The Friends page's Pending
+//! tab reads it from a tally of every relationship type, where it moves into a
+//! count that is only ever added to it, so the tab itself stays. The message
+//! requests count also decides whether the Message Requests row shows, so only
+//! the DM list's badge for it draws 0.
 
 use std::{
    str::FromStr,
@@ -34,6 +36,13 @@ use phoenix_sigs::{
 type BadgeFn = unsafe extern "C" fn(*mut u8, *const u8, usize, u32, usize, usize) -> *mut u8;
 /// `u32 f(&RelationshipStore)`.
 type CountFn = unsafe extern "C" fn(*const u8) -> u32;
+/// `fn(out: &mut [u64; 8], &RelationshipStore) -> out`.
+type TallyFn = unsafe extern "C" fn(*mut u64, *const u8) -> *mut u64;
+
+/// The tally's incoming friend requests, which badge the Pending tab.
+const TALLY_INCOMING: usize = 1;
+/// The tally's count after them, which its readers only add to the others.
+const TALLY_SUMMED: usize = 2;
 
 /// The Home badge's state when it shows a count.
 const STATE_COUNT: u32 = 2;
@@ -48,6 +57,7 @@ static BADGE: [OnceLock<BadgeFn>; BADGES] = [const { OnceLock::new() }; BADGES];
 const BADGE_DETOURS: [BadgeFn; BADGES] = [badge::<0>, badge::<1>];
 static FRIEND_REQUESTS: OnceLock<CountFn> = OnceLock::new();
 static HOME_COUNT: OnceLock<CountFn> = OnceLock::new();
+static TALLY: OnceLock<TallyFn> = OnceLock::new();
 /// The Home badge's trampoline, which [`home_badge_shim`] calls.
 static HOME_BADGE: AtomicUsize = AtomicUsize::new(0);
 
@@ -113,6 +123,17 @@ pub fn install(image: &Image<'static>) {
    if let Some(original) = unsafe { hook(image, home_state, home_badge_shim as *const () as usize) }
    {
       HOME_BADGE.store(original, Ordering::Release);
+   }
+   // SAFETY: as above, for the tally's ABI.
+   if let Some(original) = unsafe {
+      hook(
+         image,
+         desktop::relationship_counts(image),
+         tally as *const () as usize,
+      )
+   } {
+      // SAFETY: as above, continuing in the tally.
+      let _ = TALLY.set(unsafe { std::mem::transmute::<usize, TallyFn>(original) });
    }
 }
 
@@ -201,6 +222,19 @@ extern "C" fn home_count(store: *const u8) -> u32 {
    // SAFETY: the trampoline runs the original with Phoenix's argument.
    let count = unsafe { (*HOME_COUNT.wait())(store) };
    without_friend_requests(store, count)
+}
+
+extern "C" fn tally(out: *mut u64, store: *const u8) -> *mut u64 {
+   // SAFETY: the trampoline runs the original with Phoenix's arguments.
+   let returned = unsafe { (*TALLY.wait())(out, store) };
+   if HIDE_FRIEND_REQUESTS.load(Ordering::Acquire) {
+      // SAFETY: the original filled the counts `out` points to.
+      unsafe {
+         *out.add(TALLY_SUMMED) += *out.add(TALLY_INCOMING);
+         *out.add(TALLY_INCOMING) = 0;
+      }
+   }
+   returned
 }
 
 /// `count` less the friend requests while they are hidden.

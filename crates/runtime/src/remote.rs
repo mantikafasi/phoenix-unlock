@@ -878,6 +878,9 @@ fn plugin_route(method: &str, rest: &str, body: &[u8]) -> Reply {
                crate::refresh_settings();
                ok_json(&Done::Installed(name))
             },
+            Err(message @ crate::Error::PluginStart { .. }) => {
+               err("422 Unprocessable Entity", &message.to_string())
+            },
             Err(message) => err("500 Internal Server Error", &message.to_string()),
          }
       },
@@ -930,6 +933,7 @@ fn plugin_route(method: &str, rest: &str, body: &[u8]) -> Reply {
             return err("400 Bad Request", "expected JSON {key}");
          };
          crate::press(name, &req.key);
+         crate::refresh_settings();
          ok_json(&Done::Pressed(&req.key))
       },
       _ => err("404 Not Found", "unknown plugin route"),

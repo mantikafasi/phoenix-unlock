@@ -27,6 +27,7 @@ const settings = phoenix.settings.define({
     title: "Kagi session token",
     description: "The token from the Session Link in kagi.com/settings/user_details",
     default: "",
+    visible: (s) => s.service === "kagi" || s.service === "kagi-best",
   },
 });
 

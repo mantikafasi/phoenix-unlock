@@ -16,7 +16,6 @@ use crate::{
       Value,
    },
    one,
-   registry::GatewayRegistry,
 };
 
 /// Page 24's sidebar name `Phoenix` and its id, both relabeled in place.
@@ -103,10 +102,16 @@ pub fn settings_visibility(ix: &Index<'_>) -> Found<Vec<VisibilityGuard>> {
          })
       })
    };
+   // A compare with 15 among the first instructions rejects nearly every function cheaply.
    let found = ix
-      .heads(HEAD, |head| guard(head).is_some())
+      .heads(OPENS, |head| {
+         head
+            .iter()
+            .skip(1)
+            .any(|step| matches!(step.op, Op::Cmp { value: 15, .. }))
+      })
       .into_iter()
-      .filter_map(|func| guard(&func.steps()))
+      .filter_map(|func| guard(&func.head(HEAD)))
       .collect::<Vec<_>>();
    match found.len() {
       1..=4 => Ok(found),
@@ -225,15 +230,16 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
    const PUSHES: usize = 3;
 
    let sidebar = ix.literal(ID).one("us-logout load")?;
-   let ids = ix.text(ID);
    let steps = sidebar.steps();
    let load = steps
       .iter()
-      .position(|step| matches!(step.op, Op::Addr { target, .. } if ids.contains(&target)))
+      .position(|step| {
+         matches!(step.op, Op::Addr { target, .. } if ix.image.read(target, ID.len()) == Some(ID))
+      })
       .ok_or("the sidebar never takes us-logout's address")?;
    let mut calls = steps[load..].iter().filter_map(|step| {
       match step.op {
-         Op::Call(target) => Some(target),
+         Op::Call(target) => sidebar.through_outlined(target),
          _ => None,
       }
    });
@@ -264,18 +270,19 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
       .steps()
       .windows(2)
       .filter_map(|pair| {
-         match (pair[0].op, pair[1].op) {
-            (
-               Op::Addr { reg, target },
-               Op::Store {
-                  value: Value::Reg(value),
-                  offset,
-                  size: 8,
-                  ..
-               },
-            ) if value == reg => Some((target, usize::try_from(offset).ok()?)),
-            _ => None,
-         }
+         let Op::Addr { reg, target } = pair[0].op else {
+            return None;
+         };
+         let offset = match pair[1].op {
+            Op::Store {
+               value: Value::Reg(value),
+               offset,
+               size: 8,
+               ..
+            } if value == reg => offset,
+            _ => store_pair_first(pair[1].native).filter(|&(first, _)| first == reg)?.1,
+         };
+         Some((target, usize::try_from(offset).ok()?))
       })
       .next_back()
       .ok_or("Log Out's row stores no click vtable")?;
@@ -286,10 +293,21 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
    }
    let page = isize::try_from(page_offset).map_err(|err| err.to_string())?;
    // Windows stores a drop flag between the load and the call, Linux doesn't.
+   // Linux may widen the load to the page's whole dword, straight into the
+   // first argument.
+   let first = ix.isa.arg(0);
    let selected = steps
       .iter()
       .enumerate()
-      .filter(|(_, step)| matches!(step.op, Op::Load { offset, size: 1, .. } if offset == page))
+      .filter(|(_, step)| {
+         matches!(
+            step.op,
+            Op::Load { offset, size: 1, .. } if offset == page
+         ) || matches!(
+            step.op,
+            Op::Load { reg, offset, size: 4, .. } if offset == page && Some(reg) == first
+         )
+      })
       .filter_map(|(at, _)| {
          steps.get(at + 1..at + 3)?.iter().find_map(|step| {
             match step.op {
@@ -313,6 +331,19 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
    })
 }
 
+/// The first register and offset of an arm64 `stp x, x, [base, #imm]`, which
+/// the op lowering leaves as [`Op::Other`].
+const fn store_pair_first(native: Native) -> Option<(Reg, isize)> {
+   let Native::Arm64(phoenix_hook::arm64::Insn::Other(word)) = native else {
+      return None;
+   };
+   if word & 0xFFC0_0000 != 0xA900_0000 {
+      return None;
+   }
+   let imm7 = (((word >> 15) & 0x7F) << 25).cast_signed() >> 25;
+   Some(((word & 0x1F) as Reg, imm7 as isize * 8))
+}
+
 /// A Mana icon's number, by its name in a table of every icon's name, in
 /// order. Windows has the enum's `Debug` tables (each name's length, then a
 /// pointer to each); Linux has an array of records that start with the name's
@@ -331,11 +362,17 @@ fn mana_icon(ix: &Index<'_>, name: &str) -> Found<u16> {
          .is_some_and(|at| image.read(at, 1).is_some())
    };
    let text = |at: Option<usize>, len: Option<usize>| image.read(at?, len?);
-   for slot in ix
-      .text(ANCHOR)
-      .into_iter()
-      .flat_map(|at| image.pointers_to(at))
-   {
+   // Record tables are `(ptr, len)` pairs the index already holds; only
+   // Windows' split tables need the whole-image scans.
+   let records = ix
+      .strs()
+      .iter()
+      .filter(|slot| slot.len == ANCHOR.len() && image.read(slot.ptr, slot.len) == Some(ANCHOR))
+      .map(|slot| slot.slot);
+   let anywhere = std::iter::once(ANCHOR)
+      .flat_map(|anchor| ix.text(anchor))
+      .flat_map(|at| image.pointers_to(at));
+   for slot in records.chain(anywhere) {
       // Windows: a run of pointers right after a run of as many lengths.
       let mut start = slot;
       while start.checked_sub(width).is_some_and(points) {
@@ -427,8 +464,11 @@ fn named<'a>(
    (0..count).find(|&index| name_of(index) == Some(name.as_bytes()))
 }
 
-/// Settings' page-changed handler, `fn(state, cx)`: it reads the page byte
-/// early, and at least three page setters call it right after storing it.
+/// Settings' page-changed handler, `fn(state, cx)`.
+///
+/// It is one of the functions that can panic in
+/// `nav/settings/user/host/load.rs`, reads the page byte early, and at least
+/// three page setters call it right after storing it.
 ///
 /// The setters a sidebar row runs store and call unconditionally, so clicking
 /// the page already shown calls it too.
@@ -448,8 +488,9 @@ pub fn settings_page_changed(ix: &Index<'_>, page_offset: usize) -> Found<usize>
    let stores =
       |step: &Step| matches!(step.op, Op::Store { offset: at, size: 1, .. } if at == offset);
    let found = ix
-      .heads(HEAD, reads)
+      .source("settings/user/host/load.rs")
       .into_iter()
+      .filter(|handler| reads(&handler.head(HEAD)))
       .filter(|handler| {
          let setters = handler.callers().into_iter().filter(|setter| {
             let steps = setter.steps();
@@ -592,7 +633,7 @@ pub fn optimistic_delete<'ix>(ix: &'ix Index<'ix>, handler: Func<'ix>) -> Found<
 
 /// [`optimistic_delete`] from the gateway registry's `MESSAGE_DELETE` entry.
 pub fn optimistic_delete_of<'ix>(ix: &'ix Index<'ix>) -> Found<OptimisticDelete> {
-   let registry = GatewayRegistry::locate(ix.image).map_err(|err| err.to_string())?;
+   let registry = ix.registry()?;
    let id = registry.id("MESSAGE_DELETE").ok_or("no MESSAGE_DELETE")?;
    optimistic_delete(ix, ix.func(registry.entry(id).handler)?)
 }

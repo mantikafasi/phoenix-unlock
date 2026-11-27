@@ -496,6 +496,11 @@ pub fn start() {
    });
 }
 
+#[cfg(target_os = "android")]
+pub fn set_system_font(plugin: String, enabled: bool) {
+   queue(Job::SystemFont { plugin, enabled });
+}
+
 /// Adds `contribution` and draws it wherever its target is on screen.
 pub fn add(contribution: Contribution) {
    ACTIVE.store(true, Ordering::Release);

@@ -86,7 +86,7 @@ use crate::{
       lockdown::lockdown,
       messages::messages_object,
       settings::{
-         Definition,
+         PluginSettings,
          settings_object,
       },
       storage::{
@@ -182,12 +182,34 @@ impl Budget {
    }
 }
 
+/// What [`Engine::install`] does with new code that failed to start.
+enum Failed {
+   /// The version before it ran, so it runs again.
+   RunPrevious(Loaded),
+   /// The version before it failed too, so the newer code stays.
+   KeepNew,
+   /// There was no version before it.
+   Drop,
+}
+
+impl Failed {
+   fn after(previous: Option<Loaded>) -> Self {
+      match previous {
+         Some(previous) if matches!(previous.state, PluginState::On) => Self::RunPrevious(previous),
+         Some(_) => Self::KeepNew,
+         None => Self::Drop,
+      }
+   }
+}
+
+#[derive(Clone)]
 struct Loaded {
    source: String,
    origin: Origin,
    state:  PluginState,
 }
 
+#[derive(Clone)]
 enum Origin {
    Bundled,
    /// Read from `home/plugins`, so the user can delete it.
@@ -259,7 +281,11 @@ pub struct Registry<'js> {
    budget:             Arc<Budget>,
    handles:            Vec<(EventId, String, Object<'js>)>,
    hooks:              RefCell<HashMap<EventId, Vec<Hook<'js>>>>,
-   defined:            RefCell<BTreeMap<String, Vec<Definition<'js>>>>,
+   defined:            RefCell<BTreeMap<String, PluginSettings<'js>>>,
+   /// Plugins whose top-level script is currently running in [`Engine::eval`].
+   evaluating:         RefCell<HashSet<String>>,
+   /// Plugins currently inside dynamic settings resolution, blocking re-entrancy.
+   resolving:          RefCell<HashSet<String>>,
    /// Kept across unloads, so a reloaded plugin sees what the user chose.
    chosen:             RefCell<ChosenMap>,
    /// `phoenix.onUnload` callbacks, run when the plugin is turned off,
@@ -436,7 +462,8 @@ impl Engine {
                   .as_ref()
                   .and_then(|defined| defined.get(name))
                   .into_iter()
-                  .flatten()
+                  .flat_map(|settings| settings.definitions.iter())
+                  .filter(|definition| definition.is_shown())
                   .map(|definition| {
                      let picked = chosen
                         .as_ref()
@@ -488,11 +515,18 @@ impl Engine {
          .and_then(|permissions| {
             let permissions = Arc::new(permissions);
             self.with(|ctx| {
+               let evaluating = settings::enter_evaluating(&ctx, name);
                let run = || -> rquickjs::Result<()> {
                   let phoenix = api(&ctx, name, &permissions)?;
                   compile(&ctx, source)?.call((phoenix,))
                };
-               run().catch(&ctx).map_err(js_error)
+               let outcome = run().catch(&ctx).map_err(js_error);
+               drop(evaluating);
+               if outcome.is_ok() {
+                  restart_budget(&ctx);
+                  settings::resolve_plugin(&ctx, name);
+               }
+               outcome
             })
          });
       let Some(loaded) = self.plugins.get_mut(name) else {
@@ -580,7 +614,12 @@ impl Engine {
 
    /// Adds `name` or replaces its source, then runs it unless the user turned
    /// it off.
-   pub fn install(&mut self, name: &str, source: String) {
+   ///
+   /// New code that throws while starting is dropped and its error returned:
+   /// the version that ran before runs again, and a new plugin is not added.
+   /// Over a version that already failed, the new code stays.
+   pub fn install(&mut self, name: &str, source: String) -> Result<(), String> {
+      let previous = self.plugins.get(name).cloned();
       let enabled = if let Some(loaded) = self.plugins.get_mut(name) {
          loaded.install(source);
          loaded.state.is_on()
@@ -590,9 +629,32 @@ impl Engine {
          self.plugins.insert(name.to_owned(), loaded);
          true
       };
-      if enabled {
-         self.unload(name);
-         self.eval(name);
+      if !enabled {
+         return Ok(());
+      }
+      self.unload(name);
+      self.eval(name);
+      let Some(error) = self
+         .plugins
+         .get(name)
+         .and_then(|loaded| loaded.state.error())
+         .map(str::to_owned)
+      else {
+         return Ok(());
+      };
+      match Failed::after(previous) {
+         Failed::RunPrevious(previous) => {
+            self.unload(name);
+            self.plugins.insert(name.to_owned(), previous);
+            self.eval(name);
+            Err(error)
+         },
+         Failed::KeepNew => Ok(()),
+         Failed::Drop => {
+            self.unload(name);
+            self.plugins.remove(name);
+            Err(error)
+         },
       }
    }
 
@@ -721,6 +783,9 @@ pub fn image_allowed(ctx: &Ctx<'_>, plugin: &str, uri: &str) -> bool {
 
 /// Whether `plugin`'s rewrite of `before` into `after` adds a URL reaching a
 /// host it may not point Discord at, logging the refusal.
+///
+/// A URL Discord sent elsewhere counts too, like a message a plugin fetched to
+/// fill a page.
 #[must_use]
 pub fn rewrite_refused(
    ctx: &Ctx<'_>,
@@ -729,8 +794,14 @@ pub fn rewrite_refused(
    before: &Links,
    after: &Links,
 ) -> bool {
+   let registry = ctx.userdata::<Registry<'_>>();
+   let seen = |url: &str| {
+      registry
+         .as_ref()
+         .is_some_and(|registry| registry.seen.borrow().contains(url))
+   };
    let Some(host) = granted(ctx, plugin).map_or(Some(UrlHost::Unreadable), |permissions| {
-      permissions.added(before, after)
+      permissions.added(before, after, seen)
    }) else {
       return false;
    };
@@ -811,6 +882,8 @@ fn registry<'js>(
       handles,
       hooks: RefCell::default(),
       defined: RefCell::default(),
+      evaluating: RefCell::default(),
+      resolving: RefCell::default(),
       chosen: RefCell::default(),
       unloads: RefCell::default(),
       pending: RefCell::default(),
@@ -885,6 +958,12 @@ fn api<'js>(
    }
    api.set("discord", discord_object(ctx, plugin, permissions)?)?;
    let granted = Arc::clone(permissions);
+   api.set(
+      "sleep",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, ms: f64| {
+         background::start_sleep(&ctx, ms)
+      })?,
+   )?;
    api.set(
       "fetch",
       Function::new(
@@ -1067,5 +1146,39 @@ mod tests {
    fn a_missing_directory_has_no_plugins() {
       let dir = std::env::temp_dir().join("phoenix-installed-missing-directory");
       assert_eq!(installed(&dir).unwrap(), Vec::<(String, String)>::new());
+   }
+
+   fn loaded(state: PluginState) -> Loaded {
+      let mut loaded = Loaded::new("const works = 1;".to_owned(), Origin::Installed);
+      loaded.state = state;
+      loaded
+   }
+
+   #[test]
+   fn failed_code_gives_way_only_to_a_version_that_ran() {
+      assert!(matches!(
+         Failed::after(Some(loaded(PluginState::On))),
+         Failed::RunPrevious(_)
+      ));
+      assert!(matches!(
+         Failed::after(Some(loaded(PluginState::Failed("old".to_owned())))),
+         Failed::KeepNew
+      ));
+      assert!(matches!(Failed::after(None), Failed::Drop));
+   }
+
+   #[test]
+   fn code_for_a_plugin_that_is_off_is_saved_without_running() {
+      let mut engine = Engine::new(&GatewayRegistry::default()).expect("engine initializes");
+      engine
+         .plugins
+         .insert("p".to_owned(), loaded(PluginState::Off));
+      let broken = "throw new Error('boom');";
+      assert!(engine.install("p", broken.to_owned()).is_ok());
+      assert_eq!(engine.source("p").as_deref(), Some(broken));
+      assert!(matches!(
+         engine.plugins.get("p").map(|loaded| &loaded.state),
+         Some(PluginState::Off)
+      ));
    }
 }

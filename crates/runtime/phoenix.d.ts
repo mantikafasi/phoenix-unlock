@@ -961,9 +961,19 @@ declare namespace Phoenix {
     keys(): string[];
   }
 
+  /// Snapshot of a plugin's non-button setting values passed to dynamic predicates.
+  type SettingValuesMap = Readonly<Record<string, boolean | number | string>>;
+
+  interface SettingChoice {
+    value: string;
+    label?: string;
+  }
+
   interface SpecBase {
     title: string;
     description?: string;
+    /// Controls whether the setting is shown in Settings. Hidden settings keep their saved value.
+    visible?: boolean | ((settings: SettingValuesMap) => boolean | number | string);
   }
 
   type SettingSpec =
@@ -977,10 +987,10 @@ declare namespace Phoenix {
       })
     /// Text shown masked, and replaced with `[redacted]` in the plugin's log lines.
     | (SpecBase & { type: "secret"; default?: string; onChange?(value: string): void })
-    /// One of a fixed list, shown as rows with a checkmark. Defaults to the first option.
+    /// One of a static or dynamic list, shown as rows with a checkmark. Defaults to the first option.
     | (SpecBase & {
         type: "select";
-        options: readonly { value: string; label?: string }[];
+        options: readonly SettingChoice[] | ((settings: SettingValuesMap) => readonly SettingChoice[]);
         default?: string;
         onChange?(value: string): void;
       })
@@ -992,11 +1002,13 @@ declare namespace Phoenix {
     ? boolean
     : S extends { type: "select"; options: readonly { value: infer V }[] }
       ? V
-      : S extends { type: "text" | "secret" }
-      ? string
-      : S extends { type: "number" }
-        ? number
-        : never;
+      : S extends { type: "select" }
+        ? string
+        : S extends { type: "text" | "secret" }
+          ? string
+          : S extends { type: "number" }
+            ? number
+            : never;
 
   type SettingValues<S> = {
     readonly [K in keyof S as S[K] extends { type: "button" } ? never : K]: SettingValue<S[K]>;
@@ -1007,6 +1019,8 @@ declare namespace Phoenix {
     /// the user's current choice, so read it when needed instead of caching it. Text and number
     /// fields save when the keyboard's go key is pressed.
     define<const S extends Record<string, SettingSpec>>(schema: S): SettingValues<S>;
+    /// Re-evaluates dynamic visibility and select options and redraws open Settings pages.
+    refresh(): void;
   }
 
   interface Api {
@@ -1024,6 +1038,8 @@ declare namespace Phoenix {
     enqueue<P>(sig: Sig<P>, payload: Partial<P>): void;
     /// Present with a `// @messages` line.
     readonly messages: Messages;
+    readonly stream: Stream;
+    readonly appearance: Appearance;
     /// The raw view tree methods are present with `permissions.uiTree`. Icon URLs must point at a
     /// `fetch` host or Discord's CDN.
     readonly ui: Ui;
@@ -1040,6 +1056,10 @@ declare namespace Phoenix {
     /// Reaches the hosts on the plugin's `// @fetch` lines, like `// @fetch api.example.com
     /// *.example.org`, and throws for any other.
     fetch(url: string, init?: FetchInit): Promise<FetchResponse>;
+    /// Resolves after `ms` milliseconds, without blocking anything else. Values below 0 or not
+    /// finite resolve at once, and anything over ten minutes waits ten minutes. QuickJS has no
+    /// `setTimeout`, so `await phoenix.sleep(ms)` is how a plugin waits.
+    sleep(ms: number): Promise<void>;
     /// Discord's API through the app's own HTTP client, with the app's session headers. Paths are
     /// relative to the API base, like `/users/@me`. Rejects until the app has made a request of its
     /// own. Requests, `me`, `authorize` and interceptors reach only the routes on the plugin's
@@ -1052,6 +1072,18 @@ declare namespace Phoenix {
     readonly bridge: Bridge;
     /// `.theme.css` themes on Desktop Phoenix.
     readonly themes?: Themes;
+    /// Spotify behaviors to turn off, on Desktop Phoenix.
+    readonly spotify?: Spotify;
+  }
+
+  /// Each method is absent when this build's code for it was not found. The change applies while
+  /// any plugin holds it, until the returned function runs.
+  interface Spotify {
+    /// Spotify keeps playing after 30 seconds of talking in voice, instead of pausing.
+    keepPlayingInVoice?(): Remover;
+    /// The Spotify activity stays in your presence while you are idle. Discord's setting for
+    /// showing Spotify still applies.
+    keepActivityWhenIdle?(): Remover;
   }
 
   interface InstalledTheme {
@@ -1248,6 +1280,34 @@ declare namespace Phoenix {
     /// Reactions and the rest keep the lock, and nothing else about Nitro changes. Desktop has no
     /// picker presses to report: the handler is never called there, only the unlock applies.
     onEmojiPick(handler: (emojiId: string, ctx: UiContext) => string | void): Remover;
+    /// Desktop only: while held, Phoenix no longer stops long text. A paste of more than 4000
+    /// characters lands in the message box instead of becoming a `message.txt` upload, and a
+    /// message past the 2000 (4000 with Nitro) limit is sent to `onSend` without the "too long"
+    /// modal, so a plugin can split it. Phoenix's own counter then no longer shows a negative
+    /// remainder. Release it to put the limits back. On a phone this does nothing.
+    allowLongMessages(): Remover;
+  }
+
+  interface Stream {
+    /// Unlocks Go Live resolutions and framerates normally gated behind Nitro or server boost
+    /// tiers (1080p, 1440p, Source, 60 FPS) on Desktop Phoenix while the handle is active.
+    /// No-op on mobile.
+    unlockQuality(): Remover;
+    /// Whether this build's quality check and HD feature are hooked, so `unlockQuality` reaches
+    /// the whole Go Live picker. False on mobile and where a locator missed (Linux and macOS
+    /// so far).
+    readonly native: boolean;
+  }
+
+  interface Appearance {
+    /// Unlocks Nitro color themes and app icons in User Settings, Appearance on Desktop Phoenix
+    /// while the handle is active. They apply on this client only. App icons stay locked when
+    /// Discord's premium feature lists differ from the ones their id was measured on. No-op on
+    /// mobile.
+    unlockNitro(): Remover;
+    /// Whether this build's theme perk and app icon feature are hooked, so `unlockNitro` reaches
+    /// both. False on mobile and where a locator missed (Linux and macOS so far).
+    readonly native: boolean;
   }
 
   /// `channelId` is the open channel, `reply` posts a local message there.
@@ -1489,8 +1549,26 @@ declare namespace Phoenix {
       danger?: boolean;
       priority?: number;
       visible?(ctx: MessageContext): boolean | Promise<boolean>;
-      onPress(ctx: MessageContext): void;
+      /// Required unless `children` is given.
+      onPress?(ctx: MessageContext): void;
+      /// Makes the row a submenu of these. Desktop shows a native submenu, or the rows inline on a
+      /// build without one to copy; phones ignore it for now and need `onPress`.
+      children?: { label: string; icon?: Icon; danger?: boolean; onPress(ctx: MessageContext): void }[];
     }): Remover;
+    /// A row in the GIF picker's right-click menu, after Copy Link, given the GIF's URL.
+    /// Desktop Phoenix on Windows only, absent elsewhere or where the menu isn't found.
+    addGifAction?(options: {
+      label: string;
+      icon?: Icon;
+      priority?: number;
+      onPress(ctx: { url: string }): void;
+    }): Remover;
+    /// Takes over the GIF picker's Favourites search. `search` gets the search text and returns
+    /// the URLs of the favourites to show, in order, or null to leave Discord's own results.
+    /// It runs off the UI thread as the text changes; `update()` on the returned remover asks
+    /// again, after what `search` depends on changes. The latest plugin to set one wins.
+    /// Desktop Phoenix on Windows only, absent elsewhere or where the picker isn't found.
+    setGifFavoritesSearch?(search: (query: string) => string[] | null): Remover;
     /// A section at the end of a profile's main tab.
     addProfileSection(options: {
       title: string;
@@ -1514,6 +1592,9 @@ declare namespace Phoenix {
       message?: string;
       options?: (string | { label: string; icon?: Icon; danger?: boolean })[];
     }): Promise<number>;
+    /// A one-line text field in a dialog, starting with `initial`. Resolves to the submitted
+    /// text, or null when the dialog closes without a submit. Desktop only, absent elsewhere.
+    prompt?(options: { title?: string; initial?: string }): Promise<string | null>;
     /// Shows a scrollable text/code viewer sheet (with optional syntax highlighting and action
     /// rows such as Copy). Resolves to the chosen option index, or -1 when dismissed.
     showSheet(options: {
@@ -1526,6 +1607,11 @@ declare namespace Phoenix {
     /// Pushes a full-screen native Phoenix page onto the active navigator with a header,
     /// working Back button/gesture, scrollable syntax-highlighted code sections, and action buttons.
     openPage(options: { title: string; sections: PageSection[] }): PageHandle;
+    /// Desktop only, undefined on mobile. Shows the open server folders' servers in a column
+    /// beside the server rail, where the rail shows each open folder closed. The column stays
+    /// while any plugin holds one, and goes when the plugin unloads. Call the returned function
+    /// to let it go.
+    folderColumn?(): Remover;
     /// Hides every Phoenix view matching `accessibilityId` (e.g. `"composer.gift"` or
     /// `"Record Voice Message"`) by omitting it from its parent's child list. Call the returned
     /// function to restore it. Desktop only knows `"composer.gift"`.
@@ -1539,6 +1625,8 @@ declare namespace Phoenix {
     /// way Discord's member list toggle hides members. The width the user dragged it to comes
     /// back on restore. Available on Windows Desktop Phoenix builds with a recognized sidebar.
     collapseChannels?(): Remover;
+    /// Keep the current channel open after forwarding a message instead of switching to a single destination. Desktop Phoenix only.
+    disableForwardFollow?(): Remover;
     /// Runs `run` when `key` (one letter or digit) is pressed with the given modifiers while
     /// Discord is focused, and keeps the key from Discord. `ctrl` or `alt` is required.
     /// Desktop Phoenix on Windows only; a no-op elsewhere.
@@ -1591,8 +1679,13 @@ declare namespace Phoenix {
     /// mobile; no-op on desktop). Absent on runtimes from before it. Call the returned function
     /// to re-enable haptics.
     disableHaptics?(): Remover;
+    /// Uses Android's system sans-serif for text, inputs and rich-text runs until plugin unload.
+    useSystemFont?(): void;
     /// Copies `text` to the device clipboard.
     copy(text: string): void;
+    /// Opens an `https://`, `http://` or `discord://` link in the default browser, and throws for
+    /// anything else. Desktop only for now.
+    openUrl?(url: string): void;
     /// A short message at the bottom of the screen, in a banner at the top on iOS, or in a banner
     /// in the bottom right corner on desktop.
     toast(text: string): void;

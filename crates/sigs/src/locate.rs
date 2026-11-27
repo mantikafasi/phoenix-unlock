@@ -5,8 +5,11 @@
 pub mod message;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod settings;
+pub mod spotify;
 pub mod staff;
 
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod forward;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod gpui;
 
@@ -16,6 +19,7 @@ use crate::{
       Func,
       Index,
       Op,
+      Step,
    },
 };
 
@@ -50,6 +54,16 @@ pub const LOCATORS: &[Locator] = &[
       name:     "media fetch",
       families: DESKTOP,
       run:      |ix| media_fetch(ix).map(|func| format!("{func:?}")),
+   },
+   Locator {
+      name:     "spotify auto pause",
+      families: DESKTOP,
+      run:      |ix| spotify::auto_pause(ix).map(|patch| format!("{patch:x?}")),
+   },
+   Locator {
+      name:     "spotify idle activity",
+      families: DESKTOP,
+      run:      |ix| spotify::idle_activity(ix).map(|patch| format!("{patch:x?}")),
    },
    #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
    Locator {
@@ -167,6 +181,20 @@ pub const LOCATORS: &[Locator] = &[
          })
       },
    },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "forward follow",
+      families: DESKTOP,
+      run:      |ix| {
+         forward::forward_follow(ix).and_then(|found| {
+            let nav = hookable(ix, found.navigate)?;
+            match found.clips {
+               Some(clips) => Ok(format!("{nav}, clips {clips:#x}")),
+               None => Ok(nav),
+            }
+         })
+      },
+   },
 ];
 
 /// The `ClientAccessGate` read the runtime makes answer "no gate". The
@@ -213,19 +241,18 @@ pub struct EmojiCheck {
 pub fn emoji_check(ix: &Index<'_>) -> Found<EmojiCheck> {
    const HEAD: usize = 8;
    let context = ix.isa.arg(1).ok_or("no second argument register")?;
-   let checks = ix.heads(HEAD, |head| {
-      let [first, rest @ ..] = head else {
-         return false;
-      };
-      let ops = rest.iter().map(|step| step.op);
-      matches!(first.op, Op::Load { base, size: 1, .. } if base == context)
-         && ops
-            .clone()
-            .any(|op| matches!(op, Op::Cmp { value: 14, .. }))
-         && ops.clone().any(|op| matches!(op, Op::Imm { value: 3, .. }))
-         && ops.clone().any(|op| op == Op::Ret)
-         && ops.clone().any(|op| matches!(op, Op::Branch(_)))
-   });
+   let opens = |step: &Step| matches!(step.op, Op::Load { base, size: 1, .. } if base == context);
+   // Rejecting on the first instruction keeps the scan of every function to one decode each.
+   let checks = ix
+      .heads(1, |head| head.first().is_some_and(opens))
+      .filter(|func| {
+         let head = func.head(HEAD);
+         let ops = head.iter().skip(1).map(|step| step.op);
+         ops.clone().any(|op| matches!(op, Op::Cmp { value: 14, .. }))
+            && ops.clone().any(|op| matches!(op, Op::Imm { value: 3, .. }))
+            && ops.clone().any(|op| op == Op::Ret)
+            && ops.clone().any(|op| matches!(op, Op::Branch(_)))
+      });
    let func = checks.one("emoji check")?;
    let Some(Op::Load { offset, .. }) = func.steps().first().map(|step| step.op) else {
       return Err(format!("emoji check at {func:?} reads no context byte"));

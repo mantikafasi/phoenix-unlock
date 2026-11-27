@@ -98,6 +98,8 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       patches::mount::unmount(id);
    }
    crate::bridge::forget_haptics(name);
+   #[cfg(target_os = "android")]
+   patches::set_system_font(name.to_owned(), false);
    patches::forget(name);
 }
 

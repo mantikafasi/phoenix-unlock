@@ -13,12 +13,15 @@ mod badges;
 mod composer;
 mod config;
 mod context_menu;
+mod gif_menu;
+mod gif_search;
 #[cfg(target_arch = "x86_64")]
 mod counts;
 mod discord;
 mod double_click;
 mod emoji;
 mod fetch;
+mod forward;
 mod gateway_send;
 mod gpui;
 mod gpui_theme;
@@ -26,12 +29,14 @@ mod headers;
 mod health;
 mod icons;
 mod js;
+mod limits;
 mod members;
 mod message;
 mod modal;
 mod notices;
 mod onboarding;
 mod os;
+mod rail;
 mod ready;
 mod recovery;
 #[cfg(windows)]
@@ -39,7 +44,9 @@ mod restart;
 mod settings;
 mod shortcuts;
 mod sidebar;
+mod spotify;
 mod staff;
+mod stream;
 mod theme_css;
 mod toolbar;
 
@@ -258,6 +265,8 @@ pub fn prepare() -> Result<(), Error> {
       health::record("modal", health::Kind::Feature, modal);
    }
    feature("context_menu", || context_menu::install(&image));
+   feature("gif_menu", || gif_menu::install(&image));
+   feature("gif_search", || gif_search::install(&image));
    // Before accessories hooks `MessageRow::render`, whose prologue the header
    // locators check.
    let header = X86_CODE.then(|| headers::locate(&image, &ix));
@@ -274,13 +283,18 @@ pub fn prepare() -> Result<(), Error> {
    }
    feature("icons", || icons::install(&image));
    feature("composer", || composer::install(&image));
+   feature("spotify", || spotify::install(&ix));
    feature("sidebar", || sidebar::install(&image));
    feature("toolbar", || toolbar::install(&image));
    feature("badges", || badges::install(&image, &ix));
    feature("emoji", || emoji::install(&image, &ix));
+   feature("limits", || limits::install(&image));
+   feature("forward", || forward::install(&image, &ix));
    #[cfg(windows)]
    feature("gpui_theme", || gpui_theme::install(&image));
+   feature("stream", || stream::install(&image));
    feature("os_redraw", || <os::Os as os::DesktopOs>::install(&image));
+   feature("rail", || rail::install(&image, &ix));
    let registry = phoenix_runtime::hook(&image);
    critical(
       "gateway",

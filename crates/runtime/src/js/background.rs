@@ -14,7 +14,9 @@ use crate::{
       Engine,
       Registry,
       http::response_object,
+      saw,
    },
+   permissions::Links,
    store,
 };
 
@@ -30,11 +32,18 @@ impl Engine {
             return;
          };
          let value: rquickjs::Result<Result<Value<'_>, String>> = match settlement {
-            Settlement::Fetch(Ok(response)) | Settlement::Discord(Ok(response)) => {
+            Settlement::Fetch(Ok(response)) => {
+               response_object(&ctx, &response).map(|object| Ok(object.into_value()))
+            },
+            Settlement::Discord(Ok(response)) => {
+               // Discord's reply, so its URLs vouch for a plugin's rewrites as the
+               // app's own replies do.
+               saw(&ctx, &Links::scan(&String::from_utf8_lossy(&response.body)));
                response_object(&ctx, &response).map(|object| Ok(object.into_value()))
             },
             Settlement::Int(Ok(number)) => Ok(Ok(Value::new_int(ctx.clone(), number))),
             Settlement::Int(Err(err)) => Ok(Err(err)),
+            Settlement::Done => Ok(Ok(Value::new_undefined(ctx.clone()))),
             Settlement::Text(Ok(text)) => {
                rquickjs::String::from_str(ctx.clone(), &text).map(|text| Ok(text.into_value()))
             },
@@ -71,6 +80,8 @@ pub enum Settlement {
    Discord(Result<fetch::Response, discord::DiscordError>),
    Text(Result<String, discord::DiscordError>),
    Int(Result<i32, String>),
+   /// Settles with `undefined`, for a promise that only marks a moment.
+   Done,
    Rows(Result<store::Rows, store::StoreError>),
    Json(Result<Option<String>, store::StoreError>),
 }
@@ -98,4 +109,29 @@ pub fn in_background<'js>(
       }
    });
    Ok(promise)
+}
+
+/// Longest `phoenix.sleep` honored, so a plugin cannot park a thread for good.
+const MAX_SLEEP_MS: f64 = 600_000.0;
+
+/// `phoenix.sleep(ms)`, a promise that resolves after `ms` milliseconds.
+///
+/// It waits on its own thread so nothing else does. Negative and non-finite
+/// values resolve at once, and anything over ten minutes is cut to ten.
+pub fn start_sleep<'js>(ctx: &Ctx<'js>, ms: f64) -> rquickjs::Result<rquickjs::Promise<'js>> {
+   let ms = if ms.is_finite() {
+      ms.clamp(0.0, MAX_SLEEP_MS)
+   } else {
+      0.0
+   };
+   #[expect(
+      clippy::cast_possible_truncation,
+      clippy::cast_sign_loss,
+      reason = "clamped to 0..=MAX_SLEEP_MS above"
+   )]
+   let wait = std::time::Duration::from_millis(ms as u64);
+   in_background(ctx, move || {
+      std::thread::sleep(wait);
+      Settlement::Done
+   })
 }

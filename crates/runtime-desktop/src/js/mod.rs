@@ -28,14 +28,22 @@ use crate::{
    context_menu,
    double_click,
    emoji,
+   limits,
+   forward,
    js::ui::{
       DesktopAccessory,
       DesktopAction,
       DesktopMember,
    },
    members::Place,
+   rail,
    shortcuts,
    sidebar,
+   spotify::{
+      self,
+      Tweak,
+   },
+   stream,
    toolbar,
 };
 
@@ -44,33 +52,50 @@ use crate::{
 #[derive(Default)]
 pub struct Desktop<'js> {
    /// `phoenix.ui.addMessageAccessory` callbacks.
-   pub accessories:    RefCell<Vec<DesktopAccessory<'js>>>,
+   pub accessories:        RefCell<Vec<DesktopAccessory<'js>>>,
    /// `phoenix.ui.addMemberDecoration` callbacks.
-   pub members:        RefCell<Vec<DesktopMember<'js>>>,
+   pub members:            RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageHeaderDecoration` callbacks.
-   pub headers:        RefCell<Vec<DesktopMember<'js>>>,
+   pub headers:            RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageAction` callbacks.
    pub actions:        RefCell<Vec<DesktopAction<'js>>>,
+   /// `phoenix.ui.addGifAction` callbacks, `visible` unused.
+   pub gif_actions:    RefCell<Vec<DesktopAction<'js>>>,
+   /// The `phoenix.ui.setGifFavoritesSearch` function, by id and plugin. The
+   /// latest plugin to set one wins.
+   pub gif_search:     RefCell<Option<(u64, String, Function<'js>)>>,
    /// Active `phoenix.ui.openPage` button callbacks, keyed by button ID.
-   pub page_buttons:   RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
+   pub page_buttons:       RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
    /// `phoenix.ui.notify` `onPress` callbacks, keyed by banner ID.
-   pub notices:        RefCell<HashMap<u64, (String, Function<'js>)>>,
+   pub notices:            RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.messages.onEmojiPick` handlers by id and plugin. Desktop has
    /// no picker presses to give them, only the unlock they turn on.
    pub emoji_pickers:  RefCell<Vec<(u64, String)>>,
+   /// `phoenix.messages.allowLongMessages` holds by id and plugin.
+   pub long_pastes:    RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.onEvent("rowDoubleTap")` handlers by id and plugin.
-   pub double_taps:    RefCell<Vec<(u64, String, Function<'js>)>>,
+   pub double_taps:        RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.hide` holds by id and plugin.
-   pub hides:          RefCell<Vec<(u64, String)>>,
+   pub hides:              RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.collapseChannels` holds by id and plugin.
    pub collapses:      RefCell<Vec<(u64, String)>>,
+   /// `phoenix.spotify` holds by id, plugin and tweak.
+   pub spotify:        RefCell<Vec<(u64, String, Tweak)>>,
+   /// `phoenix.ui.disableForwardFollow` holds by id and plugin.
+   pub forward_follows: RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.addHeaderButton` handlers by id and plugin.
-   pub header_buttons: RefCell<Vec<(u64, String, Function<'js>)>>,
+   pub header_buttons:     RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.addShortcut` handlers by id and plugin.
-   pub shortcuts:      RefCell<Vec<(u64, String, Shortcut, Function<'js>)>>,
+   pub shortcuts:          RefCell<Vec<(u64, String, Shortcut, Function<'js>)>>,
    /// `phoenix.ui.hideCount` holds by id and plugin.
    #[cfg(target_arch = "x86_64")]
-   pub hidden_counts:  RefCell<Vec<(u64, String, Count)>>,
+   pub hidden_counts:      RefCell<Vec<(u64, String, Count)>>,
+   /// `phoenix.stream.unlockQuality` handles by id and plugin.
+   pub stream_unlocks:     RefCell<Vec<(u64, String)>>,
+   /// `phoenix.appearance.unlockNitro` handles by id and plugin.
+   pub appearance_unlocks: RefCell<Vec<(u64, String)>>,
+   /// `phoenix.ui.folderColumn` handles by id and plugin.
+   pub folder_columns:     RefCell<Vec<(u64, String)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -92,6 +117,7 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
 /// callbacks, banners, emoji pick handlers, hidden counts, sidebar collapses,
 /// header buttons and shortcuts `name` registered and redraws Discord without
 /// them.
+#[expect(clippy::too_many_lines, reason = "one release per hold a plugin can leave behind")]
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -125,6 +151,8 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       context_menu::sync_actions(meta);
    }
    drop(actions);
+
+   unload_gifs(&registry, name);
 
    registry
       .page_buttons
@@ -162,6 +190,22 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       !held
    });
 
+   registry.spotify.borrow_mut().retain(|&(_, ref plugin, tweak)| {
+      let held = plugin == name;
+      if held {
+         spotify::hold(tweak, false);
+      }
+      !held
+   });
+
+   registry.forward_follows.borrow_mut().retain(|(_, plugin)| {
+      let held = plugin == name;
+      if held {
+         forward::disable(false);
+      }
+      !held
+   });
+
    registry
       .header_buttons
       .borrow_mut()
@@ -191,5 +235,39 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       counts::hide(hidden.iter().map(|&(.., count)| count));
    }
 
+   let mut pastes = registry.long_pastes.borrow_mut();
+   pastes.retain(|(_, plugin)| plugin != name);
+   limits::allow(!pastes.is_empty());
+   drop(pastes);
+
+   let mut columns = registry.folder_columns.borrow_mut();
+   columns.retain(|(_, plugin)| plugin != name);
+   rail::enable(!columns.is_empty());
+
    themes::unload(name);
+   let mut stream_unlocks = registry.stream_unlocks.borrow_mut();
+   stream_unlocks.retain(|(_, plugin)| plugin != name);
+   stream::unlock(!stream_unlocks.is_empty());
+   drop(stream_unlocks);
+
+   let mut appearance_unlocks = registry.appearance_unlocks.borrow_mut();
+   appearance_unlocks.retain(|(_, plugin)| plugin != name);
+   stream::unlock_appearance(!appearance_unlocks.is_empty());
+}
+
+/// Drops `name`'s GIF picker registrations.
+fn unload_gifs(registry: &Desktop<'_>, name: &str) {
+   let mut gif_actions = registry.gif_actions.borrow_mut();
+   let before = gif_actions.len();
+   gif_actions.retain(|entry| entry.plugin != name);
+   if gif_actions.len() != before {
+      crate::gif_menu::sync_actions(gif_actions.iter().map(ui::gif_meta).collect());
+   }
+   drop(gif_actions);
+
+   let mut gif_search = registry.gif_search.borrow_mut();
+   if gif_search.as_ref().is_some_and(|(_, plugin, _)| plugin == name) {
+      *gif_search = None;
+      crate::gif_search::set_active(false);
+   }
 }

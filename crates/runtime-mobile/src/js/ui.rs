@@ -374,6 +374,16 @@ pub fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str, tree: bool) -> rquickjs::Res
       add_mount(ctx, plugin, &ui)?;
    }
    add_notify(ctx, plugin, &ui)?;
+   #[cfg(target_os = "android")]
+   {
+      let owner = plugin.to_owned();
+      ui.set(
+         "useSystemFont",
+         Function::new(ctx.clone(), move || {
+            patches::set_system_font(owner.clone(), true);
+         })?,
+      )?;
+   }
    let owner = plugin.to_owned();
    ui.set(
       "disableHaptics",

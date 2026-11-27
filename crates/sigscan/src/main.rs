@@ -255,7 +255,7 @@ fn check(
       }
    };
    let at = |addr: usize| format!("{addr:#x}");
-   let registry = GatewayRegistry::locate(image).map_err(|err| err.to_string());
+   let registry = ix.registry();
    report(
       "gateway registry",
       registry
@@ -326,8 +326,32 @@ fn check(
          );
          report("settings layer", desktop::settings_layer(image).map(at));
          report("animation frame", desktop::animation_frame(image).map(at));
-         report("notification gate", desktop::notification_gate(image).map(at));
+         report(
+            "notification gate",
+            desktop::notification_gate(image).map(at),
+         );
+         report(
+            "paste limit",
+            desktop::paste_limit(image)
+               .map(|limit| format!("{}, counts with {}", at(limit.func), at(limit.count_fn))),
+         );
+         report(
+            "message limit",
+            desktop::message_limit(image)
+               .map(|limit| format!("nitro {}, base {}", at(limit.nitro), at(limit.base))),
+         );
          if abi == x86::Abi::SysV {
+            report(
+               "playback allowlist",
+               desktop::playback_allowlist(image).map(|found| {
+                  format!(
+                     "allowlist {} (rank table {}, len immediate {})",
+                     at(found.allowlist),
+                     at(found.current),
+                     at(found.len_imm),
+                  )
+               }),
+            );
             report(
                "wayland frame",
                desktop::wayland_frame(image).map(|found| {
@@ -419,6 +443,45 @@ fn check(
                   menu.layout,
                )
             }),
+         );
+         report(
+            "gif menu",
+            desktop::gif_menu(image).map(|menu| {
+               format!(
+                  "{} (item {}, icon {}, click {}, push {}, handler +{:#x}, icon tag {}, url \
+                   +{:#x}/+{:#x})",
+                  at(menu.build_fn),
+                  at(menu.item_new),
+                  at(menu.item_icon),
+                  at(menu.set_click),
+                  at(menu.menu_push),
+                  menu.handler_offset,
+                  menu.icon_tag,
+                  menu.url_ptr,
+                  menu.url_len,
+               )
+            }),
+         );
+         report(
+            "gif results",
+            desktop::gif_results(image).map(|r| {
+               format!(
+                  "{} (search +{:#x}/+{:#x}, favourites +{:#x}/+{:#x}, mode +{:#x} == {}, text +{:#x}/+{:#x})",
+                  at(r.accessor),
+                  r.search_ptr,
+                  r.search_len,
+                  r.fav_ptr,
+                  r.fav_len,
+                  r.mode,
+                  r.fav_mode,
+                  r.query_ptr,
+                  r.query_len,
+               )
+            }),
+         );
+         report(
+            "menu submenu",
+            desktop::submenu_layout(image).map(|layout| format!("{layout:x?}")),
          );
          report(
             "native modal",
@@ -581,7 +644,102 @@ fn check(
                .and_then(|func| desktop::home_badge(image, func))
                .and_then(moved),
          );
+         report(
+            "relationship counts",
+            desktop::relationship_counts(image).and_then(moved),
+         );
+         report(
+            "any view",
+            desktop::any_view_layout(image).map(|found| {
+               format!(
+                  "request_layout {} cached style +{:#x} (none {}) type name +{:#x}",
+                  at(found.request_layout),
+                  found.cached_style,
+                  found.uncached,
+                  found.type_name
+               )
+            }),
+         );
+         report(
+            "rail",
+            desktop::rail(image).map(|found| {
+               format!(
+                  "render {} item {} into {} items {:x?} tiles {:x?} folder id +{:#x} len +{:#x} \
+                   open +{:#x}",
+                  at(found.render),
+                  at(found.item),
+                  at(found.render_into),
+                  found.items,
+                  found.tiles,
+                  found.folder_id,
+                  found.folder_len,
+                  found.open_folders
+               )
+            }),
+         );
+         report(
+            "rail list",
+            desktop::rail(image)
+               .and_then(|rail| desktop::rail_list(image, &rail))
+               .map(|found| {
+                  format!(
+                     "field +{:#x} borrow +{:#x} remeasure {}",
+                     found.field,
+                     found.borrow,
+                     at(found.remeasure)
+                  )
+               }),
+         );
+         report(
+            "user panel",
+            desktop::user_panel(image).map(|found| {
+               format!(
+                  "render {} sidebar width slot {}",
+                  at(found.render),
+                  at(found.sidebar_slot)
+               )
+            }),
+         );
          let json = desktop::message_json(image);
+         report(
+            "stream quality",
+            desktop::stream_quality(image).and_then(|func| {
+               prologues
+                  .stream_quality
+                  .is_none_or(|prologue| prologue.at(image, func))
+                  .then(|| at(func))
+                  .ok_or_else(|| "prologue changed".to_owned())
+            }),
+         );
+         // Only Win64's entries are measured, and the runtime leaves both off
+         // elsewhere.
+         if abi == x86::Abi::Win64 {
+            report(
+               "premium feature",
+               desktop::premium_feature(image).and_then(|found| {
+                  prologues
+                     .premium_feature
+                     .is_none_or(|prologue| prologue.at(image, found.func))
+                     .then(|| {
+                        let app_icons = found.app_icons.map_or_else(
+                           || "app_icons=off (tier lists changed)".to_owned(),
+                           |id| format!("app_icons={id:#x}"),
+                        );
+                        format!(
+                           "{} stream_high={:#x} {app_icons}",
+                           at(found.func),
+                           found.stream_high
+                        )
+                     })
+                     .ok_or_else(|| "prologue changed".to_owned())
+               }),
+            );
+            report(
+               "theme perk",
+               desktop::theme_perk(image)
+                  .map(|perk| format!("{} field +{:#x}", at(perk.accessor), perk.field)),
+            );
+         }
          report(
             "message json",
             json

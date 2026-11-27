@@ -720,11 +720,19 @@ impl Permissions {
    }
 
    /// The first host a URL in `after` reaches that the plugin may not point
-   /// Discord at, unless `before` spelled the same URL or one it trims down to.
+   /// Discord at, unless `before` spelled the same URL or one it trims down to,
+   /// or `seen` vouches for it.
    #[must_use]
-   pub fn added(&self, before: &Links, after: &Links) -> Option<UrlHost> {
+   pub fn added(
+      &self,
+      before: &Links,
+      after: &Links,
+      seen: impl Fn(&str) -> bool,
+   ) -> Option<UrlHost> {
       self.foreign(after, |url| {
-         before.0.contains_key(url) || before.urls().any(|original| trimmed(original, url))
+         before.0.contains_key(url)
+            || before.urls().any(|original| trimmed(original, url))
+            || seen(url)
       })
    }
 

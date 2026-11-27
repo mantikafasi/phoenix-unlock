@@ -239,6 +239,8 @@ pub struct SettingField {
 #[derive(Clone)]
 pub struct Prompt {
    pub title:     String,
+   /// What the field starts out holding.
+   pub initial:   String,
    pub on_submit: Arc<dyn Fn(String) + Send + Sync>,
 }
 
@@ -1571,9 +1573,10 @@ pub fn open_setting_editor(field: SettingField) {
 /// submitted.
 pub fn open_prompt(prompt: Prompt) {
    resolve_pending_choice();
+   let initial = prompt.initial.clone();
    set_active(ActiveModal::InstallUrl(InstallUrlModal {
       target:       FieldTarget::Prompt(prompt),
-      pending_init: Some(String::new()),
+      pending_init: Some(initial),
       status:       FieldStatus::Idle,
    }));
 }
@@ -2261,6 +2264,17 @@ fn div_with_id(msym: &ModalSymbols, mut div: RawDiv, id: &str) -> RawDiv {
    // scrolling via `Interactivity.element_id`.
    unsafe { (msym.div_id)(&raw mut out, &raw mut div, id_s.as_ptr(), id_s.len()) };
    out
+}
+
+/// Gives `div` an element id, which GPUI needs to keep its scroll offset.
+/// False when `Div::id` was not found.
+pub fn set_id(div: &mut RawDiv, id: &str) -> bool {
+   let Some(msym) = MODAL_SYM.get() else {
+      return false;
+   };
+   let old = std::mem::replace(div, RawDiv::zeroed());
+   *div = div_with_id(msym, old, id);
+   true
 }
 
 fn make_modal_button(
