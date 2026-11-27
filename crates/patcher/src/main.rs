@@ -11,6 +11,10 @@
 //! replaces the loader in an APK this patcher merged, such as the one installed
 //! on a phone (`adb shell pm path com.discord`), and signs it again, so a new
 //! loader installs over it without the splits it was made from.
+//!
+//! `patcher --host-names <base.apk> <name>...` prints `<name> <number>` for
+//! each name the APK's host name table holds and `<name> -` for the rest, the
+//! numbers the mobile runtime reads at startup.
 
 use std::{
    collections::BTreeMap,
@@ -49,7 +53,8 @@ const USAGE: &str = "usage: patcher --out <dir or file.apk> [--merge [--package 
                      <name>]] [--loader <libphoenix.so> [--lib [<name>=]<extra.so>]... [--plugin \
                      <name.js>]...] [--frida <gadget.so[.gz]> --frida-bootstrap <bootstrap.js> \
                      [--frida-script <x.js>]...] <split.apk>...\n       patcher --swap --loader \
-                     <libphoenix.so> --out <file.apk> <patched.apk>";
+                     <libphoenix.so> --out <file.apk> <patched.apk>\n       patcher --host-names \
+                     <base.apk> <name>...";
 
 #[derive(Default)]
 struct Args {
@@ -172,8 +177,33 @@ fn read_text(path: &Path) -> misstep::Result<String> {
    Ok(fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
 }
 
+/// Prints the number `apk`'s host name table gives each of `names`.
+fn host_names(apk: &Path, names: &[String]) -> misstep::Result<()> {
+   ensure!(!names.is_empty(), "{USAGE}");
+   let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+   let numbers = patcher::host_names(&read(apk)?, &names)?;
+   for (name, number) in names.iter().zip(numbers) {
+      match number {
+         Some(number) => println!("{name} {number}"),
+         None => println!("{name} -"),
+      }
+   }
+   Ok(())
+}
+
 fn main() -> misstep::Result<()> {
    misstep::install_panic_hook();
+   if env::args_os()
+      .nth(1)
+      .is_some_and(|arg| arg == "--host-names")
+   {
+      let mut rest = env::args_os().skip(2);
+      let apk = rest.next().map(PathBuf::from).context(USAGE)?;
+      let names = rest
+         .map(|name| text(PathBuf::from(name)))
+         .collect::<misstep::Result<Vec<_>>>()?;
+      return host_names(&apk, &names);
+   }
    let args = Args::parse()?;
    let out = args.out.as_deref().context(USAGE)?;
    if args.swap {
