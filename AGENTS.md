@@ -43,7 +43,7 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `crates/patcher` | Patches and signs split APKs as a library and CLI (merged single APK or individually signed splits). |
 | `crates/patcher-web` | `crates/patcher` compiled to wasm for the site. |
 | `crates/stand-in*` | Fake gateway library and demo to test hooks without Discord. |
-| `plugins/*/src/index.ts` | Bundled plugins. Leading `// @` lines carry banner and metadata, `// @warning` shows a warning on the site, and `// @unlisted` keeps a plugin off the site and out of updates. |
+| `plugins/*/src/index.ts` | Bundled plugins. Leading `// @` lines carry banner and metadata, `// @warning` shows a warning on the site, and `// @unlisted` keeps a plugin off the site and out of updates. `// @gateway`, `@gateway-send`, `@discord`, `@fetch`, `@stores`, `@messages` and `@bridge` lines grant APIs, and `crates/runtime/src/permissions.rs` refuses the rest. |
 | `docs/phoenix-356207.*` | Phoenix schema extracted from the APK by `scripts/extract-schema.py`: 29 view kinds, 855 props, 79 host modules with 433 methods, 109 events, 286 `ic_mana_*` icons, and accessibility ids. Read this before decompiling. |
 | `web/` | What CI deploys to assets.sunbird.tools with a `site.tar.gz` that `sunbird-tools/site` builds from (patcher wasm, loader libs, plugin bundles, `version.json`). Builds before `76bc0d7` fetch the last three from sunbird.tools, so the site keeps serving them at the same paths. |
 | `frida/` | Optional Frida gadget bootstrap for x86 debugging. |

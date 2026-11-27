@@ -1,6 +1,8 @@
 //! Gateway hooks: `phoenix.on`, `hook`, `dispatch` and `enqueue`, and the
 //! `before` and `after` phases that run them.
 
+use std::sync::Arc;
+
 use phoenix_sigs::registry::EventId;
 use rquickjs::{
    CatchResultExt,
@@ -21,6 +23,7 @@ use crate::{
       js_error,
       restart_budget,
    },
+   permissions::Permissions,
 };
 
 #[derive(Clone)]
@@ -180,24 +183,29 @@ fn registered<'js>(
       .collect()
 }
 
-fn event_of<'js>(ctx: &Ctx<'js>, sig: &Value<'js>) -> rquickjs::Result<EventId> {
+fn event_of<'js>(
+   ctx: &Ctx<'js>,
+   sig: &Value<'js>,
+   permissions: &Permissions,
+) -> rquickjs::Result<EventId> {
    ctx.userdata::<Registry<'js>>()
       .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?
       .handles
       .iter()
-      .find(|(_, handle)| handle.as_value() == sig)
-      .map(|(event, _)| *event)
+      .find(|(_, name, handle)| handle.as_value() == sig && permissions.event(name))
+      .map(|(event, ..)| *event)
       .ok_or_else(|| Exception::throw_type(ctx, "expected a hook point from phoenix.gateway"))
 }
 
 fn register<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
+   permissions: &Permissions,
    sig: &Value<'js>,
    before: Option<Function<'js>>,
    after: Option<Function<'js>>,
 ) -> rquickjs::Result<()> {
-   let event = event_of(ctx, sig)?;
+   let event = event_of(ctx, sig, permissions)?;
    gateway::install(event);
    ctx.userdata::<Registry<'js>>()
       .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?
@@ -217,33 +225,44 @@ pub fn add_gateway_api<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
    api: &Object<'js>,
+   permissions: &Arc<Permissions>,
 ) -> rquickjs::Result<()> {
    let name = plugin.to_owned();
+   let granted = Arc::clone(permissions);
    api.set(
       "on",
       Function::new(
          ctx.clone(),
          move |ctx: Ctx<'js>, sig: Value<'js>, listener: Function<'js>| {
-            register(&ctx, &name, &sig, None, Some(listener))
+            register(&ctx, &name, &granted, &sig, None, Some(listener))
          },
       )?,
    )?;
    let name = plugin.to_owned();
+   let granted = Arc::clone(permissions);
    api.set(
       "hook",
       Function::new(
          ctx.clone(),
          move |ctx: Ctx<'js>, sig: Value<'js>, hooks: Object<'js>| {
-            register(&ctx, &name, &sig, hooks.get("before")?, hooks.get("after")?)
+            register(
+               &ctx,
+               &name,
+               &granted,
+               &sig,
+               hooks.get("before")?,
+               hooks.get("after")?,
+            )
          },
       )?,
    )?;
+   let granted = Arc::clone(permissions);
    api.set(
       "dispatch",
       Function::new(
          ctx.clone(),
-         |ctx: Ctx<'js>, sig: Value<'js>, payload: Value<'js>| {
-            let event = event_of(&ctx, &sig)?;
+         move |ctx: Ctx<'js>, sig: Value<'js>, payload: Value<'js>| {
+            let event = event_of(&ctx, &sig, &granted)?;
             let json = ctx
                .json_stringify(payload)?
                .ok_or_else(|| Exception::throw_type(&ctx, "dispatch needs a JSON payload"))?
@@ -255,12 +274,13 @@ pub fn add_gateway_api<'js>(
       )?,
    )?;
 
+   let granted = Arc::clone(permissions);
    api.set(
       "enqueue",
       Function::new(
          ctx.clone(),
-         |ctx: Ctx<'js>, sig: Value<'js>, payload: Value<'js>| {
-            let event = event_of(&ctx, &sig)?;
+         move |ctx: Ctx<'js>, sig: Value<'js>, payload: Value<'js>| {
+            let event = event_of(&ctx, &sig, &granted)?;
             let json = ctx
                .json_stringify(payload)?
                .ok_or_else(|| Exception::throw_type(&ctx, "enqueue needs a JSON payload"))?
@@ -273,17 +293,23 @@ pub fn add_gateway_api<'js>(
    Ok(())
 }
 
-pub fn gateway_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
-   let base_gateway = ctx
+pub fn gateway_object<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   permissions: &Arc<Permissions>,
+) -> rquickjs::Result<Object<'js>> {
+   let gateway = Object::new(ctx.clone())?;
+   for (_, name, handle) in &ctx
       .userdata::<Registry<'js>>()
       .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?
-      .gateway
-      .clone();
+      .handles
+   {
+      if permissions.event(name) {
+         gateway.set(name.as_str(), handle.clone())?;
+      }
+   }
    let object_ctor = ctx.globals().get::<_, Object>("Object")?;
-   let gateway: Object<'js> = object_ctor
-      .get::<_, Function>("assign")?
-      .call((Object::new(ctx.clone())?, base_gateway))?;
-   add_gateway_send_api(ctx, plugin, &gateway)?;
+   add_gateway_send_api(ctx, plugin, &gateway, permissions)?;
    object_ctor
       .get::<_, Function>("freeze")?
       .call((gateway,))
@@ -293,8 +319,10 @@ pub fn add_gateway_send_api<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
    gateway_obj: &Object<'js>,
+   permissions: &Arc<Permissions>,
 ) -> rquickjs::Result<()> {
    let name = plugin.to_owned();
+   let granted = Arc::clone(permissions);
    let on_send = Function::new(
       ctx.clone(),
       move |ctx: Ctx<'js>, op: f64, handler: Function<'js>| {
@@ -318,6 +346,12 @@ pub fn add_gateway_send_api<'js>(
             return Err(Exception::throw_type(
                &ctx,
                "Identify (2) and Resume (6) carry credentials and cannot be hooked",
+            ));
+         }
+         if !granted.gateway_send(op) {
+            return Err(Exception::throw_type(
+               &ctx,
+               &format!("add {op} to the plugin's // @gateway-send line"),
             ));
          }
          let id = gateway::register_send_hook(&name, op);
@@ -363,7 +397,7 @@ mod tests {
    fn run_plugin(engine: &Engine, plugin: &str, code: &str) -> Result<bool, String> {
       engine.with(|ctx| {
          let run = || -> rquickjs::Result<bool> {
-            let gw = gateway_object(&ctx, plugin)?;
+            let gw = gateway_object(&ctx, plugin, &Arc::new(Permissions::Console))?;
             let wrapped = format!("(function (gateway) {{\n{code}\n}})");
             let val: Value<'_> = ctx.eval::<Function<'_>, _>(wrapped)?.call((gw,))?;
             Ok(val.as_bool().unwrap_or(true))

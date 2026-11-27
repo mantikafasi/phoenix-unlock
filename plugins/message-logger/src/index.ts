@@ -1,6 +1,9 @@
 // @description Keeps deleted messages and edit history
-// @version 0.3.0
+// @version 0.3.1
 // @author amaanq
+// @gateway messageCreate messageUpdate messageDelete messageDeleteBulk
+// @discord GET /channels/*/messages
+// @discord DELETE /channels/*/messages/*
 
 const { gateway } = phoenix;
 

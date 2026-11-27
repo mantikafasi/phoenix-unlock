@@ -52,6 +52,7 @@ use phoenix_runtime::{
       Request,
       Response,
    },
+   permissions::Permissions,
    remote,
    store::{
       Rows,
@@ -117,11 +118,15 @@ impl Platform for Mobile {
       &self,
       ctx: &Ctx<'js>,
       plugin: &str,
+      permissions: &Permissions,
       api: &Object<'js>,
       messages: &Object<'js>,
    ) -> rquickjs::Result<()> {
       js::messages::patch_api(ctx, plugin, api, messages)?;
-      api.set("bridge", js::bridge::bridge_object(ctx)?)
+      if permissions.bridge() {
+         api.set("bridge", js::bridge::bridge_object(ctx)?)?;
+      }
+      Ok(())
    }
 
    fn unload(&self, ctx: &Ctx<'_>, plugin: &str) {

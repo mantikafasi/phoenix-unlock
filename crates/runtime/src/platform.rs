@@ -24,6 +24,7 @@ use crate::{
       Request,
       Response,
    },
+   permissions::Permissions,
    remote,
    store::{
       Rows,
@@ -66,11 +67,13 @@ pub trait Platform: Sync {
    /// Keeps the platform's own JS state in `ctx`'s userdata.
    fn init(&self, ctx: &Ctx<'_>) -> rquickjs::Result<()>;
 
-   /// Adds the platform's namespaces to a plugin's `phoenix` object.
+   /// Adds the platform's namespaces to a plugin's `phoenix` object, the
+   /// ones `permissions` grants.
    fn api<'js>(
       &self,
       ctx: &Ctx<'js>,
       plugin: &str,
+      permissions: &Permissions,
       api: &Object<'js>,
       messages: &Object<'js>,
    ) -> rquickjs::Result<()>;

@@ -40,6 +40,7 @@ pub mod highlight;
 pub mod installer;
 pub mod js;
 pub mod local;
+pub mod permissions;
 mod platform;
 pub mod remote;
 pub mod store;
@@ -188,22 +189,7 @@ pub struct Header {
 impl From<&str> for Header {
    fn from(source: &str) -> Self {
       let mut header = Self::default();
-      for line in source
-         .lines()
-         .map(str::trim)
-         .filter(|line| !line.is_empty())
-      {
-         let Some(comment) = line.strip_prefix("//") else {
-            break;
-         };
-         let Some((key, value)) = comment
-            .trim()
-            .strip_prefix('@')
-            .and_then(|tag| tag.split_once(' '))
-         else {
-            continue;
-         };
-         let value = value.trim();
+      for (key, value) in banner(source) {
          match key {
             "description" => header.description = Some(value.to_owned()),
             "version" => header.version = Some(value.to_owned()),
@@ -214,6 +200,20 @@ impl From<&str> for Header {
       }
       header
    }
+}
+
+/// The `// @key value` lines that open a plugin, up to its first line of code.
+fn banner(source: &str) -> impl Iterator<Item = (&str, &str)> {
+   source
+      .lines()
+      .map(str::trim)
+      .filter(|line| !line.is_empty())
+      .map_while(|line| line.strip_prefix("//"))
+      .filter_map(|comment| {
+         let tag = comment.trim().strip_prefix('@')?;
+         let (key, value) = tag.split_once(' ').unwrap_or((tag, ""));
+         Some((key, value.trim()))
+      })
 }
 
 /// A plugin setting as the user currently has it.

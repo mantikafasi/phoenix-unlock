@@ -1,6 +1,7 @@
 // @description Opens a message's raw text and JSON in a viewer
-// @version 1.2.1
+// @version 1.2.2
 // @author cmdr-chara
+// @discord GET /channels/*/messages
 
 const show = (msg: Phoenix.Message) => {
   const json = JSON.stringify(msg, null, 2) ?? "null";

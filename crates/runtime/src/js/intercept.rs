@@ -24,6 +24,7 @@ use crate::{
       Registry,
       restart_budget,
    },
+   permissions::Permissions,
 };
 
 impl Engine {
@@ -262,8 +263,10 @@ pub fn add_discord_hooks<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
    object: &Object<'js>,
+   permissions: &Arc<Permissions>,
 ) -> rquickjs::Result<()> {
    let owner = plugin.to_owned();
+   let granted = Arc::clone(permissions);
    object.set(
       "onRequest",
       Function::new(
@@ -282,7 +285,7 @@ pub fn add_discord_hooks<'js>(
                .request_hooks
                .borrow_mut()
                .insert(id, (owner.clone(), handler));
-            discord::add_request_hook(id, owner.clone(), parsed);
+            discord::add_request_hook(id, owner.clone(), parsed, Arc::clone(&granted));
             Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
                if let Some(registry) = ctx.userdata::<Registry<'js>>() {
                   registry.request_hooks.borrow_mut().remove(&id);
@@ -293,6 +296,7 @@ pub fn add_discord_hooks<'js>(
       )?,
    )?;
    let owner_res = plugin.to_owned();
+   let granted = Arc::clone(permissions);
    object.set(
       "onResponse",
       Function::new(
@@ -311,7 +315,7 @@ pub fn add_discord_hooks<'js>(
                .response_hooks
                .borrow_mut()
                .insert(id, (owner_res.clone(), handler));
-            discord::add_response_hook(id, owner_res.clone(), parsed);
+            discord::add_response_hook(id, owner_res.clone(), parsed, Arc::clone(&granted));
             Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
                if let Some(registry) = ctx.userdata::<Registry<'js>>() {
                   registry.response_hooks.borrow_mut().remove(&id);

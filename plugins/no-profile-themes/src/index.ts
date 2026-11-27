@@ -1,6 +1,10 @@
 // @description Strips profile themes, effects, avatar decorations, and name styles
-// @version 0.2.0
+// @version 0.2.1
 // @author amaanq
+// @gateway readySupplemental initialGuild guildCreate messageCreate messageUpdate guildMemberAdd guildMemberUpdate guildMembersChunk guildMemberListUpdate presenceUpdate presencesReplace threadMembersUpdate channelCreate relationshipAdd relationshipUpdate
+// @discord GET /users/@me
+// @discord GET /users/*/profile
+// @discord GET /channels/*/messages
 
 const { gateway } = phoenix;
 

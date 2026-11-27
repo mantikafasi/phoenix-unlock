@@ -1,6 +1,10 @@
 // @description Adds a ReviewDB tab to user profiles
-// @version 0.2.1
+// @version 0.2.2
 // @author mantikafasi
+// @fetch manti.vendicated.dev
+// @discord GET /users/@me
+// @discord GET /users/*
+// @discord POST /oauth2/authorize
 
 const API = "https://manti.vendicated.dev/api/reviewdb";
 const CLIENT_ID = "915703782174752809";

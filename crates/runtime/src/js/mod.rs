@@ -64,6 +64,10 @@ use crate::{
    discord,
    gateway,
    io_error,
+   permissions::{
+      Permissions,
+      url_host,
+   },
    js::{
       hooks::{
          Hook,
@@ -201,8 +205,7 @@ pub enum Before {
 /// can reach is their own `phoenix` object.
 pub struct Registry<'js> {
    budget:             Arc<Budget>,
-   gateway:            Object<'js>,
-   handles:            Vec<(EventId, Object<'js>)>,
+   handles:            Vec<(EventId, String, Object<'js>)>,
    hooks:              RefCell<HashMap<EventId, Vec<Hook<'js>>>>,
    defined:            RefCell<BTreeMap<String, Vec<Definition<'js>>>>,
    /// Kept across unloads, so a reloaded plugin sees what the user chose.
@@ -352,16 +355,24 @@ impl Engine {
 
    /// Evaluates `name` with a fresh `phoenix` object, recording any error.
    fn eval(&mut self, name: &str) {
-      let Some(source) = self.plugins.get(name).map(|loaded| wrap(&loaded.source)) else {
+      let Some(loaded) = self.plugins.get(name) else {
          return;
       };
-      let outcome = self.with(|ctx| {
-         let run = || -> rquickjs::Result<()> {
-            let phoenix = api(&ctx, name)?;
-            ctx.eval::<Function<'_>, _>(source)?.call((phoenix,))
-         };
-         run().catch(&ctx).map_err(js_error)
-      });
+      let source = wrap(&loaded.source);
+      let outcome = loaded
+         .source
+         .parse::<Permissions>()
+         .map_err(|err| Error::Js(err.to_string()))
+         .and_then(|permissions| {
+            let permissions = Arc::new(permissions);
+            self.with(|ctx| {
+               let run = || -> rquickjs::Result<()> {
+                  let phoenix = api(&ctx, name, &permissions)?;
+                  ctx.eval::<Function<'_>, _>(source)?.call((phoenix,))
+               };
+               run().catch(&ctx).map_err(js_error)
+            })
+         });
       let Some(loaded) = self.plugins.get_mut(name) else {
          return;
       };
@@ -544,7 +555,7 @@ impl Engine {
       self.with(|ctx| {
          let run = || -> rquickjs::Result<String> {
             if !ctx.globals().contains_key("phoenix")? {
-               let phoenix = api(&ctx, "console")?;
+               let phoenix = api(&ctx, "console", &Arc::new(Permissions::Console))?;
                if let Some(platform) = crate::platform() {
                   platform.console(&ctx, &phoenix)?;
                }
@@ -587,7 +598,6 @@ fn registry<'js>(
       .globals()
       .get::<_, Object>("Object")?
       .get::<_, Function>("freeze")?;
-   let gateway = Object::new(ctx.clone())?;
    let mut handles = Vec::new();
    for (event, entry) in events.iter() {
       let key = camel_case(&entry.name);
@@ -598,13 +608,10 @@ fn registry<'js>(
          Function::new(ctx.clone(), move || label.clone())?,
       )?;
       let handle = freeze.call::<_, Object<'js>>((handle,))?;
-      gateway.set(key, handle.clone())?;
-      handles.push((event, handle));
+      handles.push((event, key, handle));
    }
-   let gateway = freeze.call((gateway,))?;
    Ok(Registry {
       budget,
-      gateway,
       handles,
       hooks: RefCell::default(),
       defined: RefCell::default(),
@@ -634,18 +641,25 @@ fn camel_case(name: &str) -> String {
       .collect()
 }
 
-/// The `phoenix` object one plugin receives.
-fn api<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
+/// The `phoenix` object one plugin receives, holding only what `permissions`
+/// grants.
+fn api<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   permissions: &Arc<Permissions>,
+) -> rquickjs::Result<Object<'js>> {
    let api = Object::new(ctx.clone())?;
-   api.set("gateway", gateway_object(ctx, plugin)?)?;
+   api.set("gateway", gateway_object(ctx, plugin, permissions)?)?;
 
-   add_gateway_api(ctx, plugin, &api)?;
+   add_gateway_api(ctx, plugin, &api, permissions)?;
 
    let messages = messages_object(ctx)?;
    if let Some(platform) = crate::platform() {
-      platform.api(ctx, plugin, &api, &messages)?;
+      platform.api(ctx, plugin, permissions, &api, &messages)?;
    }
-   api.set("messages", messages)?;
+   if permissions.messages() {
+      api.set("messages", messages)?;
+   }
    api.set("log", log_object(ctx, plugin)?)?;
    api.set("storage", storage(ctx, plugin)?)?;
    api.set("settings", settings_object(ctx, plugin)?)?;
@@ -663,13 +677,27 @@ fn api<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
          Ok::<_, rquickjs::Error>(())
       })?,
    )?;
-   api.set("stores", stores_object(ctx)?)?;
-   api.set("discord", discord_object(ctx, plugin)?)?;
+   if permissions.stores() {
+      api.set("stores", stores_object(ctx)?)?;
+   }
+   api.set("discord", discord_object(ctx, plugin, permissions)?)?;
+   let granted = Arc::clone(permissions);
    api.set(
       "fetch",
       Function::new(
          ctx.clone(),
-         |ctx: Ctx<'js>, url: String, init: Opt<Object<'js>>| start_fetch(&ctx, url, init.0),
+         move |ctx: Ctx<'js>, url: String, init: Opt<Object<'js>>| {
+            if !granted.fetch(&url) {
+               return Err(Exception::throw_message(
+                  &ctx,
+                  &format!(
+                     "{}: add this host to the plugin's // @fetch line",
+                     url_host(&url).as_deref().unwrap_or("fetch")
+                  ),
+               ));
+            }
+            start_fetch(&ctx, url, init.0)
+         },
       )?,
    )?;
    Ok(api)

@@ -1,8 +1,10 @@
 // @description Demo plugin covering settings, UI patches, and slash commands
-// @version 0.1.1
+// @version 0.1.2
 // @author amaanq
 // @enabled false
 // @unlisted
+// @gateway messageCreate
+// @messages
 
 const { gateway } = phoenix;
 

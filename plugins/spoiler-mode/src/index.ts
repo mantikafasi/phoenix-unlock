@@ -1,6 +1,8 @@
 // @description Adds a toggle to automatically spoiler everything you send
-// @version 1.2.1
+// @version 1.2.2
 // @author cmdr-chara
+// @messages
+// @discord POST /channels/*/messages
 
 const KEY = "enabled";
 const LIMIT = 2000;

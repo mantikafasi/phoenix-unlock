@@ -1,6 +1,8 @@
 // @description Removes tracking parameters from links you send and receive
-// @version 0.1.2
+// @version 0.1.3
 // @author amaanq
+// @gateway messageCreate messageUpdate
+// @messages
 
 const { gateway } = phoenix;
 

@@ -917,7 +917,8 @@ declare namespace Phoenix {
     /// Intercepts outgoing gateway frames for numeric opcode `op` (desktop only).
     /// Receives the frame's `d` payload; return a replacement payload, `false` to
     /// drop the frame, or nothing to pass the (possibly mutated) payload on.
-    /// Identify (2) and Resume (6) carry credentials and cannot be hooked.
+    /// Identify (2) and Resume (6) carry credentials and cannot be hooked. Other opcodes need a
+    /// `// @gateway-send` line, like `// @gateway-send 4`.
     onSend<Op extends keyof GatewaySendPayloads>(
       op: Op,
       handler: (payload: GatewaySendPayloads[Op]) => GatewaySendPayloads[Op] | false | void
@@ -1009,6 +1010,8 @@ declare namespace Phoenix {
   }
 
   interface Api {
+    /// Holds the hook points named on the plugin's `// @gateway` lines, like
+    /// `// @gateway messageCreate messageUpdate`.
     readonly gateway: Gateway;
     /// Observes a hook point after the client handled it.
     on<P>(sig: Sig<P>, listener: (payload: P) => void): void;
@@ -1019,6 +1022,7 @@ declare namespace Phoenix {
     /// Like `dispatch`, for use outside a gateway hook. The payload reaches the client's handler
     /// just before the next gateway event it handles, usually well under a second later.
     enqueue<P>(sig: Sig<P>, payload: Partial<P>): void;
+    /// Present with a `// @messages` line.
     readonly messages: Messages;
     readonly ui: Ui;
     readonly commands: Commands;
@@ -1026,17 +1030,23 @@ declare namespace Phoenix {
     readonly storage: Storage;
     readonly settings: Settings;
     /// Read-only SQL over Phoenix's own cache (`files/store/<account>/cache.sqlite`), at most
-    /// 10000 rows. Arguments bind to `?` as text.
+    /// 10000 rows. Arguments bind to `?` as text. Present with a `// @stores` line.
     readonly stores: Stores;
     /// Runs when the plugin is turned off, reloaded or removed. Hooks and settings go away on their
     /// own, anything else the plugin started is its to undo here.
     onUnload(cleanup: () => void): void;
+    /// Reaches the hosts on the plugin's `// @fetch` lines, like `// @fetch api.example.com
+    /// *.example.org`, and throws for any other.
     fetch(url: string, init?: FetchInit): Promise<FetchResponse>;
     /// Discord's API through the app's own HTTP client, with the app's session headers. Paths are
     /// relative to the API base, like `/users/@me`. Rejects until the app has made a request of its
-    /// own.
+    /// own. Requests, `me`, `authorize` and interceptors reach only the routes on the plugin's
+    /// `// @discord` lines, one a line, like `// @discord GET /channels/*/messages`. `*` is one
+    /// path segment, a final `**` the rest, and `*` as the method any method. `me` is
+    /// `GET /users/@me`, `authorize` is `POST /oauth2/authorize`.
     readonly discord: Discord;
-    /// Raw access to Phoenix's Android host modules (`GuestHost.invoke`).
+    /// Raw access to Phoenix's Android host modules (`GuestHost.invoke`). Present with a
+    /// `// @bridge` line.
     readonly bridge: Bridge;
     /// `.theme.css` themes on Desktop Phoenix.
     readonly themes?: Themes;
