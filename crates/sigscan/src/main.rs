@@ -591,6 +591,10 @@ fn check(
                .and_then(|func| desktop::home_badge(image, func))
                .and_then(moved),
          );
+         report(
+            "relationship counts",
+            desktop::relationship_counts(image).and_then(moved),
+         );
          let json = desktop::message_json(image);
          report(
             "message json",
