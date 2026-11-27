@@ -1,8 +1,3 @@
-// @description Allows the user to choose preferred video and audio codecs for streaming
-// @version 1.0.0
-// @author xx8008
-// @enabled false
-
 /*
  * Stream Codec Selector (TypeScript source for `sunbird-tools/sunbird`: plugins/stream-codec-selector/src/index.ts)
  *
@@ -446,7 +441,7 @@ function handleStreamAttempt(
   return { modified, nextPayload };
 }
 
-const streamFilters: RequestFilter[] = [
+const streamFilters: Phoenix.RequestFilter[] = [
   { pathIncludes: "/streams" },
   { pathIncludes: "/voice" },
   { pathIncludes: "/call" },
