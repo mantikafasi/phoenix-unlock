@@ -29,7 +29,10 @@ use crate::{
       Rows,
       StoreError,
    },
-   update::Update,
+   update::{
+      Slot,
+      Update,
+   },
 };
 
 /// Something the user should hear about outside the settings page.
@@ -112,8 +115,9 @@ pub trait Platform: Sync {
       false
    }
 
-   /// Installs the site's loader `version`, with `update`'s plugins.
-   fn update_loader(&self, _version: &str, _update: &Update) {}
+   /// Installs the site's loader `version`, with `update`'s plugins, and
+   /// releases `slot` when done.
+   fn update_loader(&self, _slot: Slot, _version: &str, _update: &Update) {}
 
    /// Answers a debug shell request the core does not know.
    fn route(&self, _request: &remote::Request) -> Option<remote::Reply> {

@@ -33,7 +33,10 @@ use std::{
 
 use phoenix_hook::image::Image;
 #[cfg(target_os = "android")]
-use phoenix_runtime::update::Update;
+use phoenix_runtime::update::{
+   Slot,
+   Update,
+};
 use phoenix_runtime::{
    Error,
    Notice,
@@ -232,8 +235,8 @@ impl Platform for Mobile {
    }
 
    #[cfg(target_os = "android")]
-   fn update_loader(&self, version: &str, update: &Update) {
-      loader::install(version, update);
+   fn update_loader(&self, slot: Slot, version: &str, update: &Update) {
+      loader::install(slot, version, update);
    }
 
    fn route(&self, request: &remote::Request) -> Option<remote::Reply> {

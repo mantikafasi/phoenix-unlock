@@ -12,11 +12,8 @@ use std::{
    path::Path,
    sync::{
       Mutex,
+      MutexGuard,
       PoisonError,
-      atomic::{
-         AtomicBool,
-         Ordering,
-      },
    },
    thread,
 };
@@ -72,30 +69,79 @@ pub enum Catalog {
 
 static CATALOG: Mutex<Catalog> = Mutex::new(Catalog::Unfetched);
 static FOUND: Mutex<Option<Update>> = Mutex::new(None);
-static STATUS: Mutex<Option<String>> = Mutex::new(None);
-static BUSY: AtomicBool = AtomicBool::new(false);
+static PROGRESS: Mutex<Progress> = Mutex::new(Progress::Idle);
+
+/// What the one update slot is doing. Only a [`Slot`] leaves `Idle`.
+enum Progress {
+   Idle,
+   Running(String),
+   Finished(String),
+}
+
+/// The claim on the update slot. Dropping it releases the slot, with the line
+/// [`Slot::finish`] left or none.
+#[must_use]
+pub struct Slot {
+   result: Option<String>,
+}
+
+impl Slot {
+   /// Shows `step` while the update runs.
+   pub fn step(&self, step: impl Into<String>) {
+      *progress() = Progress::Running(step.into());
+      crate::refresh_settings();
+   }
+
+   /// Releases the slot with `result` shown.
+   pub fn finish(mut self, result: Option<String>) {
+      self.result = result;
+   }
+}
+
+impl Drop for Slot {
+   fn drop(&mut self) {
+      *progress() = self
+         .result
+         .take()
+         .map_or(Progress::Idle, Progress::Finished);
+      crate::refresh_settings();
+   }
+}
+
+fn progress() -> MutexGuard<'static, Progress> {
+   PROGRESS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Claims the update slot showing `step`. `None` when an update already runs.
+pub fn begin(step: impl Into<String>) -> Option<Slot> {
+   let mut progress = progress();
+   if matches!(*progress, Progress::Running(_)) {
+      return None;
+   }
+   *progress = Progress::Running(step.into());
+   drop(progress);
+   crate::refresh_settings();
+   Some(Slot { result: None })
+}
 
 /// The update the last check found, if any.
 pub fn found() -> Option<Update> {
    FOUND.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
-/// Human-readable status of the current or last update attempt, if any.
+/// The step the running update shows, or the line the last one left.
+#[must_use]
 pub fn status() -> Option<String> {
-   STATUS
-      .lock()
-      .unwrap_or_else(PoisonError::into_inner)
-      .clone()
+   match &*progress() {
+      Progress::Idle => None,
+      Progress::Running(line) | Progress::Finished(line) => Some(line.clone()),
+   }
 }
 
-/// Whether an update download/install is currently running.
+/// Whether an update holds the slot.
+#[must_use]
 pub fn busy() -> bool {
-   BUSY.load(Ordering::Relaxed)
-}
-
-pub fn set_status(message: Option<String>) {
-   *STATUS.lock().unwrap_or_else(PoisonError::into_inner) = message;
-   crate::refresh_settings();
+   matches!(*progress(), Progress::Running(_))
 }
 
 pub fn catalog() -> Catalog {
@@ -204,13 +250,12 @@ pub fn check() {
 /// Checks the site on demand for a user click, updating status and showing a
 /// toast on completion.
 pub fn check_now() {
-   if !begin() {
+   let Some(slot) = begin("Checking for updates...") else {
       log::info!("update check: already running");
       crate::toast("Update check already in progress...");
       return;
-   }
-   set_status(Some("Checking for updates...".to_owned()));
-   thread::spawn(|| {
+   };
+   thread::spawn(move || {
       match query() {
          Ok(Some(update)) => {
             log::info!(
@@ -218,20 +263,20 @@ pub fn check_now() {
                update.loader,
                update.plugins
             );
-            finish(None);
+            drop(slot);
             if let Some(platform) = crate::platform() {
                platform.notify(Notice::UpdateAvailable(&update));
             }
          },
          Ok(None) => {
             log::info!("up to date ({VERSION})");
-            finish(Some(format!("Sunbird {VERSION} is up to date.")));
+            slot.finish(Some(format!("Sunbird {VERSION} is up to date.")));
             crate::toast("Sunbird is up to date");
          },
          Err(err) => {
             log::info!("update check: {err}");
             let msg = format!("Update check failed: {err}");
-            finish(Some(msg.clone()));
+            slot.finish(Some(msg.clone()));
             crate::toast(&msg);
          },
       }
@@ -243,12 +288,12 @@ pub fn check_now() {
 /// Updates changed plugins over-the-air first (hot-reloading them live), then
 /// runs the in-app APK self-updater if a newer loader is available.
 pub fn apply() {
-   if BUSY.swap(true, Ordering::AcqRel) {
+   let Some(slot) = begin("Checking for updates...") else {
       log::info!("update apply: already running");
       crate::toast("Update already in progress...");
       return;
-   }
-   thread::spawn(|| {
+   };
+   thread::spawn(move || {
       // The last check ran when Discord started, and the site may have shipped
       // since, so what it found can be out of date by the time this runs.
       let update = query().unwrap_or_else(|err| {
@@ -257,9 +302,7 @@ pub fn apply() {
       });
       let Some(update) = update else {
          log::info!("update apply: up to date ({VERSION})");
-         // `finish` also clears the last status line and redraws the page;
-         // releasing only the slot left "Updating..." on screen for good.
-         finish(None);
+         drop(slot);
          crate::toast("Sunbird is up to date");
          return;
       };
@@ -269,12 +312,12 @@ pub fn apply() {
          && let Some(platform) = crate::platform()
       {
          if platform.updates_loader() {
-            platform.update_loader(version, &update);
+            platform.update_loader(slot, version, &update);
             return;
          }
          if update.plugins.is_empty() {
             let msg = format!("Sunbird {version} is available — restart Sunbird to update.");
-            finish(Some(msg.clone()));
+            slot.finish(Some(msg.clone()));
             crate::toast(&msg);
             return;
          }
@@ -282,11 +325,11 @@ pub fn apply() {
       let mut updated_plugins = Vec::new();
       let mut failed = Vec::new();
       if !update.plugins.is_empty() {
-         set_status(Some(format!(
+         slot.step(format!(
             "Updating {} plugin{}...",
             update.plugins.len(),
             if update.plugins.len() == 1 { "" } else { "s" }
-         )));
+         ));
          for name in &update.plugins {
             let expected_crc = update.plugin_crcs.get(name).copied();
             match update_plugin(name, expected_crc) {
@@ -320,13 +363,12 @@ pub fn apply() {
       // A failed plugin used to go unreported whenever the loader update below
       // still had to run, since only `update.loader.is_none()` printed it.
       // The slot is released either way, and the failure keeps its line.
-      BUSY.store(false, Ordering::Release);
       if failed.is_empty() {
-         set_status(None);
+         drop(slot);
       } else {
          let msg = format!("Plugin update failed: {}", failed.join("; "));
          log::error!("{msg}");
-         set_status(Some(msg.clone()));
+         slot.finish(Some(msg.clone()));
          crate::toast(&msg);
       }
       if !updated_plugins.is_empty()
@@ -451,15 +493,4 @@ pub fn adopt_staged(home: &Path, plugins: &Path) {
    }
    let _ = fs::remove_dir_all(&dir);
    log::info!("moved in the plugins staged for {}", version.trim());
-}
-
-/// Claims the update slot. False when an update already runs.
-pub fn begin() -> bool {
-   !BUSY.swap(true, Ordering::AcqRel)
-}
-
-/// Releases the update slot with `status` shown.
-pub fn finish(status: Option<String>) {
-   BUSY.store(false, Ordering::Release);
-   set_status(status);
 }

@@ -518,8 +518,18 @@ impl Platform for Desktop {
    }
 
    #[cfg(target_os = "macos")]
-   fn update_loader(&self, version: &str, update: &phoenix_runtime::update::Update) {
-      update_macos_loader(version, update);
+   fn update_loader(
+      &self,
+      slot: phoenix_runtime::update::Slot,
+      version: &str,
+      update: &phoenix_runtime::update::Update,
+   ) {
+      let msg = update_macos_loader(&slot, version, update).unwrap_or_else(|msg| {
+         log::error!("loader update: {msg}");
+         format!("Loader update failed: {msg}")
+      });
+      slot.finish(Some(msg.clone()));
+      phoenix_ui_desktop::toast(&msg);
    }
 
    fn route(&self, request: &remote::Request) -> Option<remote::Reply> {
@@ -630,49 +640,30 @@ fn macos_loader_path() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn update_macos_loader(version: &str, update: &phoenix_runtime::update::Update) {
+fn update_macos_loader(
+   slot: &phoenix_runtime::update::Slot,
+   version: &str,
+   update: &phoenix_runtime::update::Update,
+) -> Result<String, String> {
    use phoenix_runtime::update;
 
    const ASSET: &str = "libphoenix-macos-arm64.dylib";
 
-   let finish_err = |msg: String| {
-      log::error!("loader update: {msg}");
-      update::finish(Some(format!("Loader update failed: {msg}")));
-      phoenix_ui_desktop::toast(&format!("Loader update failed: {msg}"));
-   };
+   let dest = macos_loader_path().ok_or("could not locate loaded libphoenix.dylib")?;
+   let dir = dest
+      .parent()
+      .ok_or("loaded dylib has no parent directory")?;
 
-   let Some(dest) = macos_loader_path() else {
-      finish_err("could not locate loaded libphoenix.dylib".to_owned());
-      return;
-   };
-   let Some(dir) = dest.parent() else {
-      finish_err("loaded dylib has no parent directory".to_owned());
-      return;
-   };
-
-   update::set_status(Some(format!("Downloading Sunbird {version}...")));
+   slot.step(format!("Downloading Sunbird {version}..."));
    let url = format!("{}plugins/{ASSET}", update::ASSETS);
-   let bytes = match phoenix_runtime::fetch::get(&url) {
-      Ok(bytes) => bytes,
-      Err(err) => {
-         finish_err(err.to_string());
-         return;
-      },
-   };
+   let bytes = phoenix_runtime::fetch::get(&url).map_err(|err| err.to_string())?;
    if !bytes.starts_with(&[0xCF, 0xFA, 0xED, 0xFE]) {
-      finish_err("downloaded dylib is not a 64-bit Mach-O binary".to_owned());
-      return;
+      return Err("downloaded dylib is not a 64-bit Mach-O binary".to_owned());
    }
-   if let Err(err) = update::verify_loader(ASSET, version, &bytes, update) {
-      finish_err(err);
-      return;
-   }
+   update::verify_loader(ASSET, version, &bytes, update)?;
 
    let tmp = dir.join(format!("libphoenix.dylib.next.{}", std::process::id()));
-   if let Err(err) = std::fs::write(&tmp, &bytes) {
-      finish_err(format!("write temp dylib: {err}"));
-      return;
-   }
+   std::fs::write(&tmp, &bytes).map_err(|err| format!("write temp dylib: {err}"))?;
    let signed = std::process::Command::new("/usr/bin/codesign")
       .args(["--force", "--sign", "-"])
       .arg(&tmp)
@@ -680,18 +671,16 @@ fn update_macos_loader(version: &str, update: &phoenix_runtime::update::Update) 
       .is_ok_and(|s| s.success());
    if !signed {
       let _ = std::fs::remove_file(&tmp);
-      finish_err("codesign failed".to_owned());
-      return;
+      return Err("codesign failed".to_owned());
    }
    if let Err(err) = std::fs::rename(&tmp, &dest) {
       let _ = std::fs::remove_file(&tmp);
-      finish_err(format!("swap dylib: {err}"));
-      return;
+      return Err(format!("swap dylib: {err}"));
    }
    let _ = std::fs::write(dir.join("version"), format!("{version}\n"));
 
    let failed_plugins = update::stage_plugins(version, update);
-   let msg = if failed_plugins.is_empty() {
+   Ok(if failed_plugins.is_empty() {
       format!("Updated to Sunbird {version}. Restart Sunbird to apply.")
    } else {
       format!(
@@ -700,7 +689,5 @@ fn update_macos_loader(version: &str, update: &phoenix_runtime::update::Update) 
          failed_plugins.len(),
          failed_plugins.join("; ")
       )
-   };
-   update::finish(Some(msg.clone()));
-   phoenix_ui_desktop::toast(&msg);
+   })
 }
