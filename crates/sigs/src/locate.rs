@@ -3,6 +3,8 @@
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod message;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod settings;
 
 use crate::{
    Found,
@@ -65,6 +67,57 @@ pub const LOCATORS: &[Locator] = &[
          message::message_row(ix)
             .and_then(|row| message::message_body(ix, row.func))
             .map(|body| format!("{body:x?}"))
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "settings label",
+      families: DESKTOP,
+      run:      |ix| {
+         settings::settings_label(ix).map(|label| {
+            format!(
+               "{:#x} (id {:#x}, suffix {:#x})",
+               label.name, label.id, label.suffix
+            )
+         })
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "settings visibility",
+      families: DESKTOP,
+      run:      |ix| {
+         settings::settings_visibility(ix).map(|guards| {
+            guards
+               .iter()
+               .map(|guard| format!("{:#x} (imm8 {:#x})", guard.cmp, guard.imm8()))
+               .collect::<Vec<_>>()
+               .join(", ")
+         })
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "settings section",
+      families: DESKTOP,
+      run:      |ix| {
+         settings::settings_section(ix)
+            .map(|section| format!("{:#x} (page +{:#x})", section.func, section.page_offset))
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "optimistic delete",
+      families: DESKTOP,
+      run:      |ix| {
+         settings::optimistic_delete_of(ix).map(|found| {
+            let deletes = found.deletes.iter().map(|func| format!("{func:#x}"));
+            format!(
+               "{} (sibling {:#x})",
+               deletes.collect::<Vec<_>>().join(", "),
+               found.sibling
+            )
+         })
       },
    },
 ];
