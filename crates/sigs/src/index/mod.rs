@@ -586,7 +586,7 @@ impl<'ix> Func<'ix> {
          .collect()
    }
 
-   fn through_outlined(&self, target: usize) -> Option<usize> {
+   pub(crate) fn through_outlined(&self, target: usize) -> Option<usize> {
       const MOST: usize = 6;
       if self.ix.isa != Isa::Aarch64 {
          return Some(target);
