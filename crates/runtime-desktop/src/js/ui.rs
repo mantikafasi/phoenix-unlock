@@ -115,6 +115,8 @@ pub struct DesktopAction<'js> {
    pub priority: i32,
    pub visible:  Option<Function<'js>>,
    pub on_press: Function<'js>,
+   /// The action whose submenu this one sits in.
+   pub parent:   Option<u64>,
 }
 
 impl DesktopAction<'_> {
@@ -126,6 +128,7 @@ impl DesktopAction<'_> {
          danger:      self.danger,
          priority:    self.priority,
          has_visible: self.visible.is_some(),
+         parent:      self.parent,
       }
    }
 }
@@ -604,7 +607,7 @@ fn register_action<'js>(ctx: &Ctx<'js>, action: DesktopAction<'js>) -> rquickjs:
 fn remove_action(ctx: &Ctx<'_>, id: u64) {
    if let Some(registry) = ctx.userdata::<Desktop<'_>>() {
       let mut list = registry.actions.borrow_mut();
-      list.retain(|entry| entry.id != id);
+      list.retain(|entry| entry.id != id && entry.parent != Some(id));
       context_menu::sync_actions(list.iter().map(DesktopAction::meta).collect());
    }
 }
@@ -619,7 +622,20 @@ fn add_message_action<'js>(
    let danger = options.get::<_, Option<bool>>("danger")?.unwrap_or(false);
    let priority = options.get::<_, Option<i32>>("priority")?.unwrap_or(0);
    let visible = options.get::<_, Option<Function<'js>>>("visible")?;
-   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let children = options.get::<_, Option<Vec<Object<'js>>>>("children")?;
+   let on_press = match (
+      options.get::<_, Option<Function<'js>>>("onPress")?,
+      &children,
+   ) {
+      (Some(on_press), _) => on_press,
+      (None, Some(_)) => Function::new(ctx.clone(), || {})?,
+      (None, None) => {
+         return Err(Exception::throw_type(
+            ctx,
+            "addMessageAction needs onPress or children",
+         ));
+      },
+   };
    let id = NEXT_ACTION.fetch_add(1, Ordering::Relaxed);
    register_action(ctx, DesktopAction {
       id,
@@ -630,7 +646,21 @@ fn add_message_action<'js>(
       priority,
       visible,
       on_press,
+      parent: None,
    })?;
+   for (order, child) in children.into_iter().flatten().enumerate() {
+      register_action(ctx, DesktopAction {
+         id:       NEXT_ACTION.fetch_add(1, Ordering::Relaxed),
+         plugin:   plugin.to_owned(),
+         label:    child.get("label")?,
+         icon:     child.get("icon")?,
+         danger:   child.get::<_, Option<bool>>("danger")?.unwrap_or(false),
+         priority: i32::try_from(order).unwrap_or(i32::MAX),
+         visible:  None,
+         on_press: child.get("onPress")?,
+         parent:   Some(id),
+      })?;
+   }
    let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| remove_action(&ctx, id))?;
    remove.set("update", Function::new(ctx.clone(), || {})?)?;
    Ok(remove)
@@ -935,6 +965,7 @@ fn add_profile_tab<'js>(
       priority,
       visible: None,
       on_press,
+      parent: None,
    })?;
 
    let closer = Rc::clone(&tab);
@@ -1641,6 +1672,13 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       "copy",
       Function::new(ctx.clone(), |ctx: Ctx<'js>, text: String| {
          phoenix_ui_desktop::copy(&text)
+            .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
+      })?,
+   )?;
+   ui.set(
+      "openUrl",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, url: String| {
+         phoenix_ui_desktop::open_url(&url)
             .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
       })?,
    )?;
