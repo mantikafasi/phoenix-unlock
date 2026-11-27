@@ -160,13 +160,27 @@ pub fn catalog() -> Catalog {
 /// Fetches the site's plugin list in the background, unless it is loaded or
 /// on its way. A failed fetch is retried on the next call.
 pub fn fetch_catalog() {
+   let _ = start_catalog_fetch(false);
+}
+
+/// Forces a fresh fetch of the site's plugin list in the background, unless one
+/// is already in flight. Returns `true` when a new fetch was started.
+#[must_use]
+pub fn refresh_catalog() -> bool {
+   start_catalog_fetch(true)
+}
+
+fn start_catalog_fetch(force: bool) -> bool {
    {
       let mut catalog = CATALOG.lock().unwrap_or_else(PoisonError::into_inner);
-      if matches!(*catalog, Catalog::Loading | Catalog::Loaded(_)) {
-         return;
+      if matches!(*catalog, Catalog::Loading)
+         || (!force && matches!(*catalog, Catalog::Loaded(_)))
+      {
+         return false;
       }
       *catalog = Catalog::Loading;
    }
+   crate::refresh_settings();
    thread::spawn(|| {
       let fetched = crate::fetch::get(&format!("{ASSETS}plugins/index.json"))
          .map_err(|err| err.to_string())
@@ -182,6 +196,7 @@ pub fn fetch_catalog() {
       };
       crate::refresh_settings();
    });
+   true
 }
 
 /// Installs a plugin the site lists. Site plugins can call API an older loader

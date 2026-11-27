@@ -248,6 +248,22 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             desktop::settings_section(image)
                .map(|section| format!("{} (page +{:#x})", at(section.func), section.page_offset)),
          );
+         report(
+            "settings sidebar",
+            desktop::settings_sidebar(image).and_then(|sb| {
+               let pro = desktop::entry_prologue(image, sb.vec_push)?;
+               Ok(format!(
+                  "{} ({} bytes moved) {:x?} icons=[{}, {}, {}] exp={:?}",
+                  at(sb.vec_push),
+                  pro.len,
+                  sb.layout,
+                  sb.icon_plugins,
+                  sb.icon_store,
+                  sb.icon_settings,
+                  sb.experience_icons
+               ))
+            }),
+         );
          let gpui = desktop::gpui(image);
          // The runtime skips message accessories without the text and push
          // primitives, so a miss here is a miss of the builders.
@@ -638,6 +654,20 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             "settings section",
             phoenix_sigs::macos::settings_section(image)
                .map(|section| format!("{} (page +{:#x})", at(section.func), section.page_offset)),
+         );
+         report(
+            "settings sidebar",
+            phoenix_sigs::macos::settings_sidebar(image).map(|sb| {
+               format!(
+                  "{} {:x?} icons=[{}, {}, {}] exp={:?}",
+                  at(sb.vec_push),
+                  sb.layout,
+                  sb.icon_plugins,
+                  sb.icon_store,
+                  sb.icon_settings,
+                  sb.experience_icons
+               )
+            }),
          );
          report(
             "staff flag",

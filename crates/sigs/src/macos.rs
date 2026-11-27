@@ -829,17 +829,372 @@ fn future_vtables(image: &Image<'_>, bounds: &[(usize, usize)]) -> Vec<(usize, u
 /// `PhoenixDESKTOP_PHOENIX` whose name and id one function loads.
 pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
    const NAME: usize = b"Phoenix".len();
-   let mut found = image.find_bytes(b"PhoenixDESKTOP_PHOENIX");
-   found.retain(|&name| {
-      let names = loaders(image, &[name]);
-      loaders(image, &[name + NAME])
-         .iter()
-         .any(|func| names.contains(func))
+   let mut found = image
+      .find_bytes(b"PhoenixDESKTOP_PHOENIX")
+      .into_iter()
+      .filter_map(|name| {
+         let names = loaders(image, &[name]);
+         let id_site = refs_to(image, &[name + NAME])
+            .into_iter()
+            .find_map(|(site, _)| {
+               let func = image.function_containing(site)?;
+               names.contains(&func).then_some((func, site))
+            })?;
+         Some((name, id_site.0, id_site.1))
+      })
+      .collect::<Vec<_>>();
+   found.sort_unstable();
+   found.dedup();
+   let (name, func, id_site) = one("settings label loader", &found)?;
+   // Right after loading `"DESKTOP_PHOENIX"`, Discord loads its 64-bit i18n
+   // hash into `x2` starting with `movz x2, #imm16` before calling the locale
+   // lookup. Flipping a bit in that immediate makes the lookup fall back to
+   // our patched `"Sunbird"` string.
+   let hash_imm = arm64::function(image, func).and_then(|(_, code)| {
+      let at = code.iter().position(|&(pc, _)| pc == id_site)?;
+      code[at + 1..(at + 5).min(code.len())].iter().find_map(|&(pc, insn)| {
+         matches!(
+            insn,
+            Insn::MovZ {
+               rd: 2,
+               wide: true,
+               ..
+            }
+         )
+         .then_some(pc)
+      })
    });
-   let name = one("settings label loader", &found)?;
    Ok(SettingsLabel {
       name,
       id: name + NAME,
+      hash_imm,
+   })
+}
+
+/// [`crate::desktop::settings_sidebar`] for macOS arm64.
+#[expect(
+   clippy::too_many_lines,
+   reason = "decodes SidebarItem::action, header, separator, and Vec::push in one pass"
+)]
+pub fn settings_sidebar(image: &Image<'_>) -> Found<crate::desktop::SettingsSidebar> {
+   let anchors = image.find_bytes(b"us-logout");
+   let mut found = Vec::new();
+   for (site, _) in refs_to(image, &anchors) {
+      let Some((_, code)) = arm64::function(image, site) else {
+         continue;
+      };
+      let Some(at) = code.iter().position(|&(pc, _)| pc == site) else {
+         continue;
+      };
+      let calls_after: Vec<usize> = code[at + 1..(at + 20).min(code.len())]
+         .iter()
+         .filter_map(|&(_, insn)| match insn {
+            Insn::Bl { target } => Some(target),
+            _ => None,
+         })
+         .collect();
+      let (Some(&action_ctor), Some(&push_site)) = (calls_after.first(), calls_after.get(1))
+      else {
+         continue;
+      };
+      // Follow a tiny outlined tail-jump thunk (`add x0, sp, ...; b vec_push`).
+      let vec_push = arm64::function(image, push_site)
+         .and_then(|(_, thunk)| {
+            (thunk.len() <= 8)
+               .then(|| match thunk.last()?.1 {
+                  Insn::B { target } => Some(target),
+                  _ => None,
+               })
+               .flatten()
+         })
+         .unwrap_or(push_site);
+      let Some((_, push_code)) = arm64::function(image, vec_push) else {
+         continue;
+      };
+      let Some(size) = push_code.iter().find_map(|&(_, insn)| match insn {
+         Insn::MovZ { imm, .. } => {
+            let val = usize::try_from(imm).ok()?;
+            ((0x80..=0x140).contains(&val) && val.is_multiple_of(8)).then_some(val)
+         },
+         _ => None,
+      }) else {
+         continue;
+      };
+
+      // Expand frameless outlined helpers (up to 24 insns) so LLVM's outlined
+      // field-store helpers inside `SidebarItem::action` and `header` are visible.
+      let expand_outlined = |func: usize| -> Vec<Insn> {
+         let Some((_, body)) = arm64::function(image, func) else {
+            return Vec::new();
+         };
+         let mut out = Vec::with_capacity(body.len());
+         for (_, insn) in body {
+            if let Insn::Bl { target } = insn
+               && let Some(bytes) = image.read(target, 24 * 4)
+            {
+               let mut sub = Vec::new();
+               let mut ok = false;
+               for (_, sub_insn) in arm64::decode_all(bytes, target) {
+                  match sub_insn {
+                     Insn::Ret | Insn::B { .. } => {
+                        ok = true;
+                        break;
+                     },
+                     Insn::Bl { .. }
+                     | Insn::BCond { .. }
+                     | Insn::Cbz { .. }
+                     | Insn::Tbz { .. }
+                     | Insn::Br { .. }
+                     | Insn::Blr { .. }
+                     | Insn::Writeback { .. } => break,
+                     other => sub.push(other),
+                  }
+               }
+               if ok {
+                  out.extend(sub);
+                  continue;
+               }
+            }
+            out.push(insn);
+         }
+         out
+      };
+
+      // Decode `SidebarItem::action` field offsets by tracking `x8` (sret),
+      // `x2` (label), `x3` (icon), `x4` (active), `x5` (destructive) through
+      // the constructor + its outlined field-store helpers.
+      let action_flat = expand_outlined(action_ctor);
+      let mut sret_reg = 8u8;
+      let mut label_reg = 2u8;
+      let mut icon_reg = 3u8;
+      let mut active_reg = 4u8;
+      let mut destructive_reg = 5u8;
+      let mut adr_regs = std::collections::HashSet::<u8>::new();
+      let mut q_from_label = [false; 32];
+      let mut q_from_stack = [false; 32];
+      let mut action_tag = None;
+      let mut id_off = None;
+      let mut label_off = None;
+      let mut on_click_vtable = None;
+      let mut icon_off = None;
+      let mut active_off = None;
+      let mut destructive_off = None;
+
+      for &insn in &action_flat {
+         if let Some((load, rt, rn, off)) = simd_q(insn) {
+            if load {
+               q_from_label[usize::from(rt)] = rn == label_reg && off == 0;
+               q_from_stack[usize::from(rt)] = rn == 31;
+            } else if rn == sret_reg
+               && let Ok(off) = usize::try_from(off)
+               && off + 24 <= size
+            {
+               if q_from_label[usize::from(rt)] && label_off.is_none() {
+                  label_off = Some(off);
+               } else if q_from_stack[usize::from(rt)] && id_off.is_none() {
+                  id_off = Some(off);
+               }
+            }
+            continue;
+         }
+         if let Some((false, rt, rt2, rn, off)) = pair(insn) {
+            if rn == sret_reg
+               && let Ok(off) = usize::try_from(off)
+            {
+               if adr_regs.contains(&rt) && on_click_vtable.is_none() {
+                  on_click_vtable = Some(off);
+               } else if adr_regs.contains(&rt2) && on_click_vtable.is_none() {
+                  on_click_vtable = Some(off + 8);
+               }
+            }
+            continue;
+         }
+         match insn {
+            Insn::MovReg { rd, rm, wide: true } => {
+               if rm == sret_reg && (19..=28).contains(&rd) {
+                  sret_reg = rd;
+               } else if rm == label_reg && (19..=28).contains(&rd) {
+                  label_reg = rd;
+               } else if rm == icon_reg && (19..=28).contains(&rd) {
+                  icon_reg = rd;
+               } else if rm == active_reg && (19..=28).contains(&rd) {
+                  active_reg = rd;
+               } else if rm == destructive_reg && (19..=28).contains(&rd) {
+                  destructive_reg = rd;
+               }
+               adr_regs.remove(&rd);
+            },
+            Insn::Adrp { rd, .. } => {
+               adr_regs.insert(rd);
+            },
+            Insn::AddImm { rd, rn, .. } => {
+               if adr_regs.contains(&rn) {
+                  adr_regs.insert(rd);
+               } else {
+                  adr_regs.remove(&rd);
+               }
+            },
+            Insn::Store {
+               rt,
+               rn,
+               offset,
+               size: store_size,
+            } if rn == sret_reg => {
+               match store_size {
+                  4 if offset == 0 && rt == 31 => action_tag = Some(0u32),
+                  8 if adr_regs.contains(&rt) && on_click_vtable.is_none() => {
+                     on_click_vtable = Some(offset);
+                  },
+                  2 if rt == icon_reg && icon_off.is_none() => icon_off = Some(offset),
+                  1 if rt == active_reg && active_off.is_none() => active_off = Some(offset),
+                  1 if rt == destructive_reg && destructive_off.is_none() => {
+                     destructive_off = Some(offset);
+                  },
+                  _ => {},
+               }
+            },
+            _ => {},
+         }
+      }
+
+      let (
+         Some(action_tag),
+         Some(id),
+         Some(label),
+         Some(vtable_off),
+         Some(icon),
+         Some(active),
+         Some(destructive),
+      ) = (
+         action_tag,
+         id_off,
+         label_off,
+         on_click_vtable,
+         icon_off,
+         active_off,
+         destructive_off,
+      )
+      else {
+         continue;
+      };
+      let Some(on_click) = vtable_off.checked_sub(8) else {
+         continue;
+      };
+
+      // Right before `"us-logout"`, Discord pushes a separator (`mov wR, #tag;
+      // str wR, [sp, #slot]; bl push_site`) and a header (`bl header_ctor; bl
+      // push_site`).
+      let pre = &code[at.saturating_sub(45)..at];
+      let mut sep_tag = None;
+      let mut header_ctor = None;
+      let mut mov_imms = [None::<u32>; 32];
+      let mut last_stored_imm = None;
+      let mut last_call = None;
+      for &(_, insn) in pre {
+         match insn {
+            Insn::MovZ { rd, imm, .. } => {
+               mov_imms[usize::from(rd)] = u32::try_from(imm).ok();
+            },
+            Insn::Store {
+               rt,
+               rn: 31,
+               size: 4,
+               ..
+            } => {
+               if let Some(imm) = mov_imms[usize::from(rt)]
+                  && (1..=15).contains(&imm)
+               {
+                  last_stored_imm = Some(imm);
+               }
+            },
+            Insn::Bl { target } => {
+               if target == push_site || target == vec_push {
+                  if let Some(imm) = last_stored_imm.take() {
+                     sep_tag = Some(imm);
+                  } else if let Some(ctor) = last_call.take() {
+                     header_ctor = Some(ctor);
+                  }
+               } else {
+                  last_stored_imm = None;
+                  last_call = Some(target);
+               }
+            },
+            _ => {},
+         }
+      }
+      let (Some(separator_tag), Some(header_fn)) = (sep_tag, header_ctor) else {
+         continue;
+      };
+      let header_flat = expand_outlined(header_fn);
+      let mut h_sret = 8u8;
+      let mut h_imms = [None::<u32>; 32];
+      let mut h_tags = Vec::new();
+      let mut header_label = None;
+      for &insn in &header_flat {
+         match insn {
+            Insn::MovReg { rd, rm, wide: true } if rm == h_sret && (19..=28).contains(&rd) => {
+               h_sret = rd;
+            },
+            Insn::MovZ { rd, imm, .. } => {
+               h_imms[usize::from(rd)] = u32::try_from(imm).ok();
+            },
+            Insn::Store {
+               rt,
+               rn,
+               offset: 0,
+               size: 4,
+            } if rn == h_sret => {
+               if let Some(imm) = h_imms[usize::from(rt)]
+                  && imm != action_tag
+                  && imm != separator_tag
+                  && imm < 16
+               {
+                  h_tags.push(imm);
+               }
+            },
+            Insn::AddImm { rd: 8, rn, imm } if rn == h_sret && (4..=0x20).contains(&imm) => {
+               header_label.get_or_insert(imm);
+            },
+            _ => {},
+         }
+      }
+      // `SidebarItem::header` writes tag 3 for kind 1 (special) and tag 2 for
+      // regular category headers; take the smaller tag (`2`).
+      h_tags.sort_unstable();
+      h_tags.dedup();
+      let (Some(&header_tag), Some(header_label)) = (h_tags.first(), header_label) else {
+         continue;
+      };
+      let Ok(layout) = (crate::desktop::SidebarLayout {
+         size,
+         action_tag,
+         header_tag,
+         separator_tag,
+         id,
+         label,
+         header_label,
+         on_click,
+         icon,
+         active,
+         destructive,
+      })
+      .validate() else {
+         continue;
+      };
+      found.push((vec_push, layout));
+   }
+   found.sort_by_key(|&(push, _)| push);
+   found.dedup_by_key(|&mut (push, _)| push);
+   let (vec_push, layout) = one("settings sidebar Vec::push", &found)?;
+   let ((icon_plugins, icon_store, icon_settings), experience_icons) =
+      crate::desktop::sunbird_sidebar_icons(image);
+   Ok(crate::desktop::SettingsSidebar {
+      vec_push,
+      layout,
+      icon_plugins,
+      icon_store,
+      icon_settings,
+      experience_icons,
    })
 }
 
@@ -2011,6 +2366,13 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
       _ => (layout::SCRATCH_CAP, layout::SCRATCH_CAP),
    };
 
+   let hover_style = arm64_hover_style(
+      image,
+      gpui.div_style_mut,
+      interactivity_size,
+      style.mouse_cursor,
+   );
+
    Ok(GpuiLayout {
       style,
       div: DivLayout {
@@ -2018,6 +2380,7 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
          children,
          interactivity,
          interactivity_size,
+         hover_style,
       },
       switch: SwitchLayout {
          size: switch_size,
@@ -2032,6 +2395,103 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
          scale,
       },
    })
+}
+
+/// Decodes `Interactivity::hover_style` directly from GPUI's
+/// `if self.hover_style.is_some() || self.base_style.mouse_cursor.is_some()`
+/// check near `div_style_mut`:
+/// `ldr xH, [xBase, #hover_style]; ...; cbnz xH; ldr xS, [xBase, #base_style]; ldrb wM, [xS, #mouse_cursor]; cmp wM, #0xff`.
+fn arm64_hover_style(
+   image: &Image<'_>,
+   div_style_mut: usize,
+   interactivity_size: usize,
+   mouse_cursor: usize,
+) -> Option<usize> {
+   let (_, style_fn) = arm64::function(image, div_style_mut)?;
+   let base_style = style_fn.iter().find_map(|&(_, insn)| match insn {
+      Insn::Load {
+         offset,
+         size: 8,
+         ..
+      } if (0x100..interactivity_size).contains(&offset) && offset.is_multiple_of(8) => {
+         Some(offset)
+      },
+      _ => None,
+   })?;
+   let decode_slice = |start: usize, count: usize| -> Option<Vec<Insn>> {
+      let bytes = image.read(start, count * 4)?;
+      Some(
+         bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .map(|(k, &c)| arm64::decode(u32::from_le_bytes(c), start + k * 4))
+            .collect(),
+      )
+   };
+   let lo = div_style_mut.saturating_sub(0x100_000) & !3;
+   let hi = div_style_mut.saturating_add(0x100_000) & !3;
+   let mut found: Option<usize> = None;
+   let mut pc = lo;
+   while pc + 4 <= hi {
+      let Some(bytes) = image.read(pc, 4) else {
+         pc += 0x1000;
+         continue;
+      };
+      let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+      if let Insn::Load {
+         rt: style_reg,
+         rn: base_reg,
+         offset,
+         size: 8,
+      } = arm64::decode(word, pc)
+         && offset == base_style
+         && base_reg != 31
+      {
+         let mc_ok = decode_slice(pc + 4, 4).is_some_and(|dec| {
+            dec.iter().enumerate().take(3).any(|(i, insn)| {
+               matches!(
+                  insn,
+                  Insn::Load { rt: mc_reg, rn, offset: mc_off, size: 1 }
+                     if *rn == style_reg
+                        && *mc_off == mouse_cursor
+                        && dec[i + 1..].iter().any(|next| matches!(
+                           next,
+                           Insn::CmpImm { rn: cmp_rn, imm: 0xFF, .. } if *cmp_rn == *mc_reg
+                        ))
+               )
+            })
+         });
+         if mc_ok && let Some(dec) = decode_slice(pc.saturating_sub(24), 6) {
+            for (i, insn) in dec.iter().enumerate().rev() {
+               if let Insn::Load {
+                  rt: hover_reg,
+                  rn,
+                  offset: hover_off,
+                  size: 8,
+               } = insn
+                  && *rn == base_reg
+                  && *hover_off != base_style
+                  && hover_off.is_multiple_of(8)
+                  && *hover_off + 8 <= interactivity_size
+                  && dec[i + 1..].iter().any(|next| {
+                     matches!(next, Insn::Cbz { rt, nonzero: true, .. } if *rt == *hover_reg)
+                  })
+               {
+                  match found {
+                     None => found = Some(*hover_off),
+                     Some(prev_off) if prev_off == *hover_off => {},
+                     Some(_) => return None,
+                  }
+                  break;
+               }
+            }
+         }
+      }
+      pc += 4;
+   }
+   found
 }
 
 /// `build_message_body` on arm64, which `MessageRow::render` calls as
@@ -4086,6 +4546,42 @@ pub fn text_fields(image: &Image<'_>) -> Found<crate::desktop::TextFields> {
       }
    });
 
+   // `FieldState::set_value` notifies its own entity before returning:
+   // `ldp w1, w2, [xN, #8]; mov x0, app; bl App::notify`.
+   let app_notify = arm64::function(image, set_value).and_then(|(_, code)| {
+      code.windows(4).find_map(|w| {
+         let Insn::Bl { target } = w[3].1 else {
+            return None;
+         };
+         let loads_pair = w[..3].iter().any(|&(_, insn)| match insn {
+            Insn::Other(word) => (word & 0xFFFF_FC1F) == 0x2941_0801,
+            _ => false,
+         });
+         let loads_split = w[..3].iter().any(|&(_, insn)| {
+            matches!(
+               insn,
+               Insn::Load {
+                  rt: 1,
+                  offset: 8,
+                  size: 4,
+                  ..
+               }
+            )
+         }) && w[..3].iter().any(|&(_, insn)| {
+            matches!(
+               insn,
+               Insn::Load {
+                  rt: 2,
+                  offset: 12,
+                  size: 4,
+                  ..
+               }
+            )
+         });
+         (loads_pair || loads_split).then_some(target)
+      })
+   });
+
    Ok(crate::desktop::TextFields {
       cx_new_single,
       cx_new_multiline,
@@ -4094,6 +4590,7 @@ pub fn text_fields(image: &Image<'_>) -> Found<crate::desktop::TextFields> {
       weak_drop,
       text_get,
       set_value,
+      app_notify,
       update_entity_dyn,
       arc_drop_slow,
       text_input_new,

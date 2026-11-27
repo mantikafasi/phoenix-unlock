@@ -1111,12 +1111,14 @@ pub fn entry_prologue(image: &Image<'_>, func: usize) -> Found<Prologue> {
    Err(format!("{func:#x} opens with less than a jump's bytes"))
 }
 
-/// Settings page 24's sidebar name, `Phoenix`, and the `PHOENIX` that ends
-/// its id, both relabeled in place.
+/// Settings page 24's sidebar name, `Phoenix`, the `PHOENIX` that ends its id,
+/// and the compiled 64-bit i18n lookup hash immediate when present (invalidated
+/// so Discord falls back to the patched `Sunbird` name).
 #[derive(Clone, Copy, Debug)]
 pub struct SettingsLabel {
-   pub name: usize,
-   pub id:   usize,
+   pub name:     usize,
+   pub id:       usize,
+   pub hash_imm: Option<usize>,
 }
 
 /// Page 24's label, from its one loader: `lea rax, [name]` with length 7,
@@ -1138,7 +1140,7 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
       })
       .chain(suffixes.iter().copied())
       .collect();
-   let mut found: Vec<(usize, usize)> = lea_refs_many(image, &ids)
+   let mut found: Vec<(usize, usize, usize)> = lea_refs_many(image, &ids)
       .into_iter()
       .flat_map(|(id, loads)| loads.into_iter().map(move |lea| (id, lea)))
       .filter_map(|(id, lea)| {
@@ -1153,13 +1155,33 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
          } else {
             id + PREFIX.len()
          };
-         (image.read(name, NAME.len())? == NAME).then_some((name, suffix))
+         (image.read(name, NAME.len())? == NAME).then_some((name, suffix, lea))
       })
       .collect();
    found.sort_unstable();
    found.dedup();
-   let (name, id) = one("settings label loader", &found)?;
-   Ok(SettingsLabel { name, id })
+   let (name, id, lea) = one("settings label loader", &found)?;
+   // Right after loading `"DESKTOP_PHOENIX"`, newer builds load its 64-bit
+   // compile-time i18n hash (`mov r64, imm64`) before calling the locale table.
+   let hash_imm = image.read(lea + 7, 32).and_then(|tail| {
+      for line in phoenix_hook::x86::disasm(tail, lea + 7, 6) {
+         if line.text.starts_with("jmp")
+            || line.text.starts_with("call")
+            || line.text == "ret"
+         {
+            break;
+         }
+         if line.len == 10
+            && let Some(raw) = image.read(line.addr, 2)
+            && matches!(raw[0], 0x48 | 0x49)
+            && (0xB8..=0xBF).contains(&raw[1])
+         {
+            return Some(line.addr + 2);
+         }
+      }
+      None
+   });
+   Ok(SettingsLabel { name, id, hash_imm })
 }
 
 /// The `cmp <arg2>, 0xf` immediate in `is_page_visible`, which the runtime
@@ -1184,6 +1206,511 @@ pub fn settings_visibility(image: &Image<'_>) -> Found<usize> {
 pub struct Section {
    pub func:        usize,
    pub page_offset: usize,
+}
+
+/// Decoded layout of Discord's `SidebarItem` enum, read directly from
+/// `SidebarItem::action`, `SidebarItem::header`, and the separator push in
+/// `SettingsHost::render_sidebar`.
+#[derive(Clone, Copy, Debug)]
+pub struct SidebarLayout {
+   pub size:          usize,
+   pub action_tag:    u32,
+   pub header_tag:    u32,
+   pub separator_tag: u32,
+   pub id:            usize,
+   pub label:         usize,
+   pub header_label:  usize,
+   pub on_click:      usize,
+   pub icon:          usize,
+   pub active:        usize,
+   pub destructive:   usize,
+}
+
+impl SidebarLayout {
+   /// Verifies every decoded offset fits inside `size` and none overlap.
+   pub(crate) fn validate(self) -> Found<Self> {
+      if !(0x80..=0x140).contains(&self.size) || !self.size.is_multiple_of(8) {
+         return Err(format!("unexpected SidebarItem size {:#x}", self.size));
+      }
+      if self.header_tag == self.action_tag
+         || self.separator_tag == self.action_tag
+         || self.separator_tag == self.header_tag
+      {
+         return Err(format!(
+            "SidebarItem tags collided: action={}, header={}, sep={}",
+            self.action_tag, self.header_tag, self.separator_tag
+         ));
+      }
+      let action_spans = [
+         (0, 4),
+         (self.id, 24),
+         (self.label, 24),
+         (self.on_click, 16),
+         (self.icon, 2),
+         (self.active, 1),
+         (self.destructive, 1),
+      ];
+      for (i, &(a_off, a_len)) in action_spans.iter().enumerate() {
+         if a_off + a_len > self.size {
+            return Err(format!(
+               "SidebarItem field at +{a_off:#x}..+{:#x} past size {:#x}",
+               a_off + a_len,
+               self.size
+            ));
+         }
+         for &(b_off, b_len) in &action_spans[i + 1..] {
+            if a_off < b_off + b_len && b_off < a_off + a_len {
+               return Err(format!(
+                  "SidebarItem fields overlap at +{a_off:#x} and +{b_off:#x}"
+               ));
+            }
+         }
+      }
+      if self.header_label < 4 || self.header_label + 24 > self.size {
+         return Err(format!(
+            "SidebarItem header label +{:#x} out of range for size {:#x}",
+            self.header_label, self.size
+         ));
+      }
+      Ok(self)
+   }
+}
+
+/// `Vec<SidebarItem>::push` used by `SettingsHost::render_sidebar`, its
+/// decoded `SidebarItem` layout, and built-in Discord icon ids for Sunbird's
+/// sidebar category and locale-independent section placement.
+#[derive(Clone, Copy, Debug)]
+pub struct SettingsSidebar {
+   pub vec_push:         usize,
+   pub layout:           SidebarLayout,
+   pub icon_plugins:     u16,
+   pub icon_store:       u16,
+   pub icon_settings:    u16,
+   /// Built-in `IconName` ids of Discord's Experience section pages.
+   pub experience_icons: [u16; 6],
+}
+
+/// Resolves built-in Discord `IconName` ids for Sunbird's sidebar entries
+/// (`Plugins`, `Store`, `Settings`) and Discord's Experience pages.
+#[must_use]
+pub fn sunbird_sidebar_icons(image: &Image<'_>) -> ((u16, u16, u16), [u16; 6]) {
+   let Ok(names) = icon_names(image) else {
+      return ((0, 0, 0), [0; 6]);
+   };
+   let find = |candidates: &[&str]| -> u16 {
+      candidates
+         .iter()
+         .find_map(|c| names.iter().position(|n| n == c))
+         .and_then(|idx| u16::try_from(idx).ok())
+         .unwrap_or(0)
+   };
+   let ours = (
+      find(&["PuzzlePiece", "Sparkles", "Apps"]),
+      find(&["Shop", "ShopSparkle", "Compass"]),
+      find(&["Settings", "Wrench"]),
+   );
+   let experience = [
+      find(&["Microphone"]),
+      find(&["PaintPalette"]),
+      find(&["Accessibility"]),
+      find(&["Trophy"]),
+      find(&["Keyboard"]),
+      find(&["Language"]),
+   ];
+   (ours, experience)
+}
+
+/// Parses `[reg + 0xNN]` or `[reg]` from an x86 disassembly operand for `base`.
+fn x86_base_disp(operand: &str, base: &str) -> Option<usize> {
+   let inner = operand.split('[').nth(1)?.split(']').next()?.trim();
+   if inner == base {
+      return Some(0);
+   }
+   let rest = inner.strip_prefix(base)?.trim().strip_prefix('+')?.trim();
+   let hex = rest.trim_end_matches('h');
+   usize::from_str_radix(hex, 16).ok()
+}
+
+/// Parses an x86 immediate literal (`0`, `7`, `0Ah`, etc.).
+fn x86_imm(token: &str) -> Option<u32> {
+   let s = token.trim();
+   s.strip_suffix('h')
+      .map_or_else(|| s.parse::<u32>().ok(), |hex| u32::from_str_radix(hex, 16).ok())
+}
+
+/// Parses `mov dst,src` / `lea dst,src` / `and dst,src` operands from `iced-x86`
+/// output (no space after comma).
+fn x86_operands(rest: &str) -> Option<(&str, &str)> {
+   let (dst, src) = rest.split_once(',')?;
+   Some((dst.trim(), src.trim()))
+}
+
+fn is_reg64(s: &str) -> bool {
+   matches!(
+      s,
+      "rax"
+         | "rbx"
+         | "rcx"
+         | "rdx"
+         | "rsi"
+         | "rdi"
+         | "rbp"
+         | "rsp"
+         | "r8"
+         | "r9"
+         | "r10"
+         | "r11"
+         | "r12"
+         | "r13"
+         | "r14"
+         | "r15"
+   )
+}
+
+fn is_reg16(s: &str) -> bool {
+   matches!(
+      s,
+      "ax" | "bx"
+         | "cx"
+         | "dx"
+         | "si"
+         | "di"
+         | "bp"
+         | "sp"
+         | "r8w"
+         | "r9w"
+         | "r10w"
+         | "r11w"
+         | "r12w"
+         | "r13w"
+         | "r14w"
+         | "r15w"
+   )
+}
+
+fn is_reg8(s: &str) -> bool {
+   matches!(
+      s,
+      "al" | "bl"
+         | "cl"
+         | "dl"
+         | "sil"
+         | "dil"
+         | "bpl"
+         | "spl"
+         | "r8b"
+         | "r9b"
+         | "r10b"
+         | "r11b"
+         | "r12b"
+         | "r13b"
+         | "r14b"
+         | "r15b"
+   )
+}
+
+/// Decodes `SidebarItem::action`'s field offsets on x86-64 from its sret
+/// stores.
+#[expect(
+   clippy::too_many_lines,
+   reason = "tracks sret/vtable registers across x86-64 SidebarItem::action stores"
+)]
+fn decode_x86_sidebar_action(
+   image: &Image<'_>,
+   action_ctor: usize,
+   size: usize,
+) -> Option<(u32, usize, usize, usize, usize, usize, usize)> {
+   let (start, end) = image.function_bounds(action_ctor)?;
+   let body = image.read(start, end.saturating_sub(start))?;
+   let lines = phoenix_hook::x86::disasm(body, start, 200);
+   let abi = Abi::of(image);
+   let arg0 = match abi.arg(0) {
+      Register::RCX => "rcx",
+      Register::RDI => "rdi",
+      _ => return None,
+   };
+   let mut sret_regs = vec![arg0.to_owned()];
+   let mut vtable_regs = HashSet::<String>::new();
+   let mut action_tag: Option<u32> = None;
+   let mut vtable_off: Option<usize> = None;
+   let mut icon_off: Option<usize> = None;
+   let mut byte_offs = Vec::<usize>::new();
+   let mut xmm_offs = Vec::<usize>::new();
+   let mut qword_offs = HashSet::<usize>::new();
+
+   for line in &lines {
+      let text = line.text.as_str();
+      if text == "ret" {
+         break;
+      }
+      if let Some(rest) = text.strip_prefix("and ")
+         && let Some((dst, src)) = x86_operands(rest)
+         && x86_imm(src) == Some(0)
+         && let Some(off) = sret_regs.iter().find_map(|r| x86_base_disp(dst, r))
+      {
+         if dst.starts_with("dword ptr ") && off == 0 {
+            action_tag = Some(0);
+         } else if dst.starts_with("qword ptr ") {
+            qword_offs.insert(off);
+         }
+      } else if let Some(rest) = text.strip_prefix("mov ")
+         && let Some((dst, src)) = x86_operands(rest)
+      {
+         if !dst.contains('[') && !src.contains('[') {
+            if sret_regs.iter().any(|r| r == src) && !sret_regs.iter().any(|r| r == dst) {
+               sret_regs.push(dst.to_owned());
+            } else {
+               sret_regs.retain(|r| r != dst);
+            }
+            if vtable_regs.contains(src) {
+               vtable_regs.insert(dst.to_owned());
+            } else {
+               vtable_regs.remove(dst);
+            }
+         }
+         if let Some(off) = sret_regs.iter().find_map(|r| x86_base_disp(dst, r)) {
+            if dst.starts_with("dword ptr ") && off == 0 {
+               if let Some(imm) = x86_imm(src) {
+                  action_tag = Some(imm);
+               }
+            } else if off == 0
+               && matches!(src, "eax" | "ecx" | "edx" | "r8d" | "r9d" | "r10d" | "r11d")
+            {
+               action_tag.get_or_insert(0);
+            } else if dst.starts_with("qword ptr ") || is_reg64(src) {
+               qword_offs.insert(off);
+               if vtable_regs.contains(src) {
+                  vtable_off = Some(off);
+               }
+            } else if (dst.starts_with("word ptr ") || is_reg16(src))
+               && icon_off.is_none()
+               && off + 2 <= size
+            {
+               icon_off = Some(off);
+            } else if (dst.starts_with("byte ptr ") && x86_imm(src).is_none() || is_reg8(src))
+               && off < size
+               && !byte_offs.contains(&off)
+            {
+               byte_offs.push(off);
+            }
+         }
+      } else if let Some(rest) = text.strip_prefix("lea ")
+         && let Some((dst, src)) = x86_operands(rest)
+      {
+         sret_regs.retain(|r| r != dst);
+         if src.contains("[rip") || (src.starts_with('[') && !src.contains('+') && src.ends_with("h]"))
+         {
+            vtable_regs.insert(dst.to_owned());
+         } else {
+            vtable_regs.remove(dst);
+         }
+      } else if (text.starts_with("movups ")
+         || text.starts_with("movdqu ")
+         || text.starts_with("movaps "))
+         && let Some((_, rest)) = text.split_once(' ')
+         && let Some((dst, _)) = x86_operands(rest)
+         && let Some(off) = sret_regs.iter().find_map(|r| x86_base_disp(dst, r))
+         && !xmm_offs.contains(&off)
+      {
+         xmm_offs.push(off);
+      }
+   }
+
+   let action_tag = action_tag?;
+   let on_click = vtable_off?.checked_sub(8)?;
+   let icon = icon_off?;
+   let mut strings: Vec<usize> = xmm_offs
+      .into_iter()
+      .filter(|&off| qword_offs.contains(&(off + 16)) && off + 24 <= size)
+      .collect();
+   strings.sort_unstable();
+   let (id, label) = (*strings.first()?, *strings.get(1)?);
+   let mut flags: Vec<usize> = byte_offs.into_iter().filter(|&o| o > icon).collect();
+   flags.sort_unstable();
+   let (active, destructive) = (*flags.first()?, *flags.get(1)?);
+   Some((action_tag, id, label, on_click, icon, active, destructive))
+}
+
+/// Decodes `header_tag` and `header_label` offset from `SidebarItem::header`.
+fn decode_x86_sidebar_header(
+   image: &Image<'_>,
+   header_fn: usize,
+   action_tag: u32,
+   separator_tag: u32,
+) -> Option<(u32, usize)> {
+   let (h_start, h_end) = image.function_bounds(header_fn)?;
+   let h_bytes = image.read(h_start, h_end.saturating_sub(h_start))?;
+   let h_lines = phoenix_hook::x86::disasm(h_bytes, h_start, 80);
+   let arg0 = match Abi::of(image).arg(0) {
+      Register::RCX => "rcx",
+      Register::RDI => "rdi",
+      _ => return None,
+   };
+   let mut header_label = None;
+   let mut header_tag = None;
+   let mut last_tag_imm: Option<u32> = None;
+
+   for line in &h_lines {
+      let text = line.text.as_str();
+      if text == "ret" {
+         break;
+      }
+      if header_label.is_none()
+         && let Some(rest) = text.strip_prefix("add ")
+         && let Some((dst, src)) = x86_operands(rest)
+         && dst == arg0
+         && let Some(imm) = x86_imm(src)
+      {
+         let off = imm as usize;
+         if (4..=0x20).contains(&off) && off.is_multiple_of(8) {
+            header_label = Some(off);
+         }
+      }
+      if let Some(rest) = text.strip_prefix("push ")
+         && let Some(imm) = x86_imm(rest)
+         && imm < 16
+         && imm != action_tag
+         && imm != separator_tag
+      {
+         last_tag_imm = Some(imm);
+      } else if let Some(rest) = text.strip_prefix("mov ")
+         && let Some((dst, src)) = x86_operands(rest)
+      {
+         if dst == "eax"
+            && let Some(imm) = x86_imm(src)
+            && imm < 16
+            && imm != action_tag
+            && imm != separator_tag
+         {
+            last_tag_imm = Some(imm);
+         } else if dst.starts_with("dword ptr [")
+            && let Some(imm) = x86_imm(src)
+            && imm < 16
+            && imm != action_tag
+            && imm != separator_tag
+         {
+            header_tag = Some(imm);
+         } else if dst.starts_with('[') && !dst.contains('+') && src == "eax" {
+            header_tag = last_tag_imm;
+         }
+      }
+   }
+   Some((header_tag?, header_label?))
+}
+
+/// Locates `Vec<SidebarItem>::push` and decodes `SidebarItem`'s field layout
+/// in `SettingsHost::render_sidebar` from its unique `"us-logout"` action item.
+#[expect(
+   clippy::too_many_lines,
+   reason = "decodes SidebarItem::action, header, separator, and Vec::push in one pass"
+)]
+pub fn settings_sidebar(image: &Image<'_>) -> Found<SettingsSidebar> {
+   let anchors = image.find_bytes(b"us-logout");
+   let mut found = Vec::new();
+   for lea in lea_refs_many(image, &anchors).into_values().flatten() {
+      let Some((fn_start, fn_end)) = image.function_bounds(lea) else {
+         continue;
+      };
+      let calls = decoded_calls(image, lea, fn_end.min(lea + 0x90), 25);
+      let (Some(&(_, action_ctor)), Some(&(_, vec_push))) = (calls.first(), calls.get(1)) else {
+         continue;
+      };
+      let Some((p_start, p_end)) = image.function_bounds(vec_push) else {
+         continue;
+      };
+      let Some(push_body) = image.read(p_start, p_end.saturating_sub(p_start)) else {
+         continue;
+      };
+      let Some(size) = phoenix_hook::x86::disasm(push_body, p_start, 40)
+         .into_iter()
+         .find_map(|line| {
+            let hex = line
+               .text
+               .rsplit([',', ' '])
+               .next()?
+               .trim_end_matches('h');
+            let val = usize::from_str_radix(hex, 16).ok()?;
+            ((0x80..=0x140).contains(&val) && val.is_multiple_of(8)).then_some(val)
+         })
+      else {
+         continue;
+      };
+      let Some((action_tag, id, label, on_click, icon, active, destructive)) =
+         decode_x86_sidebar_action(image, action_ctor, size)
+      else {
+         continue;
+      };
+      // Disassemble from `fn_start` so we never land mid-instruction before `lea`.
+      let Some(fn_bytes) = image.read(fn_start, lea.saturating_sub(fn_start)) else {
+         continue;
+      };
+      let all_pre = phoenix_hook::x86::disasm(fn_bytes, fn_start, usize::MAX);
+      let pre_lines = &all_pre[all_pre.len().saturating_sub(80)..];
+      let mut sep_tag = None;
+      let mut header_ctor = None;
+      let mut last_imm_store: Option<u32> = None;
+      let mut last_non_push_call: Option<usize> = None;
+      for line in pre_lines {
+         if line.text.starts_with("mov dword ptr [")
+            && let Some((_, rhs)) = x86_operands(&line.text)
+            && let Some(imm) = x86_imm(rhs)
+            && (1..=15).contains(&imm)
+         {
+            last_imm_store = Some(imm);
+         } else if line.text.starts_with("call ")
+            && let Some(raw) = image.read(line.addr, line.len)
+            && let Some((_, target)) = call_target(image, raw, line.addr)
+         {
+            if target == vec_push || same_code(image, target, vec_push) {
+               if let Some(imm) = last_imm_store.take() {
+                  sep_tag = Some(imm);
+               } else if let Some(ctor) = last_non_push_call.take() {
+                  header_ctor = Some(ctor);
+               }
+            } else {
+               last_imm_store = None;
+               last_non_push_call = Some(target);
+            }
+         }
+      }
+      let (Some(separator_tag), Some(header_fn)) = (sep_tag, header_ctor) else {
+         continue;
+      };
+      let Some((header_tag, header_label)) =
+         decode_x86_sidebar_header(image, header_fn, action_tag, separator_tag)
+      else {
+         continue;
+      };
+      let Ok(layout) = (SidebarLayout {
+         size,
+         action_tag,
+         header_tag,
+         separator_tag,
+         id,
+         label,
+         header_label,
+         on_click,
+         icon,
+         active,
+         destructive,
+      })
+      .validate() else {
+         continue;
+      };
+      found.push((vec_push, layout));
+   }
+   found.sort_by_key(|&(push, _)| push);
+   found.dedup_by_key(|&mut (push, _)| push);
+   let (vec_push, layout) = one("settings sidebar Vec::push", &found)?;
+   let ((icon_plugins, icon_store, icon_settings), experience_icons) = sunbird_sidebar_icons(image);
+   Ok(SettingsSidebar {
+      vec_push,
+      layout,
+      icon_plugins,
+      icon_store,
+      icon_settings,
+      experience_icons,
+   })
 }
 
 pub fn settings_section(image: &Image<'_>) -> Found<Section> {
@@ -1450,6 +1977,9 @@ pub struct DivLayout {
    pub children:           usize,
    pub interactivity:      usize,
    pub interactivity_size: usize,
+   /// `Interactivity` offset of `hover_style: Option<Box<StyleRefinement>>`,
+   /// decoded from GPUI's `hover_style.is_some() || base_style.mouse_cursor.is_some()` check.
+   pub hover_style:        Option<usize>,
 }
 
 /// `mana_gpui::components::switch::Switch`.
@@ -1749,11 +2279,12 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
       return Err("Div children or Interactivity sit past the Div".to_owned());
    }
    check("Div::new", gpui.div_new, div_size, &[interactivity])?;
-   let div = DivLayout {
+   let mut div = DivLayout {
       size: div_size,
       children,
       interactivity,
       interactivity_size,
+      hover_style: None,
    };
 
    let (on_change, switch_size) = rc_store(function_code(
@@ -1828,6 +2359,12 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
       .find(|&size| (0x200..=0x400).contains(&size))
       .ok_or("Interactivity::default StyleRefinement allocation not found")?;
    let style = style_offsets(image, style_bytes)?;
+   div.hover_style = x86_hover_style(
+      image,
+      gpui.div_style_mut,
+      interactivity_size,
+      style.mouse_cursor,
+   );
 
    Ok(GpuiLayout {
       style,
@@ -1835,6 +2372,104 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
       switch,
       button,
    })
+}
+
+/// Decodes `Interactivity::hover_style` directly from GPUI's
+/// `if self.hover_style.is_some() || self.base_style.mouse_cursor.is_some()`
+/// check near `div_style_mut`:
+/// `mov rH, [rBase + hover_off]` (or `cmp qword ptr [rBase + hover_off], 0`)
+/// immediately before `mov rStyle, [rBase + base_style]` and a byte read or
+/// compare of `[rStyle + mouse_cursor]` against `0xff`.
+fn x86_hover_style(
+   image: &Image<'_>,
+   div_style_mut: usize,
+   interactivity_size: usize,
+   mouse_cursor: usize,
+) -> Option<usize> {
+   let base_style = image.read(div_style_mut, 0x40).and_then(|code| {
+      code.windows(7).find_map(|w| {
+         if matches!(w[0], 0x48 | 0x49 | 0x4C | 0x4D)
+            && w[1] == 0x8B
+            && (w[2] & 0xC0) == 0x80
+            && (w[2] & 7) != 4
+         {
+            let disp = u32::from_le_bytes([w[3], w[4], w[5], w[6]]) as usize;
+            ((0x100..interactivity_size).contains(&disp) && disp.is_multiple_of(8))
+               .then_some(disp)
+         } else {
+            None
+         }
+      })
+   })?;
+   let base_bytes = u32::try_from(base_style).ok()?.to_le_bytes();
+   let mc_bytes = u32::try_from(mouse_cursor).ok()?.to_le_bytes();
+   let lo = div_style_mut.saturating_sub(0x400_000);
+   let hi = div_style_mut.saturating_add(0x400_000);
+   let mut found: Option<usize> = None;
+   for hit in image.find_bytes(&base_bytes) {
+      if hit < lo || hit >= hi || hit < 32 || !image.is_code(hit) {
+         continue;
+      }
+      // `hit` points at the disp32 inside `[REX] 8B ModRM disp32`.
+      let Some(win) = image.read(hit - 32, 64) else {
+         continue;
+      };
+      // Confirm `mov rStyle, [rBase + base_style]` at offset 32 (opcode at 30, ModRM at 31).
+      let rex_b = win[29];
+      let has_rex = matches!(rex_b, 0x48 | 0x49 | 0x4C | 0x4D);
+      if !has_rex || win[30] != 0x8B || (win[31] & 0xC0) != 0x80 || (win[31] & 7) == 4 {
+         continue;
+      }
+      let base_reg = ((rex_b & 1) << 3) | (win[31] & 7);
+      // Confirm `[rStyle + mouse_cursor]` with `0xff` follows within 18 bytes.
+      let after = &win[36..];
+      let has_mc = after
+         .windows(4)
+         .take(16)
+         .enumerate()
+         .any(|(i, w)| w == mc_bytes && after[i + 4..].iter().take(6).any(|&b| b == 0xFF));
+      if !has_mc {
+         continue;
+      }
+      // Look backward in `win[..29]` for `cmp qword ptr [rBase + hover_off], 0`
+      // (`48/49 83 B8..BF disp32 00`) or `mov rH, [rBase + hover_off]`
+      // (`48/49/4C/4D 8B 80..BF disp32`) using the exact same `base_reg`.
+      let before = &win[..29];
+      let mut candidate = None;
+      for i in (0..before.len().saturating_sub(6)).rev() {
+         let rex = before[i];
+         let is_cmp = matches!(rex, 0x48 | 0x49)
+            && before[i + 1] == 0x83
+            && (before[i + 2] & 0xF8) == 0xB8
+            && (before[i + 2] & 7) != 4
+            && before.get(i + 7) == Some(&0);
+         let is_mov = matches!(rex, 0x48 | 0x49 | 0x4C | 0x4D)
+            && before[i + 1] == 0x8B
+            && (before[i + 2] & 0xC0) == 0x80
+            && (before[i + 2] & 7) != 4;
+         if !is_cmp && !is_mov {
+            continue;
+         }
+         let reg = ((rex & 1) << 3) | (before[i + 2] & 7);
+         if reg != base_reg {
+            continue;
+         }
+         let off = u32::from_le_bytes([before[i + 3], before[i + 4], before[i + 5], before[i + 6]])
+            as usize;
+         if off != base_style && off.is_multiple_of(8) && off + 8 <= interactivity_size {
+            candidate = Some(off);
+            break;
+         }
+      }
+      if let Some(off) = candidate {
+         match found {
+            None => found = Some(off),
+            Some(prev) if prev == off => {},
+            Some(_) => return None,
+         }
+      }
+   }
+   found
 }
 
 /// `MessageRow::render`, and where its message keeps the id.
@@ -4538,6 +5173,8 @@ pub struct TextFields {
    pub weak_drop:           usize,
    pub text_get:            usize,
    pub set_value:           usize,
+   /// `App::notify(&mut App, entity_id_lo: u32, entity_id_hi: u32)`.
+   pub app_notify:          Option<usize>,
    pub update_entity_dyn:   usize,
    pub arc_drop_slow:       usize,
    pub text_input_new:      usize,
@@ -5040,6 +5677,31 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
       .filter(|&weak| weak + 8 <= layout::ENTITY)
       .ok_or("WeakEntity Weak offset not found in entity_downgrade")?;
 
+   // `FieldState::set_value` notifies its own entity before returning:
+   // `mov arg1, [cx + 8]; mov arg2, [cx + 0Ch]; mov arg0, app; call App::notify`.
+   let app_notify = image.function_bounds(set_value).and_then(|(start, end)| {
+      let body_end = first_ret(image, start, end);
+      let code = image.read(start, body_end.saturating_sub(start))?;
+      let lines = phoenix_hook::x86::disasm(code, start, 400);
+      lines.windows(4).find_map(|w| {
+         let call = w.last()?;
+         if !call.text.starts_with("call ") {
+            return None;
+         }
+         let loads_lo = w[..3]
+            .iter()
+            .any(|l| l.text.contains("+8]") || l.text.contains("+8h]"));
+         let loads_hi = w[..3]
+            .iter()
+            .any(|l| l.text.contains("+0Ch]") || l.text.contains("+0ch]"));
+         if !loads_lo || !loads_hi {
+            return None;
+         }
+         let bytes = image.read(call.addr, call.len)?;
+         call_target(image, bytes, call.addr).map(|(_, target)| target)
+      })
+   });
+
    Ok(TextFields {
       cx_new_single,
       cx_new_multiline,
@@ -5048,6 +5710,7 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
       weak_drop,
       text_get,
       set_value,
+      app_notify,
       update_entity_dyn,
       arc_drop_slow,
       text_input_new,

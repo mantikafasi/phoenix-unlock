@@ -245,6 +245,7 @@ struct InstallUrlModal {
    target:       FieldTarget,
    pending_init: Option<String>,
    status:       FieldStatus,
+   under_plugin: Option<String>,
 }
 
 #[derive(Clone)]
@@ -259,6 +260,8 @@ enum ActiveModal {
       choice: Arc<Choice>,
       under:  Option<(u64, PageModalSpec)>,
    },
+   PluginSettings(String),
+   StoreDetail(phoenix_runtime::update::Listed),
    CodeEditor(CodeEditorModal),
    InstallUrl(InstallUrlModal),
 }
@@ -267,6 +270,8 @@ enum ActiveModal {
 /// dialog draws as the page it is.
 enum Snapshot {
    Page(PageModalSpec),
+   PluginSettings(String),
+   StoreDetail(phoenix_runtime::update::Listed),
    CodeEditor(CodeEditorModal),
    InstallUrl(InstallUrlModal),
 }
@@ -328,6 +333,7 @@ type WeakDropFn = unsafe extern "C" fn(*mut c_void);
 type TextGetFn =
    unsafe extern "C" fn(*mut SharedString, *const c_void, *const c_void) -> *mut SharedString;
 type SetValueFn = unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut c_void, *mut c_void);
+type AppNotifyFn = unsafe extern "C" fn(*mut c_void, u32, u32);
 type UpdateEntityDynFn = unsafe extern "C" fn(
    *mut c_void,
    *const RawEntity,
@@ -387,6 +393,7 @@ struct TextFieldSymbols {
    weak_drop:           WeakDropFn,
    text_get:            TextGetFn,
    set_value:           SetValueFn,
+   app_notify:          Option<AppNotifyFn>,
    update_entity_dyn:   UpdateEntityDynFn,
    arc_drop_slow:       ArcDropSlowFn,
    text_input_new:      TextInputNewFn,
@@ -659,6 +666,8 @@ fn snapshot_modal(modal: &mut ActiveModal, take_init: bool) -> Snapshot {
       ActiveModal::Page { spec, .. } | ActiveModal::Choice { spec, .. } => {
          Snapshot::Page(spec.clone())
       },
+      ActiveModal::PluginSettings(plugin) => Snapshot::PluginSettings(plugin.clone()),
+      ActiveModal::StoreDetail(item) => Snapshot::StoreDetail(item.clone()),
       ActiveModal::CodeEditor(ed) => {
          Snapshot::CodeEditor(CodeEditorModal {
             plugin:       ed.plugin.clone(),
@@ -679,6 +688,7 @@ fn snapshot_modal(modal: &mut ActiveModal, take_init: bool) -> Snapshot {
                None
             },
             status:       inst.status.clone(),
+            under_plugin: inst.under_plugin.clone(),
          })
       },
    }
@@ -777,14 +787,18 @@ fn wrap_scale_fade(
 /// Main-thread-owned GPUI `Entity<FieldState>` handles, lazily created on first
 /// render when `window` and `app` are live.
 struct FieldEntities {
-   url:  Option<RawEntity>,
-   code: Option<RawEntity>,
+   url:            Option<RawEntity>,
+   code:           Option<RawEntity>,
+   plugin_search:  Option<RawEntity>,
+   catalog_search: Option<RawEntity>,
 }
 
 static FIELD_ENTITIES: LazyLock<Mutex<FieldEntities>> = LazyLock::new(|| {
    Mutex::new(FieldEntities {
-      url:  None,
-      code: None,
+      url:            None,
+      code:           None,
+      plugin_search:  None,
+      catalog_search: None,
    })
 });
 
@@ -792,6 +806,11 @@ static FIELD_ENTITIES: LazyLock<Mutex<FieldEntities>> = LazyLock::new(|| {
 enum ModalAction {
    Close,
    PageButton(Arc<dyn Fn() + Send + Sync>),
+   EditPluginCode(String),
+   ReloadPlugin(String),
+   OpenPluginSettings(String),
+   InstallStorePlugin(String),
+   UninstallPlugin(String),
    SaveCode(String),
    CopyCode,
    SubmitInstallUrl,
@@ -920,6 +939,12 @@ unsafe fn card_press(
    });
 }
 
+/// Marks the active mouse press as handled inside the modal or its floating
+/// popout so [`scrim_press`] will not dismiss the modal on bubble.
+pub fn mark_card_press() {
+   PRESS_IN_CARD.store(true, Ordering::Relaxed);
+}
+
 /// Pushes a zero-sized listener into `div`'s `Interactivity` mouse-down list,
 /// which also makes GPUI give `div` a hitbox.
 fn on_mouse_down(div: &mut RawDiv, vtbl: &'static RcFnVtbl) -> bool {
@@ -932,6 +957,91 @@ pub fn hovered(hitbox: *const c_void, window: *const c_void) -> bool {
    DISMISS_SYM
       .get()
       .is_some_and(|sym| unsafe { (sym.is_hovered)(hitbox, window) })
+}
+
+/// Reads the `(id_lo, id_hi)` entity id from a live GPUI `Context<T>` pointer
+/// using [`RawContext`].
+///
+/// # Safety
+///
+/// `cx` must be null or point to a live GPUI `Context<T>`.
+pub unsafe fn context_entity_id(cx: *mut c_void) -> Option<(u32, u32)> {
+   if cx.is_null() {
+      return None;
+   }
+   // SAFETY: `cx` points to a live `RawContext` whose `weak` field starts with
+   // `(id_lo, id_hi)`.
+   let ctx = unsafe { &*cx.cast::<RawContext>() };
+   Some((ctx.weak.id_lo, ctx.weak.id_hi))
+}
+
+/// Calls GPUI's `cx.stop_propagation()` on the live `*mut App` inside a
+/// mouse-down listener so the press does not bubble to parent views.
+///
+/// # Safety
+///
+/// `app` must be null or a live `&mut App` on the GPUI main thread.
+pub unsafe fn stop_propagation(app: *mut c_void) {
+   let Some(sym) = DISMISS_SYM.get() else {
+      return;
+   };
+   if !app.is_null() {
+      // SAFETY: `propagate_event` is a `bool` in `App`, located by `sigs`.
+      unsafe { app.cast::<u8>().add(sym.propagate_event).write(0) };
+   }
+}
+
+/// Notifies GPUI that the entity `(id_lo, id_hi)` changed, triggering an
+/// immediate re-render on the next frame.
+///
+/// # Safety
+///
+/// `app` must be a live `&mut App` on the GPUI main thread.
+pub unsafe fn notify_entity(app: *mut c_void, id_lo: u32, id_hi: u32) -> bool {
+   let Some(notify) = FIELD_SYM.get().and_then(|tf| tf.app_notify) else {
+      return false;
+   };
+   if app.is_null() || (id_lo == 0 && id_hi == 0) {
+      return false;
+   }
+   // SAFETY: `app_notify` is `App::notify(&mut App, id_lo, id_hi)`.
+   unsafe { notify(app, id_lo, id_hi) };
+   true
+}
+
+/// Looks up a GPUI entity's live data pointer from `app` by `(id_lo, id_hi)`.
+///
+/// # Safety
+///
+/// `app` must be a live `&mut App` on the GPUI main thread.
+pub unsafe fn get_entity(app: *mut c_void, id_lo: u32, id_hi: u32) -> *mut c_void {
+   let Some(tf) = FIELD_SYM.get() else {
+      return ptr::null_mut();
+   };
+   if app.is_null() {
+      return ptr::null_mut();
+   }
+   // SAFETY: `entity_map_get` resolves `(id_lo, id_hi)` in `app.entities`.
+   unsafe {
+      (tf.entity_map_get)(
+         app.cast::<u8>()
+            .add(tf.layout.app_entities)
+            .cast::<c_void>(),
+         id_lo,
+         id_hi,
+      )
+   }
+}
+
+/// Assigns a static `ElementId` to `div` via Discord's `Div::id`.
+pub fn set_div_id(mut div: RawDiv, id: &'static str) -> RawDiv {
+   let Some(msym) = MODAL_SYM.get() else {
+      return div;
+   };
+   let mut out = RawDiv::zeroed();
+   // SAFETY: moves `div` into `out` with static `ElementId(id)`.
+   unsafe { (msym.div_id)(&raw mut out, &raw mut div, id.as_ptr(), id.len()) };
+   out
 }
 
 /// [`on_mouse_down`] with `data` as the listener's `self`. A zero-sized
@@ -1058,6 +1168,32 @@ unsafe extern "C" fn modal_button_callback(
          ModalAction::PageButton(cb) => {
             std::thread::spawn(move || cb());
          },
+         ModalAction::EditPluginCode(plugin) => {
+            let Some(source) = phoenix_runtime::source(&plugin) else {
+               phoenix_ui_desktop::toast(&format!("Could not read source for {plugin}"));
+               return;
+            };
+            open_code_editor(plugin, source);
+         },
+         ModalAction::ReloadPlugin(plugin) => {
+            phoenix_runtime::reload(&plugin);
+            force_redraw();
+         },
+         ModalAction::OpenPluginSettings(plugin) => {
+            open_plugin_settings(plugin);
+         },
+         ModalAction::InstallStorePlugin(name) => {
+            gpui::start_store_install(name);
+         },
+         ModalAction::UninstallPlugin(name) => {
+            if let Err(err) = phoenix_runtime::uninstall(&name) {
+               log::warn!("sunbird settings: uninstall {name}: {err}");
+               phoenix_ui_desktop::toast(&format!("Uninstall failed: {err}"));
+            } else {
+               phoenix_ui_desktop::toast(&format!("Uninstalled {name}"));
+            }
+            force_redraw();
+         },
          ModalAction::CopyCode => {
             if let Some(code) = read_code_field(app) {
                match phoenix_ui_desktop::copy(&code) {
@@ -1081,58 +1217,60 @@ unsafe extern "C" fn modal_button_callback(
                },
             }
          },
-         ModalAction::SubmitInstallUrl => {
-            let target = match active_modal().active.as_ref() {
-               Some(ActiveModal::InstallUrl(inst)) => inst.target.clone(),
-               _ => return,
-            };
-            match target {
-               FieldTarget::Install => {},
-               FieldTarget::Setting(field) => {
-                  save_setting(app, &field);
-                  return;
-               },
-               FieldTarget::Prompt(prompt) => {
-                  let Some(raw) = read_url_field(app) else {
-                     set_install_status(FieldStatus::Failed(
-                        "Could not read the text field".to_owned(),
-                     ));
-                     return;
-                  };
-                  let text = raw.trim().to_owned();
-                  if text.is_empty() {
-                     return;
-                  }
-                  close_active();
-                  std::thread::spawn(move || (prompt.on_submit)(text));
-                  return;
-               },
-            }
-            let Some(raw) = read_url_field(app) else {
-               set_install_status(FieldStatus::Failed("Could not read URL field".to_owned()));
-               return;
-            };
-            let url = raw.trim().to_owned();
-            if url.is_empty() {
-               set_install_status(FieldStatus::Failed(
-                  "Enter an https:// link to a plugin .js file".to_owned(),
-               ));
-               return;
-            }
-            set_install_status(FieldStatus::Working(
-               "Downloading and installing plugin...".to_owned(),
+         ModalAction::SubmitInstallUrl => submit_install_url(app),
+      }
+   });
+}
+
+fn submit_install_url(app: *mut c_void) {
+   let target = match active_modal().active.as_ref() {
+      Some(ActiveModal::InstallUrl(inst)) => inst.target.clone(),
+      _ => return,
+   };
+   match target {
+      FieldTarget::Install => {},
+      FieldTarget::Setting(field) => {
+         save_setting(app, &field);
+         return;
+      },
+      FieldTarget::Prompt(prompt) => {
+         let Some(raw) = read_url_field(app) else {
+            set_install_status(FieldStatus::Failed(
+               "Could not read the text field".to_owned(),
             ));
-            std::thread::spawn(move || {
-               match phoenix_runtime::install(&url) {
-                  Ok(installed) => {
-                     close_active();
-                     phoenix_ui_desktop::toast(&installed.to_string());
-                  },
-                  Err(err) => {
-                     set_install_status(FieldStatus::Failed(err.to_string()));
-                  },
-               }
-            });
+            return;
+         };
+         let text = raw.trim().to_owned();
+         if text.is_empty() {
+            return;
+         }
+         close_active();
+         std::thread::spawn(move || (prompt.on_submit)(text));
+         return;
+      },
+   }
+   let Some(raw) = read_url_field(app) else {
+      set_install_status(FieldStatus::Failed("Could not read URL field".to_owned()));
+      return;
+   };
+   let url = raw.trim().to_owned();
+   if url.is_empty() {
+      set_install_status(FieldStatus::Failed(
+         "Enter an https:// link to a plugin .js file".to_owned(),
+      ));
+      return;
+   }
+   set_install_status(FieldStatus::Working(
+      "Downloading and installing plugin...".to_owned(),
+   ));
+   std::thread::spawn(move || {
+      match phoenix_runtime::install(&url) {
+         Ok(installed) => {
+            close_active();
+            phoenix_ui_desktop::toast(&installed.to_string());
+         },
+         Err(err) => {
+            set_install_status(FieldStatus::Failed(err.to_string()));
          },
       }
    });
@@ -1390,6 +1528,10 @@ fn uncover(closing: &ActiveModal) -> Option<ActiveModal> {
             spec: spec.clone(),
          })
       },
+      ActiveModal::InstallUrl(InstallUrlModal {
+         under_plugin: Some(plugin),
+         ..
+      }) => Some(ActiveModal::PluginSettings(plugin.clone())),
       _ => None,
    }
 }
@@ -1430,6 +1572,30 @@ pub fn close_page(id: u64) {
    }
 }
 
+/// Whether native GPUI modals are hooked and ready to open.
+pub fn is_ready() -> bool {
+   ORIG_OVERLAY_RENDER.get().is_some()
+}
+
+/// Opens the native GPUI settings modal for `plugin`.
+pub fn open_plugin_settings(plugin: String) {
+   if ORIG_OVERLAY_RENDER.get().is_none() {
+      return;
+   }
+   resolve_pending_choice();
+   gpui::clear_open_select();
+   set_active(ActiveModal::PluginSettings(plugin));
+}
+
+/// Opens the native GPUI Store detail modal for a catalog plugin.
+pub fn open_store_detail(item: phoenix_runtime::update::Listed) {
+   if ORIG_OVERLAY_RENDER.get().is_none() {
+      return;
+   }
+   resolve_pending_choice();
+   set_active(ActiveModal::StoreDetail(item));
+}
+
 /// Opens a native GPUI multiline code editor modal for `plugin`.
 pub fn open_code_editor(plugin: String, initial_source: String) {
    resolve_pending_choice();
@@ -1447,16 +1613,22 @@ pub fn open_install_url() {
       target:       FieldTarget::Install,
       pending_init: Some(String::new()),
       status:       FieldStatus::Idle,
+      under_plugin: None,
    }));
 }
 
 /// Opens the one-line field on a plugin's text, number or secret setting.
 pub fn open_setting_editor(field: SettingField) {
    resolve_pending_choice();
+   let under_plugin = match active_modal().active.as_ref() {
+      Some(ActiveModal::PluginSettings(plugin)) => Some(plugin.clone()),
+      _ => None,
+   };
    set_active(ActiveModal::InstallUrl(InstallUrlModal {
       pending_init: Some(field.initial.clone()),
       target:       FieldTarget::Setting(field),
       status:       FieldStatus::Idle,
+      under_plugin,
    }));
 }
 
@@ -1468,6 +1640,7 @@ pub fn open_prompt(prompt: Prompt) {
       target:       FieldTarget::Prompt(prompt),
       pending_init: Some(String::new()),
       status:       FieldStatus::Idle,
+      under_plugin: None,
    }));
 }
 
@@ -1661,6 +1834,9 @@ pub fn install(image: &Image<'static>) {
                   weak_drop:           std::mem::transmute::<usize, WeakDropFn>(tf.weak_drop),
                   text_get:            std::mem::transmute::<usize, TextGetFn>(text_get),
                   set_value:           std::mem::transmute::<usize, SetValueFn>(tf.set_value),
+                  app_notify:          tf
+                     .app_notify
+                     .map(|addr| std::mem::transmute::<usize, AppNotifyFn>(addr)),
                   update_entity_dyn:   std::mem::transmute::<usize, UpdateEntityDynFn>(
                      tf.update_entity_dyn,
                   ),
@@ -1968,6 +2144,75 @@ fn read_url_field(app: *mut c_void) -> Option<String> {
       .url?;
    // SAFETY: called from GPUI button callback with live `app`.
    unsafe { read_field_text(app, &ent) }
+}
+
+/// Builds a native GPUI `TextInput` search field for the Sunbird Settings
+/// Plugins or Store tab and returns its rendered `AnyElement` plus the current
+/// query string.
+///
+/// # Safety
+///
+/// Must be called on GPUI's main render thread with live `window` and `app`
+/// pointers.
+pub unsafe fn search_input(
+   window: *mut c_void,
+   app: *mut c_void,
+   catalog: bool,
+) -> Option<(RawAnyElement, String)> {
+   let tf = FIELD_SYM.get()?;
+   if window.is_null() || app.is_null() {
+      return None;
+   }
+   let ent = {
+      let mut guard = FIELD_ENTITIES
+         .lock()
+         .unwrap_or_else(PoisonError::into_inner);
+      let slot = if catalog {
+         &mut guard.catalog_search
+      } else {
+         &mut guard.plugin_search
+      };
+      *slot.get_or_insert_with(|| {
+         let placeholder = if catalog {
+            "Search store..."
+         } else {
+            "Search plugins..."
+         };
+         // SAFETY: invoked on GPUI main thread with live `app` and `window`.
+         unsafe {
+            let mut out = MaybeUninit::<RawEntity>::uninit();
+            (tf.cx_new_single)(out.as_mut_ptr(), app, window);
+            let ent = out.assume_init();
+            let field = (tf.entity_map_get)(
+               app.cast::<u8>()
+                  .add(tf.layout.app_entities)
+                  .cast::<c_void>(),
+               ent.id_lo,
+               ent.id_hi,
+            );
+            if !field.is_null() {
+               for slot_off in tf.layout.placeholders {
+                  field
+                     .cast::<u8>()
+                     .add(slot_off)
+                     .cast::<SharedString>()
+                     .write_unaligned(SharedString::from_static(placeholder));
+               }
+            }
+            ent
+         }
+      })
+   };
+   // SAFETY: reads the entity's current text and constructs a hosted `TextInput`.
+   let query = unsafe { read_field_text(app, &ent) }.unwrap_or_default();
+   let any = unsafe {
+      let mut ti = RawTextInput::zeroed();
+      (tf.text_input_new)(&raw mut ti, &raw const ent);
+      let mut out = MaybeUninit::<RawAnyElement>::uninit();
+      (tf.text_input_into_any)(out.as_mut_ptr(), &raw mut ti);
+      out.assume_init()
+   };
+   Some((any, query))
 }
 
 // ---------------------------------------------------------------------------
@@ -2413,6 +2658,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
       .unwrap_or_else(PoisonError::into_inner)
       .clear();
 
+   let is_plugin_settings = matches!(modal_snapshot, Snapshot::PluginSettings(_));
    let (title, subtitle, size_code, body_opt, footer_buttons): (
       String,
       Option<String>,
@@ -2433,6 +2679,148 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
             footer.push(close_btn);
          }
          (spec.title, None, 3, body, footer)
+      },
+      Snapshot::PluginSettings(plugin_name) => {
+         let plugins = phoenix_runtime::plugins();
+         let Some(plugin) = plugins.into_iter().find(|p| p.name == plugin_name) else {
+            close_active();
+            return None;
+         };
+         let mut sub_parts = Vec::new();
+         if let Some(ver) = &plugin.header.version {
+            sub_parts.push(format!("v{ver}"));
+         }
+         if let Some(author) = &plugin.header.author {
+            sub_parts.push(format!("by {author}"));
+         }
+         if let Some(desc) = &plugin.header.description {
+            sub_parts.push(desc.clone());
+         }
+         let subtitle = (!sub_parts.is_empty()).then(|| sub_parts.join(" · "));
+         let body = gpui::build_plugin_settings_body(&plugin);
+         let mut footer = Vec::new();
+         if let Some(btn) = make_modal_button(
+            "sunbird-pset-code",
+            "Edit Code",
+            BtnVariant::Secondary,
+            BtnSize::Medium,
+            ModalAction::EditPluginCode(plugin.name.clone()),
+         ) {
+            footer.push(btn);
+         }
+         if plugin.state.is_on()
+            && plugin.installed
+            && let Some(btn) = make_modal_button(
+               "sunbird-pset-reload",
+               "Reload",
+               BtnVariant::Secondary,
+               BtnSize::Medium,
+               ModalAction::ReloadPlugin(plugin.name.clone()),
+            )
+         {
+            footer.push(btn);
+         }
+         if let Some(btn) = make_modal_button(
+            "sunbird-pset-done",
+            "Done",
+            BtnVariant::Primary,
+            BtnSize::Medium,
+            ModalAction::Close,
+         ) {
+            footer.push(btn);
+         }
+         (plugin.name, subtitle, 2, body, footer)
+      },
+      Snapshot::StoreDetail(item) => {
+         let installed = phoenix_runtime::plugins()
+            .into_iter()
+            .find(|p| p.name == item.name);
+         let installing = gpui::is_store_installing(&item.name);
+         let mut sub_parts = vec![gpui::store_compat_label(&item.name).to_owned()];
+         if let Some(p) = &installed {
+            if let Some(ver) = &p.header.version {
+               sub_parts.push(format!("v{ver}"));
+            }
+            if let Some(author) = &p.header.author {
+               sub_parts.push(author.clone());
+            }
+         }
+         let subtitle = Some(sub_parts.join(" · "));
+         let body = gpui::build_store_detail_body(&item, installed.as_ref(), installing);
+         let mut footer = Vec::new();
+         if installing {
+            if let Some(btn) = make_modal_button(
+               "sunbird-store-close",
+               "Close",
+               BtnVariant::Secondary,
+               BtnSize::Medium,
+               ModalAction::Close,
+            ) {
+               footer.push(btn);
+            }
+         } else if let Some(plugin) = installed {
+            if plugin.installed
+               && let Some(btn) = make_modal_button(
+                  "sunbird-store-uninstall",
+                  "Uninstall",
+                  BtnVariant::Critical,
+                  BtnSize::Medium,
+                  ModalAction::UninstallPlugin(plugin.name.clone()),
+               )
+            {
+               footer.push(btn);
+            }
+            if plugin.state.is_on()
+               && !plugin.settings.is_empty()
+               && let Some(btn) = make_modal_button(
+                  "sunbird-store-settings",
+                  "Settings",
+                  BtnVariant::Secondary,
+                  BtnSize::Medium,
+                  ModalAction::OpenPluginSettings(plugin.name),
+               )
+            {
+               footer.push(btn);
+            }
+            if let Some(btn) = make_modal_button(
+               "sunbird-store-reinstall",
+               "Reinstall",
+               BtnVariant::Secondary,
+               BtnSize::Medium,
+               ModalAction::InstallStorePlugin(item.name.clone()),
+            ) {
+               footer.push(btn);
+            }
+            if let Some(btn) = make_modal_button(
+               "sunbird-store-done",
+               "Done",
+               BtnVariant::Primary,
+               BtnSize::Medium,
+               ModalAction::Close,
+            ) {
+               footer.push(btn);
+            }
+         } else {
+            if let Some(btn) = make_modal_button(
+               "sunbird-store-close",
+               "Close",
+               BtnVariant::Secondary,
+               BtnSize::Medium,
+               ModalAction::Close,
+            ) {
+               footer.push(btn);
+            }
+            if let Some(btn) = make_modal_button(
+               "sunbird-store-install",
+               "Install",
+               BtnVariant::Primary,
+               BtnSize::Medium,
+               ModalAction::InstallStorePlugin(item.name.clone()),
+            ) {
+               footer.push(btn);
+            }
+         }
+         (item.name, subtitle, 2, body, footer)
       },
       Snapshot::CodeEditor(ed) => {
          let mut body = gpui::v_stack(10.0);
@@ -2687,7 +3075,11 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
       on_mouse_down(&mut card, &CARD_PRESS_VTBL);
    }
 
-   Some(gpui::push_div(scrim, card))
+   let mut overlay = gpui::push_div(scrim, card);
+   if is_plugin_settings && let Some(select_layer) = gpui::build_open_select_overlay() {
+      overlay = gpui::push_div(overlay, select_layer);
+   }
+   Some(overlay)
 }
 
 #[cfg(test)]
