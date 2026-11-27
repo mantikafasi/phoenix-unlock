@@ -221,8 +221,9 @@ fn query() -> Result<Option<Update>, String> {
    let mut plugin_crcs = BTreeMap::new();
    for plugin in crate::plugins() {
       if let Some(&crc) = site.plugins.get(&plugin.name)
-         && crate::source(&plugin.name)
-            .is_some_and(|source| crc32fast::hash(source.as_bytes()) != crc)
+         && crate::source(&plugin.name).is_some_and(|source| {
+            crc32fast::hash(source.as_bytes()) != crc && !site_older(&plugin.name, &source, crc)
+         })
       {
          plugin_crcs.insert(plugin.name.clone(), crc);
          plugins.push(plugin.name);
@@ -300,6 +301,29 @@ pub fn download_loader(
    }
    verify_loader(asset, version, &bytes, update)?;
    Ok(bytes)
+}
+
+/// A plugin's `@version`, as numbers, or `None` when it has none or it is not
+/// dotted numbers.
+fn version_of(source: &str) -> Option<Vec<u64>> {
+   let (_, version) = crate::banner(source).find(|&(key, _)| key == "version")?;
+   version
+      .split('.')
+      .map(|part| part.parse().ok())
+      .collect()
+}
+
+/// Whether the site's copy of `name` is older than the installed `source`, as
+/// a plugin built from a newer checkout is until the site catches up. Only
+/// asked once the CRC-32s differ, so an unchanged plugin costs no download.
+fn site_older(name: &str, source: &str, crc: u32) -> bool {
+   let Some(local) = version_of(source) else {
+      return false;
+   };
+   download_plugin(name, Some(crc))
+      .ok()
+      .and_then(|site| version_of(&site))
+      .is_some_and(|site| site < local)
 }
 
 /// Asks the site in the background. Failures (offline) are only logged.
@@ -662,5 +686,16 @@ mod tests {
       assert!(verify_loader("libphoenix-linux-x86_64.so", "2026.1-abc", dll, &listed).is_err());
       let wrong = update(&[("phoenix-windows-x86_64.dll", crc ^ 1)]);
       assert!(verify_loader("phoenix-windows-x86_64.dll", "2026.1-abc", dll, &wrong).is_err());
+   }
+
+
+   #[test]
+   fn orders_plugin_versions_by_number() {
+      let old = version_of("// @description x\n// @version 0.4.4\n").unwrap();
+      let new = version_of("// @version 0.6.0\n").unwrap();
+      assert!(old < new);
+      assert!(version_of("// @version 0.10.0").unwrap() > new);
+      assert_eq!(version_of("// @version beta"), None);
+      assert_eq!(version_of("const x = 1;"), None);
    }
 }
