@@ -233,7 +233,7 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
       .ok_or("the sidebar never takes us-logout's address")?;
    let mut calls = steps[load..].iter().filter_map(|step| {
       match step.op {
-         Op::Call(target) => Some(target),
+         Op::Call(target) => sidebar.through_outlined(target),
          _ => None,
       }
    });
