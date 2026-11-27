@@ -78,13 +78,10 @@ pub fn auto_pause(ix: &Index<'_>) -> Found<CodePatch> {
       else {
          return Err(format!("spotify auto pause call {site:#x} passes no local's address"));
       };
-      let kept = steps[at + 1..].iter().take(REACH).any(|step| {
-         matches!(
-            step.op,
-            Op::Offset { base: b, offset: o, .. } | Op::Load { base: b, offset: o, .. }
-               if b == base && o == offset
-         )
-      });
+      let kept = steps[at + 1..]
+         .iter()
+         .take(REACH)
+         .any(|step| takes_slot(step.op, base, offset) || outlined_takes(ix, step.op, base, offset));
       if reg != this || !kept {
          return Err(format!("spotify auto pause call {site:#x} gives its argument away"));
       }
@@ -95,6 +92,32 @@ pub fn auto_pause(ix: &Index<'_>) -> Found<CodePatch> {
       Isa::Aarch64 => CodePatch::at(ix, func.start, &ARM64_RET),
       Isa::Thumb2 => Err("Desktop Phoenix has no Thumb-2 build".into()),
    }
+}
+
+const fn takes_slot(op: Op, base: Reg, offset: isize) -> bool {
+   matches!(
+      op,
+      Op::Offset { base: b, offset: o, .. } | Op::Load { base: b, offset: o, .. }
+         if b == base && o == offset
+   )
+}
+
+/// Whether `op` calls an arm64 outlined stub (a few frameless instructions
+/// ending in `b` or `ret`) that takes the slot, as both callers' drops do.
+fn outlined_takes(ix: &Index<'_>, op: Op, base: Reg, offset: isize) -> bool {
+   const MOST: usize = 6;
+   let Op::Call(target) = op else {
+      return false;
+   };
+   ix.isa == Isa::Aarch64
+      && ix.func(target).is_ok_and(|stub| {
+         stub
+            .steps()
+            .iter()
+            .take(MOST)
+            .take_while(|step| !matches!(step.op, Op::Jump(_) | Op::Ret | Op::Call(_)))
+            .any(|step| takes_slot(step.op, base, offset))
+      })
 }
 
 /// The idle test that hides the Spotify activity while you are idle.
@@ -161,8 +184,8 @@ const fn arg_after_return_slot(isa: Isa, index: usize) -> Option<Reg> {
    }
 }
 
-/// Whether `func` reads the state's `idle` byte and loads its `idle_since`
-/// before `site`.
+/// Whether `func` reads the state's `idle` tag (a byte on x86-64, a word on
+/// arm64) and loads its `idle_since` before `site`.
 fn reads_idle_state(func: &Func<'_>, site: usize, state: Reg) -> bool {
    const IDLE: isize = 0;
    const SINCE: isize = 8;
@@ -171,8 +194,8 @@ fn reads_idle_state(func: &Func<'_>, site: usize, state: Reg) -> bool {
    let reads_idle = before.clone().any(|step| {
       matches!(
          step.op,
-         Op::CmpMem { base, offset: IDLE, size: 1, value: 0 }
-            | Op::Load { base, offset: IDLE, size: 1, .. } if base == state
+         Op::CmpMem { base, offset: IDLE, size: 1 | 4, value: 0 }
+            | Op::Load { base, offset: IDLE, size: 1 | 4, .. } if base == state
       )
    });
    let loads_since = before.clone().any(|step| {
