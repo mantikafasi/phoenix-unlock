@@ -130,7 +130,7 @@ fn haptics_locks(change: impl FnOnce(&mut Vec<(u64, String)>)) {
 }
 
 /// A guest-to-host call that is not a UI batch. `frame` reads the whole frame,
-/// which only Discord's requests need.
+/// which only Discord's requests and theme need.
 fn host_call(head: &[u8], frame: impl FnOnce() -> Vec<u8>) -> Action {
    if phoenix_runtime::remote::enabled()
       && let Some((module, method)) = phoenix_wire::HostCall::target(head)
@@ -139,6 +139,10 @@ fn host_call(head: &[u8], frame: impl FnOnce() -> Vec<u8>) -> Action {
    }
    if haptics_disabled() && crate::host::is_module(head, crate::host::Module::Haptics) {
       return Action::Drop;
+   }
+   if crate::settings::theme::wants(head) {
+      crate::settings::theme::set_theme(&frame());
+      return Action::Pass;
    }
    if discord::wants(head) {
       discord::intercept_call(&frame())

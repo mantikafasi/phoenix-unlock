@@ -13,10 +13,11 @@ pub enum Method {
    MediaPickerRead,
    MediaPickerRelease,
    TimingSet,
+   AppStateSetTheme,
 }
 
 impl Method {
-   pub const ALL: [Self; 8] = [
+   pub const ALL: [Self; 9] = [
       Self::NetworkingRequest,
       Self::LinkingOpenUrl,
       Self::SystemOverlayToast,
@@ -25,6 +26,7 @@ impl Method {
       Self::MediaPickerRead,
       Self::MediaPickerRelease,
       Self::TimingSet,
+      Self::AppStateSetTheme,
    ];
 
    #[must_use]
@@ -38,6 +40,7 @@ impl Method {
          Self::MediaPickerRead => "MediaPicker.read",
          Self::MediaPickerRelease => "MediaPicker.release",
          Self::TimingSet => "Timing.set",
+         Self::AppStateSetTheme => "AppState.setTheme",
       }
    }
 
@@ -92,10 +95,16 @@ pub enum Field {
    Name,
    Denied,
    Delay,
+   Dark,
+   Surface,
+   TextDefault,
+   TextMuted,
+   Ripple,
+   Danger,
 }
 
 impl Field {
-   pub const ALL: [Self; 16] = [
+   pub const ALL: [Self; 22] = [
       Self::Id,
       Self::Error,
       Self::Method,
@@ -112,6 +121,12 @@ impl Field {
       Self::Name,
       Self::Denied,
       Self::Delay,
+      Self::Dark,
+      Self::Surface,
+      Self::TextDefault,
+      Self::TextMuted,
+      Self::Ripple,
+      Self::Danger,
    ];
 
    #[must_use]
@@ -133,6 +148,12 @@ impl Field {
          Self::Name => "name",
          Self::Denied => "denied",
          Self::Delay => "delay",
+         Self::Dark => "dark",
+         Self::Surface => "surface",
+         Self::TextDefault => "textDefault",
+         Self::TextMuted => "textMuted",
+         Self::Ripple => "ripple",
+         Self::Danger => "danger",
       }
    }
 }
