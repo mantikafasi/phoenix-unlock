@@ -49,34 +49,51 @@ pub fn ready(tweak: Tweak) -> bool {
    PATCHES[tweak.index()].get().is_some()
 }
 
-/// Reference-counted across plugins: the patch stays until the last holder
-/// releases it. False when this build's site was not found or not writable.
-pub fn hold(tweak: Tweak, on: bool) -> bool {
-   let (Some(patch), Some(state)) = (PATCHES[tweak.index()].get(), phoenix_runtime::state())
-   else {
+/// Takes a hold on `tweak`, patching it in on the first one. False when this
+/// build's site was not found or not writable.
+pub fn acquire(tweak: Tweak) -> bool {
+   let Some(patch) = PATCHES[tweak.index()].get() else {
       return false;
    };
-   let mut holders = HOLDERS_PER_TWEAK.lock().unwrap_or_else(PoisonError::into_inner);
-   let held = holders[tweak.index()];
-   let next = if on {
-      held + 1
-   } else {
-      held.saturating_sub(1)
-   };
-   if (held > 0) != (next > 0) {
-      let bytes = if on {
-         &patch.patched[..patch.len]
-      } else {
-         &patch.shipped[..patch.len]
-      };
-      // SAFETY: the locator patches one x86 opcode byte or one aligned arm64
-      // instruction, so a thread at the site runs the old or the new
-      // instruction whole.
-      if let Err(err) = unsafe { state.image.write_code(patch.site, bytes) } {
-         log::error!("spotify {tweak:?}: {err}");
-         return false;
-      }
+   let mut holders = HOLDERS_PER_TWEAK
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+   if holders[tweak.index()] == 0 && !write(tweak, patch, patch.patched) {
+      return false;
    }
-   holders[tweak.index()] = next;
+   holders[tweak.index()] += 1;
    true
+}
+
+/// Drops a hold [`acquire`] took, restoring Discord's code after the last.
+pub fn release(tweak: Tweak) {
+   let Some(patch) = PATCHES[tweak.index()].get() else {
+      return;
+   };
+   let mut holders = HOLDERS_PER_TWEAK
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+   let held = &mut holders[tweak.index()];
+   *held = held.saturating_sub(1);
+   if *held == 0 {
+      write(tweak, patch, patch.shipped);
+   }
+   // Held through the write, so an acquire cannot patch in between.
+   drop(holders);
+}
+
+fn write(tweak: Tweak, patch: &CodePatch, bytes: [u8; 4]) -> bool {
+   let Some(state) = phoenix_runtime::state() else {
+      return false;
+   };
+   // SAFETY: the locator patches one x86 opcode byte or one aligned arm64
+   // instruction, so a thread at the site runs the old or the new
+   // instruction whole.
+   match unsafe { state.image.write_code(patch.site, &bytes[..patch.len]) } {
+      Ok(()) => true,
+      Err(err) => {
+         log::error!("spotify {tweak:?}: {err}");
+         false
+      },
+   }
 }

@@ -1161,7 +1161,7 @@ fn hold_spotify<'js>(
    let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
       return noop_handle(ctx);
    };
-   if !spotify::hold(tweak, true) {
+   if !spotify::acquire(tweak) {
       return noop_handle(ctx);
    }
    let hold = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
@@ -1177,7 +1177,7 @@ fn hold_spotify<'js>(
       let before = holds.len();
       holds.retain(|&(held, ..)| held != hold);
       if holds.len() != before {
-         spotify::hold(tweak, false);
+         spotify::release(tweak);
       }
    })
 }

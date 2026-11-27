@@ -171,7 +171,7 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    registry.spotify.borrow_mut().retain(|&(_, ref plugin, tweak)| {
       let held = plugin == name;
       if held {
-         spotify::hold(tweak, false);
+         spotify::release(tweak);
       }
       !held
    });
