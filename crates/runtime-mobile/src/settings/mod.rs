@@ -79,8 +79,10 @@ const ICON_UNINSTALL: &str = "res://ic_mana_puzzle_piece_minus";
 const ICON_CONSOLE: &str = "res://ic_mana_angle_brackets";
 const ICON_FILE: &str = "res://ic_mana_image_file_up";
 /// Plugins are named by their index in [`phoenix_runtime::plugins`] as of the
-/// last render, which every install follows with a fresh one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// last render, which every install follows with a fresh one. Settings and
+/// select options are named by their stable key/value so dynamic visibility
+/// changes do not shift targets or drafts.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Press {
    OpenMain,
    OpenConsole,
@@ -96,10 +98,11 @@ enum Press {
    Toggle(usize),
    Reload(usize),
    Uninstall(usize),
-   /// A plugin's switch or button, by its index in [`PluginInfo::settings`].
-   Setting(usize, usize),
-   /// Option `option` of a plugin's select setting.
-   Choose(usize, usize, usize),
+   /// A plugin's switch or button, by plugin index and `setting.key`.
+   Setting(usize, String),
+   /// Option `value` of a plugin's select setting, by plugin index and
+   /// `setting.key`.
+   Choose(usize, String, String),
    /// Apply the pending update in-app (OTA plugins / APK self-updater).
    ApplyUpdate,
    /// The site, to get the update [`crate::update`] found.
@@ -135,18 +138,18 @@ enum Job {
    ThemeChanged,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum Field {
    Eval,
    Install,
-   /// A text or number setting, indexed like [`Press::Setting`].
-   Setting(usize, usize),
+   /// A text or number setting, keyed like [`Press::Setting`].
+   Setting(usize, String),
    /// A plugin's code, by its index in [`phoenix_runtime::plugins`].
    Code(usize),
 }
 
 /// Nodes updated in place, so typing is not interrupted.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Slot {
    Input(Field),
    Log,
@@ -291,11 +294,11 @@ pub fn start() {
                   .map(|plugin| plugin.name.clone())
                   .collect::<Vec<_>>();
                state.drafts.retain(|field, _| {
-                  match *field {
+                  match field {
                      Field::Eval | Field::Install => true,
                      Field::Setting(index, _) | Field::Code(index) => {
-                        old.get(index)
-                           .is_some_and(|name| names.get(index).is_some_and(|new| new == name))
+                        old.get(*index)
+                           .is_some_and(|name| names.get(*index).is_some_and(|new| new == name))
                      },
                   }
                });

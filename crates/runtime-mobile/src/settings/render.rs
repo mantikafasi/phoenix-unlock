@@ -58,12 +58,12 @@ impl Settings {
       })
    }
 
-   pub fn build(&mut self, tree: &mut Tree, inherited: Option<Press>, ops: &mut Vec<Op>) -> i32 {
-      let press = tree.press.or(inherited);
+   pub fn build(&mut self, tree: &mut Tree, inherited: Option<&Press>, ops: &mut Vec<Op>) -> i32 {
+      let press = tree.press.as_ref().or(inherited).cloned();
       let kids = tree
          .kids
          .iter_mut()
-         .map(|kid| self.build(kid, press, ops))
+         .map(|kid| self.build(kid, press.as_ref(), ops))
          .collect::<Vec<i32>>();
       tree.id = self.next_id;
       self.next_id += 1;
@@ -132,18 +132,18 @@ impl Settings {
       }]
    }
 
-   fn slots(&self) -> impl Iterator<Item = (i32, Slot)> + '_ {
+   fn slots(&self) -> impl Iterator<Item = (i32, &Slot)> + '_ {
       self
          .screen
          .iter()
          .flat_map(|screen| &screen.stack)
-         .flat_map(|page| page.slots.iter().copied())
+         .flat_map(|page| page.slots.iter().map(|(id, slot)| (*id, slot)))
    }
 
    pub fn field(&self, node: i32) -> Option<Field> {
       self.slots().find_map(|(id, slot)| {
          match slot {
-            Slot::Input(field) if id == node => Some(field),
+            Slot::Input(field) if id == node => Some(field.clone()),
             _ => None,
          }
       })
@@ -155,7 +155,7 @@ impl Settings {
    fn log_ops(&mut self) -> Vec<Op> {
       let boxes = self
          .slots()
-         .filter(|(_, slot)| *slot == Slot::Log)
+         .filter(|(_, slot)| **slot == Slot::Log)
          .map(|(id, _)| id)
          .collect::<Vec<i32>>();
       let mut ops = Vec::new();
@@ -189,10 +189,10 @@ impl Settings {
 
    /// Empties the inputs that hold `field`. `forceValue` rather than `value`,
    /// which the host ignores while the keyboard has edits in flight.
-   fn clear_ops(&mut self, field: Field) -> Vec<Op> {
+   fn clear_ops(&mut self, field: &Field) -> Vec<Op> {
       let inputs = self
          .slots()
-         .filter(|(_, slot)| *slot == Slot::Input(field))
+         .filter(|(_, slot)| matches!(slot, Slot::Input(other) if other == field))
          .map(|(id, _)| id)
          .collect::<Vec<i32>>();
       inputs
@@ -218,11 +218,11 @@ impl Settings {
    pub fn run(&mut self, job: Job) -> Vec<Op> {
       match job {
          Job::Draft(field, draft) => {
-            let ops = match field {
+            let ops = match &field {
                Field::Code(_) => {
                   self
                      .slots()
-                     .filter(|(_, slot)| *slot == Slot::Input(field))
+                     .filter(|(_, slot)| matches!(slot, Slot::Input(other) if other == &field))
                      .map(|(id, _)| {
                         Op::Update {
                            id,
@@ -240,7 +240,7 @@ impl Settings {
          Job::ThemeChanged => self.theme_changed(),
          Job::Submit(Field::Eval) => {
             let mut ops = self.log_ops();
-            ops.extend(self.clear_ops(Field::Eval));
+            ops.extend(self.clear_ops(&Field::Eval));
             ops
          },
          Job::Submit(Field::Code(_)) | Job::Press(Press::PickFile | Press::OpenSite) => Vec::new(),
@@ -268,7 +268,7 @@ impl Settings {
             | Press::Choose(..)
             | Press::ToggleStaff
             | Press::ToggleRemoteShell),
-         ) => self.rerender_all(Some(press)),
+         ) => self.rerender_all(Some(&press)),
          Job::Press(Press::Back) => self.close_top(),
          Job::Press(Press::Uninstall(_)) => {
             let mut ops = self.close_top();
@@ -328,7 +328,7 @@ impl Settings {
 
    /// Rebuilds every open page. The switches `flipped` targets spring from
    /// their old state.
-   fn rerender_all(&mut self, flipped: Option<Press>) -> Vec<Op> {
+   fn rerender_all(&mut self, flipped: Option<&Press>) -> Vec<Op> {
       let kinds = self.screen.as_ref().map_or_default(|screen| {
          screen
             .stack
@@ -429,11 +429,12 @@ impl Settings {
    /// Restores unsubmitted text when a page with inputs is rebuilt.
    fn apply_drafts(&self, trees: &mut [Tree]) {
       fn apply(tree: &mut Tree, drafts: &HashMap<Field, String>) {
-         if let Some(Slot::Input(field)) = tree.slot
-            && let Some(draft) = drafts.get(&field)
+         if let Some(Slot::Input(field)) = &tree.slot
+            && let Some(draft) = drafts.get(field)
          {
+            let is_code = matches!(field, Field::Code(_));
             tree.set(Prop::VALUE, Some(text(draft)));
-            if matches!(field, Field::Code(_)) {
+            if is_code {
                tree.set(prop!("valueSpans"), Some(code_spans(draft)));
             }
          }

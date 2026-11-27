@@ -930,6 +930,7 @@ fn plugin_route(method: &str, rest: &str, body: &[u8]) -> Reply {
             return err("400 Bad Request", "expected JSON {key}");
          };
          crate::press(name, &req.key);
+         crate::refresh_settings();
          ok_json(&Done::Pressed(&req.key))
       },
       _ => err("404 Not Found", "unknown plugin route"),

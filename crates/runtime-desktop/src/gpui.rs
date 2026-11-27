@@ -422,6 +422,11 @@ unsafe fn switch_callback(
          Action::TogglePlugin(name) => phoenix_runtime::set_enabled(&name, on),
          Action::ToggleSetting { plugin, key } => {
             phoenix_runtime::set_setting(&plugin, &key, Chosen::Switch(on));
+            UI_STATE
+               .lock()
+               .unwrap_or_else(PoisonError::into_inner)
+               .open_select = None;
+            crate::modal::force_redraw();
          },
          _ => {},
       }
@@ -479,6 +484,7 @@ unsafe extern "C" fn button_callback(
                .lock()
                .unwrap_or_else(PoisonError::into_inner)
                .open_select = None;
+            crate::modal::force_redraw();
          },
          Action::ToggleCatalogGroup(group) => {
             let mut ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -503,6 +509,10 @@ unsafe extern "C" fn button_callback(
             crate::modal::open_install_url();
          },
          Action::EditSetting(field) => {
+            UI_STATE
+               .lock()
+               .unwrap_or_else(PoisonError::into_inner)
+               .open_select = None;
             crate::modal::open_setting_editor(field);
          },
          Action::InstallFromFile => {
@@ -528,7 +538,14 @@ unsafe extern "C" fn button_callback(
                log::warn!("sunbird settings: uninstall {name}: {err}");
             }
          },
-         Action::PressButton { plugin, key } => phoenix_runtime::press(&plugin, &key),
+         Action::PressButton { plugin, key } => {
+            phoenix_runtime::press(&plugin, &key);
+            UI_STATE
+               .lock()
+               .unwrap_or_else(PoisonError::into_inner)
+               .open_select = None;
+            crate::modal::force_redraw();
+         },
          Action::InstallCatalog(name) => {
             std::thread::spawn(move || {
                match update::install_listed(&name) {
@@ -2001,7 +2018,7 @@ fn render_plugins_tab(
                   );
                   if dropdown_open && !options.is_empty() {
                      let mut menu = b.card(6.0, 8.0, 6.0, 0.24);
-                     for opt in options {
+                     for (idx, opt) in options.iter().enumerate() {
                         let selected = opt.value == *chosen;
                         let opt_lbl = if selected {
                            format!("✓  {}", opt.label)
@@ -2010,7 +2027,7 @@ fn render_plugins_tab(
                         };
                         menu = b.push_button(
                            menu,
-                           &format!("{sid}-opt-{}", opt.value),
+                           &format!("{sid}-opt-{idx}"),
                            &opt_lbl,
                            if selected {
                               BtnVariant::Primary

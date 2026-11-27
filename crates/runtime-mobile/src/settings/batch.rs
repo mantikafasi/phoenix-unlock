@@ -115,7 +115,7 @@ pub fn filter_dispatch(frame: &[u8]) -> Action {
                (*event == Prop::SUBMIT.key()).then_some(Job::Submit(field))
             }
          } else if let Some(press) = state.handlers.get(node) {
-            (*event == Prop::PRESS.key()).then_some(Job::Press(*press))
+            (*event == Prop::PRESS.key()).then(|| Job::Press(press.clone()))
          } else {
             continue;
          };

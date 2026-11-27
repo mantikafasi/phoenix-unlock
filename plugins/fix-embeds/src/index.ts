@@ -17,12 +17,14 @@ const settings = phoenix.settings.define({
       { value: "custom", label: "Custom (use textbox below)" },
     ],
     default: "fixupx.com",
+    visible: (s) => s.twitter,
   },
   customTwitterDomain: {
     type: "text",
     title: "Custom X / Twitter domain",
-    description: "Overrides preset when non-empty (e.g. goyimx.com)",
+    description: "Custom replacement domain (e.g. goyimx.com)",
     default: "",
+    visible: (s) => Boolean(s.twitter) && s.twitterDomain === "custom",
   },
   instagram: {
     type: "switch",
@@ -43,12 +45,14 @@ const settings = phoenix.settings.define({
       { value: "custom", label: "Custom (use textbox below)" },
     ],
     default: "kkinstagram.com",
+    visible: (s) => s.instagram,
   },
   customInstagramDomain: {
     type: "text",
     title: "Custom Instagram domain",
-    description: "Overrides preset when non-empty",
+    description: "Custom replacement domain",
     default: "",
+    visible: (s) => Boolean(s.instagram) && s.instagramDomain === "custom",
   },
   tiktok: {
     type: "switch",
@@ -67,12 +71,14 @@ const settings = phoenix.settings.define({
       { value: "custom", label: "Custom (use textbox below)" },
     ],
     default: "tnktok.com",
+    visible: (s) => s.tiktok,
   },
   customTiktokDomain: {
     type: "text",
     title: "Custom TikTok domain",
-    description: "Overrides preset when non-empty",
+    description: "Custom replacement domain",
     default: "",
+    visible: (s) => Boolean(s.tiktok) && s.tiktokDomain === "custom",
   },
   customRules: {
     type: "text",
@@ -92,11 +98,8 @@ const cleanHost = (value: string) =>
     .replace(/^https?:\/\//i, "")
     .replace(/\/.*$/, "");
 
-const pickDomain = (custom: string, preset: string, fallback: string) => {
-  const cleaned = cleanHost(custom);
-  if (cleaned) return cleaned;
-  return preset === "custom" ? fallback : preset;
-};
+const pickDomain = (custom: string, preset: string, fallback: string) =>
+  preset === "custom" ? cleanHost(custom) || fallback : preset;
 
 const parseCustomRules = (): [string, string][] => {
   const raw = settings.customRules.trim();

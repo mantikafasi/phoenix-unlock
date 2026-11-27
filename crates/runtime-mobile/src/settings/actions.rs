@@ -27,7 +27,7 @@ fn plugin(index: usize) -> Option<PluginInfo> {
 /// Makes the runtime calls `job` asks for. They take the engine lock, so they
 /// run before the settings lock is taken.
 pub fn act(job: &Job) {
-   match *job {
+   match job {
       Job::Log => LOG_QUEUED.store(false, Ordering::Relaxed),
       // The editor is multiline: Enter is a newline there, and Save saves.
       Job::Submit(Field::Code(_))
@@ -36,7 +36,7 @@ pub fn act(job: &Job) {
       | Job::Refresh
       | Job::ThemeChanged => {},
       Job::Submit(field) => submit(field),
-      Job::Picked(ref picked) => {
+      Job::Picked(picked) => {
          match picked {
             Ok(Some((file, bytes))) => {
                installed(phoenix_runtime::install_file(file, bytes.clone()), file);
@@ -55,8 +55,8 @@ pub fn act(job: &Job) {
    }
 }
 
-fn submit(field: Field) {
-   let Some(draft) = settings().drafts.remove(&field) else {
+fn submit(field: &Field) {
+   let Some(draft) = settings().drafts.remove(field) else {
       return;
    };
    let input = draft.trim();
@@ -65,11 +65,11 @@ fn submit(field: Field) {
       Field::Install if !input.is_empty() => {
          installed(phoenix_runtime::install(input), input);
       },
-      Field::Setting(index, at) => {
-         let Some(plugin) = plugin(index) else {
+      Field::Setting(index, key) => {
+         let Some(plugin) = plugin(*index) else {
             return;
          };
-         let Some(setting) = plugin.settings.get(at) else {
+         let Some(setting) = plugin.settings.iter().find(|setting| setting.key == *key) else {
             return;
          };
          let value = match setting.control {
@@ -93,20 +93,20 @@ fn submit(field: Field) {
    }
 }
 
-fn press(pressed: Press) {
+fn press(pressed: &Press) {
    match pressed {
       Press::PickFile => crate::picker::pick(),
       // The editor starts from the plugin's code, kept as the field's draft.
       Press::EditCode(index) => {
-         if let Some(plugin) = plugin(index)
+         if let Some(plugin) = plugin(*index)
             && let Some(source) = phoenix_runtime::source(&plugin.name)
          {
-            settings().drafts.insert(Field::Code(index), source);
+            settings().drafts.insert(Field::Code(*index), source);
          }
       },
       Press::SaveCode(index) => {
-         let draft = settings().drafts.get(&Field::Code(index)).cloned();
-         if let (Some(plugin), Some(source)) = (plugin(index), draft) {
+         let draft = settings().drafts.get(&Field::Code(*index)).cloned();
+         if let (Some(plugin), Some(source)) = (plugin(*index), draft) {
             match phoenix_runtime::save_source(&plugin.name, source) {
                Ok(()) => log::info!("saved {} and restarted it", plugin.name),
                Err(err) => log::error!("saving {} failed: {err}", plugin.name),
@@ -114,30 +114,31 @@ fn press(pressed: Press) {
          }
       },
       Press::Toggle(index) => {
-         if let Some(plugin) = plugin(index) {
+         if let Some(plugin) = plugin(*index) {
             phoenix_runtime::set_enabled(&plugin.name, !plugin.state.is_on());
          }
       },
       Press::Reload(index) => {
-         if let Some(plugin) = plugin(index) {
+         if let Some(plugin) = plugin(*index) {
             phoenix_runtime::reload(&plugin.name);
          }
       },
       Press::Uninstall(index) => {
-         if let Some(plugin) = plugin(index) {
+         if let Some(plugin) = plugin(*index) {
             match phoenix_runtime::uninstall(&plugin.name) {
                Ok(outcome) => log::info!("{}", uninstalled(&plugin.name, outcome)),
                Err(err) => log::error!("uninstall failed: {err}"),
             }
          }
       },
-      Press::Setting(index, at) => {
-         let Some(plugin) = plugin(index) else {
+      Press::Setting(index, key) => {
+         let Some(plugin) = plugin(*index) else {
             return;
          };
          match plugin
             .settings
-            .get(at)
+            .iter()
+            .find(|setting| setting.key == *key)
             .map(|setting| (&setting.key, &setting.control))
          {
             Some((key, Control::Switch(on))) => {
@@ -147,13 +148,13 @@ fn press(pressed: Press) {
             _ => {},
          }
       },
-      Press::Choose(index, at, option) => {
-         let Some(plugin) = plugin(index) else {
+      Press::Choose(index, key, value) => {
+         let Some(plugin) = plugin(*index) else {
             return;
          };
-         if let Some(setting) = plugin.settings.get(at)
+         if let Some(setting) = plugin.settings.iter().find(|setting| setting.key == *key)
             && let Control::Select { options, .. } = &setting.control
-            && let Some(choice) = options.get(option)
+            && let Some(choice) = options.iter().find(|choice| choice.value == *value)
          {
             phoenix_runtime::set_setting(
                &plugin.name,
@@ -162,7 +163,7 @@ fn press(pressed: Press) {
             );
          }
       },
-      Press::Listed(index) => listed(index),
+      Press::Listed(index) => listed(*index),
       Press::ApplyUpdate => {
          phoenix_runtime::update::apply();
       },

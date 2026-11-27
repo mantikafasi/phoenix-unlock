@@ -68,6 +68,7 @@ impl Tree {
    pub fn slots(&self) -> Vec<(i32, Slot)> {
       let mut slots = self
          .slot
+         .clone()
          .map(|slot| (self.id, slot))
          .into_iter()
          .collect::<Vec<_>>();
@@ -76,8 +77,8 @@ impl Tree {
    }
 
    /// Marks the animated nodes under the one `press` targets as just flipped.
-   pub fn flip(&mut self, press: Press, inside: bool) {
-      let inside = inside || (self.press == Some(press) && self.animate.is_some());
+   pub fn flip(&mut self, press: &Press, inside: bool) {
+      let inside = inside || (self.press.as_ref() == Some(press) && self.animate.is_some());
       if inside && let Some(animate) = &mut self.animate {
          animate.flipped = true;
       }

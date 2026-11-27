@@ -86,7 +86,7 @@ use crate::{
       lockdown::lockdown,
       messages::messages_object,
       settings::{
-         Definition,
+         PluginSettings,
          settings_object,
       },
       storage::{
@@ -259,7 +259,11 @@ pub struct Registry<'js> {
    budget:             Arc<Budget>,
    handles:            Vec<(EventId, String, Object<'js>)>,
    hooks:              RefCell<HashMap<EventId, Vec<Hook<'js>>>>,
-   defined:            RefCell<BTreeMap<String, Vec<Definition<'js>>>>,
+   defined:            RefCell<BTreeMap<String, PluginSettings<'js>>>,
+   /// Plugins whose top-level script is currently running in [`Engine::eval`].
+   evaluating:         RefCell<HashSet<String>>,
+   /// Plugins currently inside dynamic settings resolution, blocking re-entrancy.
+   resolving:          RefCell<HashSet<String>>,
    /// Kept across unloads, so a reloaded plugin sees what the user chose.
    chosen:             RefCell<ChosenMap>,
    /// `phoenix.onUnload` callbacks, run when the plugin is turned off,
@@ -436,7 +440,8 @@ impl Engine {
                   .as_ref()
                   .and_then(|defined| defined.get(name))
                   .into_iter()
-                  .flatten()
+                  .flat_map(|settings| settings.definitions.iter())
+                  .filter(|definition| definition.is_shown())
                   .map(|definition| {
                      let picked = chosen
                         .as_ref()
@@ -488,11 +493,18 @@ impl Engine {
          .and_then(|permissions| {
             let permissions = Arc::new(permissions);
             self.with(|ctx| {
+               let evaluating = settings::enter_evaluating(&ctx, name);
                let run = || -> rquickjs::Result<()> {
                   let phoenix = api(&ctx, name, &permissions)?;
                   compile(&ctx, source)?.call((phoenix,))
                };
-               run().catch(&ctx).map_err(js_error)
+               let outcome = run().catch(&ctx).map_err(js_error);
+               drop(evaluating);
+               if outcome.is_ok() {
+                  restart_budget(&ctx);
+                  settings::resolve_plugin(&ctx, name);
+               }
+               outcome
             })
          });
       let Some(loaded) = self.plugins.get_mut(name) else {
@@ -811,6 +823,8 @@ fn registry<'js>(
       handles,
       hooks: RefCell::default(),
       defined: RefCell::default(),
+      evaluating: RefCell::default(),
+      resolving: RefCell::default(),
       chosen: RefCell::default(),
       unloads: RefCell::default(),
       pending: RefCell::default(),

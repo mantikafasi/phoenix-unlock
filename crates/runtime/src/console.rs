@@ -62,7 +62,7 @@ pub fn url_encoded(text: &str) -> String {
       .collect()
 }
 
-fn scrub(mut line: String) -> String {
+pub(crate) fn scrub(mut line: String) -> String {
    for secret in SECRETS
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
