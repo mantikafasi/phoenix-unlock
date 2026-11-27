@@ -200,6 +200,7 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             },
          );
          report("settings layer", desktop::settings_layer(image).map(at));
+         report("animation frame", desktop::animation_frame(image).map(at));
          report("access gate", desktop::access_gate(image).map(at));
          report("notification gate", desktop::notification_gate(image).map(at));
          if abi == x86::Abi::SysV {
@@ -673,6 +674,21 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          report(
             "settings layer",
             phoenix_sigs::macos::settings_layer(image).map(at),
+         );
+         report(
+            "animation frame",
+            phoenix_sigs::macos::animation_frame(image).map(at),
+         );
+         report(
+            "scale fade",
+            phoenix_sigs::macos::scale_fade(image).map(|sf| {
+               format!(
+                  "{} (loc {}) {:x?}",
+                  at(sf.into_any),
+                  at(sf.caller_loc),
+                  sf.layout
+               )
+            }),
          );
          report(
             "native modal",

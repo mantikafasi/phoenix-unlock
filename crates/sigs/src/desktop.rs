@@ -329,6 +329,8 @@ fn literal(image: &Image<'_>, text: &[u8]) -> Vec<usize> {
 pub mod layout {
    /// Bytes reserved for a `gpui::Div`, which is moved by value everywhere.
    pub const DIV_CAP: usize = 0x100;
+   /// Bytes reserved for a `mana_gpui::components::motion::effects::ScaleFade`.
+   pub const SCALE_FADE_CAP: usize = 0x200;
    /// Bytes reserved for each other Mana struct (`Switch`, `Button`, `Modal`,
    /// `TextInput`, `TextArea`, `MenuItem`).
    pub const SCRATCH_CAP: usize = 0x800;
@@ -1420,6 +1422,7 @@ pub struct StyleOffsets {
    pub text_color:      usize,
    pub white_space:     usize,
    pub flex_shrink:     usize,
+   pub opacity:         usize,
    pub background:      usize,
    pub border_color:    usize,
    pub overflow_x:      usize,
@@ -1577,6 +1580,7 @@ pub(crate) fn style_from_fields(
       text_color: get("text.color")?,
       white_space: get("text.white_space")?,
       flex_shrink: get("flex_shrink")?,
+      opacity: get("opacity")?,
       background: get("background")?,
       border_color: get("border_color")?,
       overflow_x: get("overflow.x")?,
@@ -1608,6 +1612,7 @@ pub(crate) fn style_from_fields(
       (style.text_color, 20),
       (style.white_space, 1),
       (style.flex_shrink, 8),
+      (style.opacity, 8),
       (style.background, 0x48),
       (style.border_color, 20),
       (style.overflow_x, 1),
@@ -5116,6 +5121,256 @@ pub fn settings_layer(image: &Image<'_>) -> Found<usize> {
       return Err("settings layer render prologue changed".to_owned());
    }
    Ok(func)
+}
+
+/// Decoded layout of `mana_gpui::components::motion::effects::ScaleFade` and
+/// its `ElementId` field.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleFadeLayout {
+   pub size:               usize,
+   pub child:              usize,
+   pub opacity_range:      usize,
+   pub label_none:         usize,
+   pub element_id:         usize,
+   pub element_id_tag_off: usize,
+   pub element_id_tag:     u8,
+   pub element_id_key:     usize,
+   pub element_id_str:     usize,
+   pub progress:           usize,
+   pub scale_from:         usize,
+   pub origin:             usize,
+   pub fade:               usize,
+}
+
+/// Discord's `ScaleFade::into_any_element`, its `Location` static, and its
+/// decoded struct layout.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleFade {
+   pub into_any:   usize,
+   pub caller_loc: usize,
+   pub layout:     ScaleFadeLayout,
+}
+
+pub(crate) fn validate_scale_fade_layout(layout: ScaleFadeLayout) -> Found<ScaleFadeLayout> {
+   const ELEMENT_ID_SIZE: usize = 0x28;
+   if !(0x40..=layout::SCALE_FADE_CAP).contains(&layout.size) {
+      return Err(format!("ScaleFade size {:#x} out of bounds", layout.size));
+   }
+   let check_spans = |what: &str, cap: usize, spans: &[(usize, usize)]| -> Found<()> {
+      for (i, &(off, len)) in spans.iter().enumerate() {
+         let end = off
+            .checked_add(len)
+            .filter(|&end| end <= cap)
+            .ok_or_else(|| format!("{what} field +{off:#x}..+{len:#x} exceeds {cap:#x}"))?;
+         for &(other_off, other_len) in &spans[i + 1..] {
+            let other_end = other_off.saturating_add(other_len);
+            if off < other_end && other_off < end {
+               return Err(format!(
+                  "{what} fields +{off:#x} and +{other_off:#x} overlap"
+               ));
+            }
+         }
+      }
+      Ok(())
+   };
+   check_spans("ElementId", ELEMENT_ID_SIZE, &[
+      (layout.element_id_tag_off, 1),
+      (layout.element_id_key, 8),
+      (layout.element_id_str, 24),
+   ])?;
+   check_spans("ScaleFade", layout.size, &[
+      (layout.child, layout::ANY_ELEMENT),
+      (layout.opacity_range, 8),
+      (layout.label_none, 1),
+      (layout.element_id, ELEMENT_ID_SIZE),
+      (layout.progress, 4),
+      (layout.scale_from, 4),
+      (layout.origin, 4),
+      (layout.fade, 1),
+   ])?;
+   Ok(layout)
+}
+
+/// Shared call-graph search for [`animation_frame`] and
+/// [`crate::macos::animation_frame`]: runs bounded BFS from `"modal-layer-scrim"`
+/// callees to the 12-byte closure scheduler (`on_next_frame_notify`), then picks
+/// the unique short caller whose targets are a subset of the spring tick's.
+pub(crate) fn find_animation_frame(
+   roots: Vec<usize>,
+   func_targets: impl Fn(usize) -> Vec<usize>,
+   is_notify: impl Fn(usize) -> bool,
+   callers_of: impl Fn(usize) -> Vec<usize>,
+   is_short: impl Fn(usize) -> bool,
+) -> Found<usize> {
+   let mut visited = HashSet::new();
+   let mut queue = std::collections::VecDeque::new();
+   for root in roots {
+      if visited.insert(root) {
+         queue.push_back((root, 0usize));
+      }
+   }
+   let mut edges = Vec::new();
+   while let Some((func, depth)) = queue.pop_front() {
+      if depth >= 4 || visited.len() > 96 {
+         continue;
+      }
+      for target in func_targets(func) {
+         if is_notify(target) {
+            edges.push((func, target));
+            continue;
+         }
+         if visited.insert(target) {
+            queue.push_back((target, depth + 1));
+         }
+      }
+   }
+   edges.sort_unstable();
+   edges.dedup();
+   let mut notify_fns: Vec<usize> = edges.iter().map(|&(_, n)| n).collect();
+   notify_fns.sort_unstable();
+   notify_fns.dedup();
+   let notify_fn = one("on_next_frame_notify", &notify_fns)?;
+   let parent_set: HashSet<usize> = edges
+      .iter()
+      .filter(|&&(_, n)| n == notify_fn)
+      .map(|&(parent, _)| parent)
+      .collect();
+   let parent_callees: HashSet<usize> = parent_set
+      .iter()
+      .flat_map(|&parent| func_targets(parent))
+      .collect();
+
+   let candidates: Vec<usize> = callers_of(notify_fn)
+      .into_iter()
+      .filter(|caller| !parent_set.contains(caller) && is_short(*caller))
+      .filter(|&caller| {
+         let targets = func_targets(caller);
+         (3..=5).contains(&targets.len())
+            && targets.contains(&notify_fn)
+            && targets.iter().all(|t| parent_callees.contains(t))
+      })
+      .collect();
+   one("animation_frame", &candidates)
+}
+
+fn x86_callers(image: &Image<'_>, target: usize) -> Vec<usize> {
+   let mut callers: Vec<usize> = image
+      .rip_refs(target..target + 1)
+      .into_iter()
+      .filter(|&(field, _)| {
+         field
+            .checked_sub(1)
+            .and_then(|op| image.read(op, 1))
+            .is_some_and(|b| matches!(b, [0xE8 | 0xE9]))
+      })
+      .filter_map(|(field, _)| Some(image.function_bounds(field)?.0))
+      .collect();
+   for slot in image.pointers_to(target) {
+      for (field, _) in image.rip_refs(slot..slot + 1) {
+         if field
+            .checked_sub(2)
+            .and_then(|op| image.read(op, 2))
+            .is_some_and(|b| matches!(b, [0xFF, 0x15 | 0x25]))
+            && let Some((func, _)) = image.function_bounds(field)
+         {
+            callers.push(func);
+         }
+      }
+   }
+   callers.sort_unstable();
+   callers.dedup();
+   callers
+}
+
+/// GPUI's per-view next-frame scheduler, `fn(window: *mut c_void, app: *mut
+/// c_void)`.
+pub fn animation_frame(image: &Image<'_>) -> Found<usize> {
+   let abi = Abi::of(image);
+   let scrim = one("modal-layer-scrim", &image.find_bytes(b"modal-layer-scrim"))?;
+   let mut roots = Vec::new();
+   for site in lea_refs(image, scrim) {
+      let Some(code) = image.read(site, 0xA0) else {
+         continue;
+      };
+      for idx in 0..code.len() {
+         if let Some((_, target)) = call_target(image, &code[idx..], site + idx)
+            && image.is_function(target)
+         {
+            roots.push(target);
+         }
+      }
+   }
+   roots.sort_unstable();
+   roots.dedup();
+
+   let func_targets = |func: usize| -> Vec<usize> {
+      let Some((start, end)) = image.function_bounds(func) else {
+         return Vec::new();
+      };
+      let mut out = callees(image, start, end);
+      if let Some(bytes) = image.read(start, end.saturating_sub(start)) {
+         for idx in 0..bytes.len() {
+            if let Some(target) = jump_target(image, &bytes[idx..], start + idx)
+               && target != func
+               && image.is_function(target)
+            {
+               out.push(target);
+            }
+         }
+      }
+      out.sort_unstable();
+      out.dedup();
+      out
+   };
+
+   let sizes = imm_loads(abi.arg(0), 12);
+   let aligns = imm_loads(abi.arg(1), 4);
+   let is_notify = |func: usize| -> bool {
+      let Some((start, end)) = image.function_bounds(func) else {
+         return false;
+      };
+      let len = end.saturating_sub(start);
+      let Some(bytes) = (80..=640)
+         .contains(&len)
+         .then(|| image.read(start, len))
+         .flatten()
+      else {
+         return false;
+      };
+      let near = |a: &[Vec<u8>], b: &[Vec<u8>]| {
+         (0..bytes.len()).any(|at| {
+            let Some(rest) = bytes.get(at..) else {
+               return false;
+            };
+            a.iter().any(|pa| {
+               rest.starts_with(pa)
+                  && rest
+                     .get(pa.len()..(pa.len() + 12).min(rest.len()))
+                     .is_some_and(|win| {
+                        (0..win.len()).any(|off| b.iter().any(|pb| win[off..].starts_with(pb)))
+                     })
+            })
+         })
+      };
+      if !near(&sizes, &aligns) && !near(&aligns, &sizes) {
+         return false;
+      }
+      phoenix_hook::x86::disasm(bytes, start, usize::MAX)
+         .iter()
+         .any(|line| line.text.starts_with("call qword ptr [") || line.text.starts_with("call r"))
+   };
+
+   find_animation_frame(
+      roots,
+      func_targets,
+      is_notify,
+      |notify_fn| x86_callers(image, notify_fn),
+      |func| {
+         image
+            .function_bounds(func)
+            .is_some_and(|(start, end)| end.saturating_sub(start) <= 260)
+      },
+   )
 }
 
 /// The `tracing::Callsite` static naming `"media_fetch"` /

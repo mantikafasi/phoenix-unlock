@@ -4290,6 +4290,433 @@ fn arm64_pick_cx_new(
       .ok_or_else(|| format!("{name} not found"))
 }
 
+/// GPUI's per-view next-frame scheduler, `fn(window: *mut c_void, app: *mut
+/// c_void)`.
+pub fn animation_frame(image: &Image<'_>) -> Found<usize> {
+   let scrim = one("modal-layer-scrim", &image.find_bytes(b"modal-layer-scrim"))?;
+   let mut roots = Vec::new();
+   for (site, _) in refs_to(image, &[scrim]) {
+      let Some((_, body)) = arm64::function(image, site) else {
+         continue;
+      };
+      let Some(at) = body.iter().position(|&(pc, _)| pc == site) else {
+         continue;
+      };
+      for &(_, insn) in body[at + 1..].iter().take(28) {
+         if let Insn::Bl { target } = insn
+            && image.is_function(target)
+         {
+            roots.push(target);
+         }
+      }
+   }
+   let func_targets = |func: usize| -> Vec<usize> {
+      let Some((_, body)) = arm64::function(image, func) else {
+         return Vec::new();
+      };
+      sorted(
+         body
+            .iter()
+            .filter_map(|&(_, insn)| {
+               match insn {
+                  Insn::Bl { target } | Insn::B { target } if image.is_function(target) => {
+                     Some(target)
+                  },
+                  _ => None,
+               }
+            })
+            .collect(),
+      )
+   };
+   let is_notify = |func: usize| -> bool {
+      let Some((_, body)) = arm64::function(image, func) else {
+         return false;
+      };
+      (32..=128).contains(&body.len())
+         && body.iter().any(|&(_, insn)| matches!(insn, Insn::Blr { .. }))
+         && allocs(&flattened(image, func)).any(|(_, size, align, _)| size == 12 && align == 4)
+   };
+   let callers_of = |notify_fn: usize| {
+      sorted(
+         refs_to(image, &[notify_fn])
+            .into_iter()
+            .filter_map(|(site, _)| image.function_containing(site))
+            .collect(),
+      )
+   };
+
+   crate::desktop::find_animation_frame(sorted(roots), func_targets, is_notify, callers_of, |f| {
+      arm64::function(image, f).is_some_and(|(_, body)| body.len() <= 64)
+   })
+}
+
+/// Decodes `ScaleFade`'s byte size from the `[x0 + off]` copies in
+/// `ScaleFade::into_any_element`.
+fn arm64_scale_fade_size(image: &Image<'_>, into_any: usize) -> Found<usize> {
+   let (_, body) = arm64::function(image, into_any).ok_or("ScaleFade::into_any did not decode")?;
+   let mut max_end = 0usize;
+   for &(_, insn) in &body {
+      match insn {
+         Insn::Load {
+            rn: 0,
+            offset,
+            size,
+            ..
+         } => max_end = max_end.max(offset + size),
+         Insn::Other(w) if w & 0xFFC0_03E0 == 0xAD40_0000 => {
+            let imm7 = ((w >> 15) & 0x7F) as usize;
+            if imm7 & 0x40 == 0 {
+               max_end = max_end.max(imm7 * 16 + 32);
+            }
+         },
+         Insn::Other(w) if w & 0xFFC0_03E0 == 0x3DC0_0000 => {
+            let imm12 = ((w >> 10) & 0xFFF) as usize;
+            max_end = max_end.max(imm12 * 16 + 16);
+         },
+         _ => {},
+      }
+   }
+   if max_end == 0 {
+      max_end = body
+         .windows(2)
+         .find_map(|pair| {
+            match (pair[0].1, pair[1].1) {
+               (
+                  Insn::MovZ {
+                     rd: 2,
+                     imm,
+                     wide: false,
+                  },
+                  Insn::Bl { .. },
+               ) => usize::try_from(imm).ok(),
+               _ => None,
+            }
+         })
+         .unwrap_or(0);
+   }
+   if max_end == 0 {
+      return Err("ScaleFade size not found in into_any".to_owned());
+   }
+   Ok(max_end)
+}
+
+/// Discord's `mana_gpui::components::motion::effects::ScaleFade::into_any_element`
+/// and its decoded struct layout from `mana_modal_layer`.
+#[expect(
+   clippy::too_many_lines,
+   reason = "decodes all ScaleFade and ElementId field offsets from mana_modal_layer"
+)]
+pub fn scale_fade(image: &Image<'_>) -> Found<crate::desktop::ScaleFade> {
+   const MODAL_SCALE: &[u8] = b"modal-scale";
+   let anchor = one("modal-scale", &image.find_bytes(MODAL_SCALE))?;
+   let mut parents = Vec::new();
+   for (site, _) in refs_to(image, &[anchor]) {
+      if let Some(func) = image.function_containing(site) {
+         parents.push(func);
+      }
+   }
+   let parent = one("mana_modal_layer", &sorted(parents))?;
+   let (_, body) = arm64::function(image, parent).ok_or("mana_modal_layer did not decode")?;
+   let callees = sorted(
+      body
+         .iter()
+         .filter_map(|&(_, insn)| match insn {
+            Insn::Bl { target } if image.is_function(target) => Some(target),
+            _ => None,
+         })
+         .collect(),
+   );
+
+   let type_names = image.find_bytes(b"mana_gpui::components::motion::effects::ScaleFade");
+   let type_users: std::collections::HashSet<usize> = refs_to(image, &type_names)
+      .into_iter()
+      .filter_map(|(site, _)| image.function_containing(site))
+      .collect();
+   let candidates: Vec<usize> = callees
+      .into_iter()
+      .filter(|callee| type_users.contains(callee))
+      .collect();
+   let into_any = one("scale_fade", &candidates)?;
+   let size = arm64_scale_fade_size(image, into_any)?;
+
+   let loads = loaded(&body);
+   let (anchor_at, call_at) = body
+      .iter()
+      .enumerate()
+      .filter(|&(_, &(_, insn))| insn == Insn::Bl { target: into_any })
+      .find_map(|(call_at, _)| {
+         let start = call_at.saturating_sub(48);
+         let anchor_at = (start..call_at)
+            .rev()
+            .find(|&idx| loads[idx].is_some_and(|(_, addr)| addr == anchor))?;
+         Some((anchor_at, call_at))
+      })
+      .ok_or("ScaleFade call after modal-scale not found")?;
+
+   let base = body[call_at.saturating_sub(8)..call_at]
+      .iter()
+      .rev()
+      .find_map(pick!(&(_, Insn::AddImm { rd: 0, rn: 31, imm }) => imm))
+      .ok_or("ScaleFade stack base (x0) not found")?;
+   let caller_loc = loads[call_at.saturating_sub(8)..call_at]
+      .iter()
+      .rev()
+      .find_map(|load| load.and_then(pick!((1, addr) => addr)))
+      .ok_or("ScaleFade caller_loc (x1) not found")?;
+
+   let mut clamped_fp = [false; 32];
+   for &(_, insn) in &body[..call_at] {
+      // `fcmp sN, #0.0` clamps `progress` for the modal scrim.
+      if let Insn::Other(w) = insn
+         && w & 0xFFFF_FC1F == 0x1E20_2008
+      {
+         clamped_fp[((w >> 5) & 0x1F) as usize] = true;
+      }
+   }
+
+   let win_start = anchor_at.saturating_sub(6);
+   let mut imm_val: [Option<u64>; 32] = [None; 32];
+   let mut adrp_page: [Option<usize>; 32] = [None; 32];
+   let mut ptr_reg: [Option<usize>; 32] = [None; 32];
+   let mut q_src: [Option<usize>; 32] = [None; 32];
+   let mut d_opacity = [false; 32];
+   let mut pending_sret: Option<usize> = None;
+   let mut child_tmp: Option<usize> = None;
+   let mut ptr_slot: Option<usize> = None;
+   let mut byte_imm_stores: Vec<(usize, u8)> = Vec::new();
+   let mut qword_stores: Vec<(usize, Option<u64>)> = Vec::new();
+   let mut vec_copies: Vec<(usize, usize)> = Vec::new();
+   let mut opacity_range: Option<usize> = None;
+   let mut fp_stores: Vec<(u8, usize)> = Vec::new();
+   let mut origin: Option<usize> = None;
+
+   for &(_, insn) in &body[win_start..call_at] {
+      match insn {
+         Insn::Adrp { rd, page } => {
+            let r = usize::from(rd);
+            adrp_page[r] = Some(page);
+            imm_val[r] = None;
+            ptr_reg[r] = None;
+         },
+         Insn::AddImm { rd, rn, imm } => {
+            let r = usize::from(rd);
+            if rd == 8 && rn == 31 {
+               pending_sret = Some(imm);
+            }
+            ptr_reg[r] = adrp_page[usize::from(rn)].map(|page| page.wrapping_add(imm));
+            adrp_page[r] = None;
+            imm_val[r] = None;
+         },
+         Insn::MovZ { rd, imm, .. } => {
+            let r = usize::from(rd);
+            imm_val[r] = Some(imm);
+            adrp_page[r] = None;
+            ptr_reg[r] = None;
+         },
+         Insn::MovN { rd, imm, .. } => {
+            let r = usize::from(rd);
+            imm_val[r] = Some(!imm);
+            adrp_page[r] = None;
+            ptr_reg[r] = None;
+         },
+         Insn::MovReg { rd, rm, .. } => {
+            let (d, s) = (usize::from(rd), usize::from(rm));
+            imm_val[d] = imm_val[s];
+            adrp_page[d] = adrp_page[s];
+            ptr_reg[d] = ptr_reg[s];
+         },
+         Insn::Load { rt, .. } => {
+            let r = usize::from(rt);
+            imm_val[r] = None;
+            adrp_page[r] = None;
+            ptr_reg[r] = None;
+         },
+         Insn::Store {
+            rt,
+            rn: 31,
+            offset,
+            size: store_size,
+         } => {
+            let r = usize::from(rt);
+            match store_size {
+               1 => {
+                  if let Some(v) = imm_val[r].and_then(|v| u8::try_from(v).ok()) {
+                     byte_imm_stores.push((offset, v));
+                  }
+               },
+               4 => {
+                  if rt == 31 && (base..base + size).contains(&offset) {
+                     origin = Some(offset - base);
+                  }
+               },
+               8 => {
+                  if ptr_reg[r] == Some(anchor) {
+                     ptr_slot = Some(offset);
+                  }
+                  qword_stores.push((offset, imm_val[r]));
+               },
+               _ => {},
+            }
+         },
+         Insn::Bl { .. } => {
+            if let Some(slot) = pending_sret.take() {
+               child_tmp = Some(slot);
+            }
+            for r in 0..19 {
+               imm_val[r] = None;
+               adrp_page[r] = None;
+               ptr_reg[r] = None;
+            }
+         },
+         Insn::Other(w) => {
+            // `ldr qT, [sp, #imm12*16]`
+            if w & 0xFFC0_03E0 == 0x3DC0_03E0 {
+               let rt = (w & 0x1F) as usize;
+               let off = (((w >> 10) & 0xFFF) as usize) * 16;
+               q_src[rt] = Some(off);
+            // `stp qA, qB, [sp, #imm7*16]`
+            } else if w & 0xFFC0_03E0 == 0xAD00_03E0 {
+               let rt1 = (w & 0x1F) as usize;
+               let imm7 = ((w >> 15) & 0x7F) as usize;
+               if imm7 & 0x40 == 0
+                  && let Some(src) = q_src[rt1]
+               {
+                  vec_copies.push((src, imm7 * 16));
+               }
+            // `str qT, [sp, #imm12*16]`
+            } else if w & 0xFFC0_03E0 == 0x3D80_03E0 {
+               let rt = (w & 0x1F) as usize;
+               let dst = (((w >> 10) & 0xFFF) as usize) * 16;
+               if let Some(src) = q_src[rt] {
+                  vec_copies.push((src, dst));
+               }
+            // `ldr dT, [xN, #imm12*8]`
+            } else if w & 0xFFC0_0000 == 0xFD40_0000 {
+               let rt = (w & 0x1F) as usize;
+               let rn = ((w >> 5) & 0x1F) as usize;
+               let off = (((w >> 10) & 0xFFF) as usize) * 8;
+               d_opacity[rt] = adrp_page[rn]
+                  .and_then(|page| image.read(page.wrapping_add(off), 8))
+                  .is_some_and(|b| {
+                     u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == 0.0f32.to_bits()
+                        && u32::from_le_bytes([b[4], b[5], b[6], b[7]]) == 1.0f32.to_bits()
+                  });
+            // `str dT, [sp, #imm12*8]`
+            } else if w & 0xFFC0_03E0 == 0xFD00_03E0 {
+               let rt = (w & 0x1F) as usize;
+               let dst = (((w >> 10) & 0xFFF) as usize) * 8;
+               if d_opacity[rt] && (base..base + size).contains(&dst) {
+                  opacity_range = Some(dst - base);
+               }
+            // `str sT, [sp, #imm12*4]`
+            } else if w & 0xFFC0_03E0 == 0xBD00_03E0 {
+               let rt = (w & 0x1F) as u8;
+               let dst = (((w >> 10) & 0xFFF) as usize) * 4;
+               if (base..base + size).contains(&dst) {
+                  fp_stores.push((rt, dst - base));
+               }
+            } else {
+               let rd = (w & 0x1F) as usize;
+               imm_val[rd] = None;
+               adrp_page[rd] = None;
+               ptr_reg[rd] = None;
+            }
+         },
+         _ => {},
+      }
+   }
+
+   let ptr_slot = ptr_slot.ok_or("modal-scale ptr slot not found")?;
+   let ss_slot = ptr_slot
+      .checked_sub(8)
+      .ok_or("modal-scale SharedString slot underflow")?;
+   if !byte_imm_stores.contains(&(ss_slot, 0x18))
+      || !qword_stores.contains(&(ptr_slot + 8, Some(MODAL_SCALE.len() as u64)))
+   {
+      return Err("modal-scale SharedString shape changed".to_owned());
+   }
+   let (id_tmp, element_id) = vec_copies
+      .iter()
+      .find_map(|&(src, dst)| {
+         (src <= ss_slot && ss_slot < src + 32 && (base..base + size).contains(&dst))
+            .then_some((src, dst - base))
+      })
+      .ok_or("ScaleFade element_id copy not found")?;
+   let element_id_str = ss_slot - id_tmp;
+   let (element_id_tag_off, element_id_tag) = byte_imm_stores
+      .iter()
+      .find_map(|&(slot, val)| {
+         ((id_tmp..id_tmp + 0x28).contains(&slot) && slot != ss_slot)
+            .then_some((slot - id_tmp, val))
+      })
+      .ok_or("ScaleFade ElementId tag not found")?;
+   let element_id_key = qword_stores
+      .iter()
+      .find_map(|&(slot, _)| {
+         ((id_tmp..id_tmp + 0x28).contains(&slot) && slot != ptr_slot && slot != ptr_slot + 8)
+            .then_some(slot - id_tmp)
+      })
+      .ok_or("ScaleFade ElementId key slot not found")?;
+
+   let child_tmp = child_tmp.ok_or("ScaleFade child sret slot not found")?;
+   let child = vec_copies
+      .iter()
+      .find_map(|&(src, dst)| {
+         (src == child_tmp && (base..base + size).contains(&dst)).then_some(dst - base)
+      })
+      .ok_or("ScaleFade child copy not found")?;
+   let opacity_range = opacity_range.ok_or("ScaleFade opacity_range not found")?;
+   let label_none = byte_imm_stores
+      .iter()
+      .find_map(|&(dst, val)| {
+         (val == 0xFF && (base..base + size).contains(&dst)).then_some(dst - base)
+      })
+      .ok_or("ScaleFade label_none not found")?;
+   let fade = byte_imm_stores
+      .iter()
+      .find_map(|&(dst, val)| {
+         (val == 1 && (base..base + size).contains(&dst)).then_some(dst - base)
+      })
+      .ok_or("ScaleFade fade flag not found")?;
+   let origin = origin.ok_or("ScaleFade origin not found")?;
+
+   let [(r0, o0), (r1, o1)] = fp_stores.as_slice() else {
+      return Err(format!(
+         "ScaleFade expected 2 float stores, got {}",
+         fp_stores.len()
+      ));
+   };
+   let (progress, scale_from) = match (
+      clamped_fp[usize::from(*r0)],
+      clamped_fp[usize::from(*r1)],
+   ) {
+      (true, false) => (*o0, *o1),
+      (false, true) => (*o1, *o0),
+      _ => return Err("ScaleFade progress/scale_from ambiguous".to_owned()),
+   };
+
+   let layout = crate::desktop::validate_scale_fade_layout(crate::desktop::ScaleFadeLayout {
+      size,
+      child,
+      opacity_range,
+      label_none,
+      element_id,
+      element_id_tag_off,
+      element_id_tag,
+      element_id_key,
+      element_id_str,
+      progress,
+      scale_from,
+      origin,
+      fade,
+   })?;
+   Ok(crate::desktop::ScaleFade {
+      into_any,
+      caller_loc,
+      layout,
+   })
+}
+
 #[cfg(test)]
 mod tests {
    use super::*;
