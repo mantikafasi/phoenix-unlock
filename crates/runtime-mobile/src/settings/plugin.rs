@@ -102,12 +102,12 @@ pub fn plugin_sections(index: usize, plugin: &PluginInfo) -> Vec<Tree> {
 fn setting_controls(index: usize, plugin: &PluginInfo) -> (Vec<Tree>, Vec<Tree>) {
    let mut rows = Vec::new();
    let mut fields = Vec::new();
-   for (at, setting) in plugin.settings.iter().enumerate() {
-      let press = Press::Setting(index, at);
+   for setting in &plugin.settings {
+      let press = Press::Setting(index, setting.key.clone());
       let description = setting.description.as_deref();
       let field = |value: &str, entry| {
          let input = text_field(
-            Field::Setting(index, at),
+            Field::Setting(index, setting.key.clone()),
             None,
             description.unwrap_or(""),
             value,
@@ -122,7 +122,7 @@ fn setting_controls(index: usize, plugin: &PluginInfo) -> (Vec<Tree>, Vec<Tree>)
                &setting.title,
                description,
                *on,
-               press,
+               press.clone(),
                press,
             ));
          },
@@ -137,13 +137,13 @@ fn setting_controls(index: usize, plugin: &PluginInfo) -> (Vec<Tree>, Vec<Tree>)
          Control::Secret(current) => fields.push(field(current, InputKind::Secret)),
          Control::Number(number) => fields.push(field(&number.to_string(), InputKind::Number)),
          Control::Select { options, chosen } => {
-            let rows = (0..)
-               .zip(options)
-               .map(|(option, choice)| {
+            let rows = options
+               .iter()
+               .map(|choice| {
                   select_row(
                      &choice.label,
                      choice.value == *chosen,
-                     Press::Choose(index, at, option),
+                     Press::Choose(index, setting.key.clone(), choice.value.clone()),
                   )
                })
                .collect();

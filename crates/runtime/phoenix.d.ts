@@ -961,9 +961,19 @@ declare namespace Phoenix {
     keys(): string[];
   }
 
+  /// Snapshot of a plugin's non-button setting values passed to dynamic predicates.
+  type SettingValuesMap = Readonly<Record<string, boolean | number | string>>;
+
+  interface SettingChoice {
+    value: string;
+    label?: string;
+  }
+
   interface SpecBase {
     title: string;
     description?: string;
+    /// Controls whether the setting is shown in Settings. Hidden settings keep their saved value.
+    visible?: boolean | ((settings: SettingValuesMap) => boolean | number | string);
   }
 
   type SettingSpec =
@@ -977,10 +987,10 @@ declare namespace Phoenix {
       })
     /// Text shown masked, and replaced with `[redacted]` in the plugin's log lines.
     | (SpecBase & { type: "secret"; default?: string; onChange?(value: string): void })
-    /// One of a fixed list, shown as rows with a checkmark. Defaults to the first option.
+    /// One of a static or dynamic list, shown as rows with a checkmark. Defaults to the first option.
     | (SpecBase & {
         type: "select";
-        options: readonly { value: string; label?: string }[];
+        options: readonly SettingChoice[] | ((settings: SettingValuesMap) => readonly SettingChoice[]);
         default?: string;
         onChange?(value: string): void;
       })
@@ -992,11 +1002,13 @@ declare namespace Phoenix {
     ? boolean
     : S extends { type: "select"; options: readonly { value: infer V }[] }
       ? V
-      : S extends { type: "text" | "secret" }
-      ? string
-      : S extends { type: "number" }
-        ? number
-        : never;
+      : S extends { type: "select" }
+        ? string
+        : S extends { type: "text" | "secret" }
+          ? string
+          : S extends { type: "number" }
+            ? number
+            : never;
 
   type SettingValues<S> = {
     readonly [K in keyof S as S[K] extends { type: "button" } ? never : K]: SettingValue<S[K]>;
@@ -1007,6 +1019,8 @@ declare namespace Phoenix {
     /// the user's current choice, so read it when needed instead of caching it. Text and number
     /// fields save when the keyboard's go key is pressed.
     define<const S extends Record<string, SettingSpec>>(schema: S): SettingValues<S>;
+    /// Re-evaluates dynamic visibility and select options and redraws open Settings pages.
+    refresh(): void;
   }
 
   interface Api {

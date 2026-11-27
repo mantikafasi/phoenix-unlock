@@ -24,6 +24,7 @@ const settings = phoenix.settings.define({
     title: "Link text",
     description: "{{NAME}} is replaced with the emoji's name",
     default: "{{NAME}}",
+    visible: (s) => s.useHyperLinks,
   },
   renderFakeEmojis: {
     type: "switch",

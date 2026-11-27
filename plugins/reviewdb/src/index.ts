@@ -24,9 +24,24 @@ const settings = phoenix.settings.define({
     description: "Only if logging in with Discord doesn't work: paste a token here",
     default: "",
   },
-  login: { type: "button", title: "Log in to ReviewDB", onPress: () => void loginAndTell() },
-  logout: { type: "button", title: "Log out of ReviewDB", onPress: () => logout("Logged out of ReviewDB") },
-  blocks: { type: "button", title: "Blocked ReviewDB users", onPress: () => void showBlocks() },
+  login: {
+    type: "button",
+    title: "Log in to ReviewDB",
+    visible: () => !phoenix.storage.get<string>("token"),
+    onPress: () => void loginAndTell(),
+  },
+  logout: {
+    type: "button",
+    title: "Log out of ReviewDB",
+    visible: () => Boolean(phoenix.storage.get<string>("token")),
+    onPress: () => logout("Logged out of ReviewDB"),
+  },
+  blocks: {
+    type: "button",
+    title: "Blocked ReviewDB users",
+    visible: (s) => Boolean(String(s.token).trim() || phoenix.storage.get<string>("token")),
+    onPress: () => void showBlocks(),
+  },
 });
 
 interface Sender {
@@ -88,6 +103,7 @@ function redraw(userId?: string) {
 function logout(why?: string) {
   phoenix.storage.delete("token");
   phoenix.storage.delete("me");
+  phoenix.settings.refresh?.();
   if (why) phoenix.ui.toast(settings.token.trim() ? `${why}, but a pasted token is still set` : why);
   for (const known of profiles.values()) known.votes.clear();
   redraw();
@@ -134,6 +150,7 @@ async function login() {
   if (!reply.success || !reply.token) throw new Error(reply.message || "ReviewDB login failed");
   phoenix.storage.set("token", reply.token);
   phoenix.storage.delete("me");
+  phoenix.settings.refresh?.();
   await me();
   phoenix.ui.toast("Logged in to ReviewDB");
   for (const known of profiles.values()) known.page = undefined;
