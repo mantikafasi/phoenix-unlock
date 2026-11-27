@@ -793,6 +793,60 @@ pub(crate) fn callees(image: &Image<'_>, start: usize, end: usize) -> Vec<usize>
    out
 }
 
+/// The general playback allowlist and the rank fallback's table reference.
+#[derive(Clone, Copy, Debug)]
+pub struct PlaybackAllowlist {
+   /// The `lea` displacement field to retarget.
+   pub disp:      usize,
+   /// The table-length immediate to widen.
+   pub len_imm:   usize,
+   /// The table now referenced by the fallback.
+   pub current:   usize,
+   /// The table that also names the AAC decoders.
+   pub allowlist: usize,
+}
+
+/// The Linux playback policy ranks decoder features itself. Its fallback uses
+/// only the three software video decoders, even though its general allowlist
+/// also names `avdec_aac` and `fdkaacdec`; retargeting that one lookup keeps
+/// the AAC decoders usable to `decodebin`.
+pub fn playback_allowlist(image: &Image<'_>) -> Found<PlaybackAllowlist> {
+   if Abi::of(image) != Abi::SysV {
+      return Err("playback allowlist is a Linux locator".to_owned());
+   }
+   let fallback = one(
+      "decoder rank fallback",
+      &image.scan(Pattern::new(
+         "48 83 EC 28 48 89 7C 24 08 48 89 74 24 10 48 89 54 24 18 48 89 4C 24 20 48 8D 35 ?? ?? \
+          ?? ?? 48 8D 7C 24 08 BA 03 00 00 00 FF 15 ?? ?? ?? ??",
+      )),
+   )?;
+   let current =
+      rel32_target(image, fallback + 27).ok_or("decoder rank fallback table does not decode")?;
+   let sites = image.scan(Pattern::new(
+      "BA 16 00 00 00 48 8D BC 24 ?? ?? ?? ?? 48 8D 35 ?? ?? ?? ?? FF 15",
+   ));
+   let mut targets = HashSet::new();
+   for site in sites {
+      if let Some(target) = rel32_target(image, site + 16) {
+         targets.insert(target);
+      }
+   }
+   let allowlist = one(
+      "playback allowlist table",
+      &targets.into_iter().collect::<Vec<_>>(),
+   )?;
+   if allowlist == current {
+      return Err("playback allowlist already backs decoder ranks".to_owned());
+   }
+   Ok(PlaybackAllowlist {
+      disp: fallback + 27,
+      len_imm: fallback + 37,
+      current,
+      allowlist,
+   })
+}
+
 /// Where the runtime makes the `surfaces` notification provider decline.
 ///
 /// On System V, `client_access::enforced`'s start, to return false. On Win64,
@@ -4946,8 +5000,9 @@ pub(crate) fn validate_scale_fade_layout(layout: ScaleFadeLayout) -> Found<Scale
 
 /// Shared call-graph search for [`animation_frame`] and
 /// [`crate::macos::animation_frame`]: runs bounded BFS from `"modal-layer-scrim"`
-/// callees to the 12-byte closure scheduler (`on_next_frame_notify`), then picks
-/// the unique short caller whose targets are a subset of the spring tick's.
+/// callees to the 12-byte closure scheduler (`on_next_frame_notify`), then
+/// picks the unique short caller whose targets are a subset of the spring
+/// tick's.
 pub(crate) fn find_animation_frame(
    roots: Vec<usize>,
    func_targets: impl Fn(usize) -> Vec<usize>,

@@ -345,10 +345,7 @@ mod linux {
       // SAFETY: the cache owns one strong count; this hands out another. Main
       // thread only.
       unsafe { *(ptr as *mut usize) += 1 };
-      DisplayRc {
-         ptr,
-         vtable,
-      }
+      DisplayRc { ptr, vtable }
    }
 
    fn first_display(hook: &PrimaryDisplay, platform: *const u8) -> Option<(usize, usize)> {
@@ -415,8 +412,41 @@ mod linux {
 
    pub struct Linux;
 
+   /// Retargets Phoenix's decoder-rank fallback from its three software video
+   /// decoders to its general playback allowlist, which also names the system
+   /// AAC decoders it intends to use.
+   fn playback_allowlist(image: &Image<'static>) {
+      let found = match desktop::playback_allowlist(image) {
+         Ok(found) => found,
+         Err(err) => {
+            log::warn!("desktop video: {err}");
+            return;
+         },
+      };
+      let end = found.disp + 4;
+      let Ok(disp) = i32::try_from(found.allowlist as i64 - end as i64) else {
+         log::warn!("desktop video: playback allowlist is out of range");
+         return;
+      };
+      // SAFETY: rewrites the located table operand and entry count during
+      // `prepare`, before Discord's playback threads run.
+      let changed = unsafe { image.write_code(found.disp, &disp.to_le_bytes()) }
+         .and_then(|()| unsafe { image.write_code(found.len_imm, &[0x16]) });
+      match changed {
+         Ok(()) => {
+            log::info!(
+               "desktop video: using the playback allowlist for decoder ranks ({:#x} -> {:#x})",
+               found.current,
+               found.allowlist,
+            );
+         },
+         Err(err) => log::warn!("desktop video: {err}"),
+      }
+   }
+
    impl DesktopOs for Linux {
       fn install(image: &Image<'static>) {
+         playback_allowlist(image);
          skip_va_scaler(image);
          install_primary_display(image);
          let found = match desktop::wayland_frame(image) {

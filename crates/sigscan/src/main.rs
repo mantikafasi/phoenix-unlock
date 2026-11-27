@@ -326,7 +326,10 @@ fn check(
          );
          report("settings layer", desktop::settings_layer(image).map(at));
          report("animation frame", desktop::animation_frame(image).map(at));
-         report("notification gate", desktop::notification_gate(image).map(at));
+         report(
+            "notification gate",
+            desktop::notification_gate(image).map(at),
+         );
          report(
             "paste limit",
             desktop::paste_limit(image)
@@ -338,6 +341,17 @@ fn check(
                .map(|limit| format!("nitro {}, base {}", at(limit.nitro), at(limit.base))),
          );
          if abi == x86::Abi::SysV {
+            report(
+               "playback allowlist",
+               desktop::playback_allowlist(image).map(|found| {
+                  format!(
+                     "allowlist {} (rank table {}, len immediate {})",
+                     at(found.allowlist),
+                     at(found.current),
+                     at(found.len_imm),
+                  )
+               }),
+            );
             report(
                "wayland frame",
                desktop::wayland_frame(image).map(|found| {
