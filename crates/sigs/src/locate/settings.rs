@@ -102,10 +102,16 @@ pub fn settings_visibility(ix: &Index<'_>) -> Found<Vec<VisibilityGuard>> {
          })
       })
    };
+   // A compare with 15 among the first instructions rejects nearly every function cheaply.
    let found = ix
-      .heads(HEAD, |head| guard(head).is_some())
+      .heads(OPENS, |head| {
+         head
+            .iter()
+            .skip(1)
+            .any(|step| matches!(step.op, Op::Cmp { value: 15, .. }))
+      })
       .into_iter()
-      .filter_map(|func| guard(&func.steps()))
+      .filter_map(|func| guard(&func.head(HEAD)))
       .collect::<Vec<_>>();
    match found.len() {
       1..=4 => Ok(found),
@@ -286,10 +292,21 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
    }
    let page = isize::try_from(page_offset).map_err(|err| err.to_string())?;
    // Windows stores a drop flag between the load and the call, Linux doesn't.
+   // Linux may widen the load to the page's whole dword, straight into the
+   // first argument.
+   let first = ix.isa.arg(0);
    let selected = steps
       .iter()
       .enumerate()
-      .filter(|(_, step)| matches!(step.op, Op::Load { offset, size: 1, .. } if offset == page))
+      .filter(|(_, step)| {
+         matches!(
+            step.op,
+            Op::Load { offset, size: 1, .. } if offset == page
+         ) || matches!(
+            step.op,
+            Op::Load { reg, offset, size: 4, .. } if offset == page && Some(reg) == first
+         )
+      })
       .filter_map(|(at, _)| {
          steps.get(at + 1..at + 3)?.iter().find_map(|step| {
             match step.op {
@@ -440,8 +457,11 @@ fn named<'a>(
    (0..count).find(|&index| name_of(index) == Some(name.as_bytes()))
 }
 
-/// Settings' page-changed handler, `fn(state, cx)`: it reads the page byte
-/// early, and at least three page setters call it right after storing it.
+/// Settings' page-changed handler, `fn(state, cx)`.
+///
+/// It is one of the functions that can panic in
+/// `nav/settings/user/host/load.rs`, reads the page byte early, and at least
+/// three page setters call it right after storing it.
 ///
 /// The setters a sidebar row runs store and call unconditionally, so clicking
 /// the page already shown calls it too.
@@ -461,8 +481,9 @@ pub fn settings_page_changed(ix: &Index<'_>, page_offset: usize) -> Found<usize>
    let stores =
       |step: &Step| matches!(step.op, Op::Store { offset: at, size: 1, .. } if at == offset);
    let found = ix
-      .heads(HEAD, reads)
+      .source("settings/user/host/load.rs")
       .into_iter()
+      .filter(|handler| reads(&handler.head(HEAD)))
       .filter(|handler| {
          let setters = handler.callers().into_iter().filter(|setter| {
             let steps = setter.steps();

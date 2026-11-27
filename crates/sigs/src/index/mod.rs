@@ -293,8 +293,7 @@ impl<'img> Index<'img> {
          part
             .iter()
             .filter(|&&(start, end)| {
-               let head = op::decode(self.image, self.isa, start, end.min(start + bytes));
-               keep(&head[..head.len().min(steps)])
+               keep(&op::decode_head(self.image, self.isa, start, end.min(start + bytes), steps))
             })
             .map(|&(start, _)| start)
             .collect::<Vec<_>>()
@@ -566,6 +565,12 @@ impl<'ix> Func<'ix> {
    #[must_use]
    pub fn steps(&self) -> Vec<Step> {
       op::decode(self.ix.image, self.ix.isa, self.start, self.end)
+   }
+
+   /// The first `count` steps, decoding no further.
+   #[must_use]
+   pub fn head(&self, count: usize) -> Vec<Step> {
+      op::decode_head(self.ix.image, self.ix.isa, self.start, self.end, count)
    }
 
    /// The functions this one calls, in instruction order, tail jumps
