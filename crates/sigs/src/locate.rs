@@ -6,6 +6,9 @@ pub mod message;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod settings;
 
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod gpui;
+
 use crate::{
    Found,
    index::{
@@ -44,6 +47,12 @@ pub const LOCATORS: &[Locator] = &[
       name:     "media fetch",
       families: DESKTOP,
       run:      |ix| media_fetch(ix).map(|func| format!("{func:?}")),
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "gpui builders",
+      families: DESKTOP,
+      run:      |ix| gpui::gpui(ix).map(|found| format!("{found:x?}")),
    },
    Locator {
       name:     "emoji check",

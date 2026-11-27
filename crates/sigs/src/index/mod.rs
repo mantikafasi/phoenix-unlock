@@ -400,6 +400,27 @@ impl<'img> Index<'img> {
       })
    }
 
+   /// The [`Location`] stored at `addr`, if one is.
+   #[must_use]
+   pub fn location_at(&self, addr: usize) -> Option<Location> {
+      let width = self.image.pointer_width;
+      let file = StrSlot {
+         slot: addr,
+         ptr:  self.image.read_usize(addr)?,
+         len:  self.image.read_usize(addr + width)?,
+      };
+      if file.len > MAX_STR || !self.image.read(file.ptr, file.len)?.ends_with(b".rs") {
+         return None;
+      }
+      let line = self.image.read_u32(addr + 2 * width)?;
+      let column = self.image.read_u32(addr + 2 * width + 4)?;
+      ((1..1_000_000).contains(&line) && (1..1_000).contains(&column)).then_some(Location {
+         file,
+         line,
+         column,
+      })
+   }
+
    /// The functions that can panic at a [`Location`] in a file whose path
    /// ends in `suffix`, `/` matching either separator.
    #[must_use]
@@ -542,14 +563,25 @@ impl<'ix> Func<'ix> {
    #[must_use]
    pub fn calls(&self) -> Vec<usize> {
       self
+         .calls_at()
+         .into_iter()
+         .map(|(_, callee)| callee)
+         .collect()
+   }
+
+   /// [`Func::calls`] with the address of each call site.
+   #[must_use]
+   pub fn calls_at(&self) -> Vec<(usize, usize)> {
+      self
          .steps()
          .iter()
          .filter_map(|step| {
-            match step.op {
+            let callee = match step.op {
                Op::Call(target) => self.through_outlined(target),
                Op::Jump(target) if !(self.start..self.end).contains(&target) => Some(target),
                _ => None,
-            }
+            }?;
+            Some((step.at, callee))
          })
          .collect()
    }
@@ -594,6 +626,21 @@ impl<'ix> Func<'ix> {
    #[must_use]
    pub fn callers(&self) -> Funcs<'ix> {
       self.ix.funcs(self.ix.call_sites(self.start))
+   }
+
+   /// The function after this one in the image.
+   #[must_use]
+   pub fn next(&self) -> Option<Self> {
+      let at = self
+         .ix
+         .functions
+         .partition_point(|&(start, _)| start < self.end);
+      let &(start, end) = self.ix.functions.get(at)?;
+      Some(Self {
+         ix: self.ix,
+         start,
+         end,
+      })
    }
 
    /// The `n`th function this one calls.
