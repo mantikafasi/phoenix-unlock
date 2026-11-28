@@ -3,6 +3,7 @@
 
 pub mod commands;
 pub mod fonts;
+#[cfg(windows)] pub mod message_hooks;
 pub mod native;
 pub mod themes;
 pub mod ui;
@@ -93,6 +94,8 @@ pub struct Desktop<'js> {
    pub idle_off:         RefCell<Vec<(u64, String, Timer)>>,
    /// `phoenix.commands.register` commands by lowercase name.
    pub commands:         RefCell<HashMap<String, Registered<'js>>>,
+   #[cfg(windows)]
+   message_hooks:        RefCell<message_hooks::Hooks<'js>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -110,14 +113,7 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
    type Changed<'to> = Desktop<'to>;
 }
 
-/// Drops the accessories, member decorations, context menu actions, open page
-/// callbacks, banners, emoji pick handlers, hidden counts, call idle holds,
-/// sidebar collapses, header and composer buttons and shortcuts `name`
-/// registered and redraws Discord without them.
-pub fn unload(ctx: &Ctx<'_>, name: &str) {
-   let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
-      return;
-   };
+fn unload_accessories(registry: &Desktop<'_>, name: &str) {
    let mut list = registry.accessories.borrow_mut();
    let before = list.len();
    list.retain(|entry| entry.plugin != name);
@@ -126,7 +122,19 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       accessories::clear_cache();
       accessories::invalidate_discord_windows();
    }
-   drop(list);
+}
+
+/// Drops the accessories, member decorations, context menu actions, open page
+/// callbacks, banners, emoji pick handlers, hidden counts, call idle holds,
+/// sidebar collapses, header and composer buttons and shortcuts `name`
+/// registered and redraws Discord without them.
+pub fn unload(ctx: &Ctx<'_>, name: &str) {
+   let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+      return;
+   };
+   #[cfg(windows)]
+   registry.message_hooks.borrow_mut().remove(|hook| hook.plugin == name);
+   unload_accessories(&registry, name);
 
    for place in [Place::Members, Place::Headers] {
       let mut decorations = registry.decorations(place).borrow_mut();

@@ -1051,12 +1051,11 @@ pub fn send_channel_id(path: &str) -> Option<&str> {
 /// Desktop has no composer hook, so `phoenix.messages.onSend` runs on the
 /// request that posts a message, before the shared request hooks.
 fn observe(method: &str, url: &str, headers: &[(String, String)], body: &[u8]) -> RequestAction {
-   if let Some(action) =
-      api_path(url).and_then(|path| commands::intercept(method, path, body))
-   {
+   let path = api_path(url);
+   if let Some(action) = path.and_then(|path| commands::intercept(method, path, body)) {
       return action;
    }
-   let channel = api_path(url)
+   let channel = path
       .filter(|_| method.eq_ignore_ascii_case("POST"))
       .and_then(send_channel_id);
    let sent = channel.map_or(RequestAction::Pass, |channel| {
@@ -1064,15 +1063,22 @@ fn observe(method: &str, url: &str, headers: &[(String, String)], body: &[u8]) -
          crate::js::ui::intercept_send_body(&engine, channel, body)
       })
    });
-   match sent {
-      RequestAction::Pass => observe_request(method, url, headers, body),
-      RequestAction::Drop => RequestAction::Drop,
-      RequestAction::Replace(sent) => {
-         match observe_request(method, url, headers, &sent) {
-            RequestAction::Pass => RequestAction::Replace(sent),
-            hooked => hooked,
-         }
-      },
+   let sent = match sent {
+      RequestAction::Pass => None,
+      RequestAction::Drop => return RequestAction::Drop,
+      RequestAction::Replace(body) => Some(body),
+   };
+   #[cfg(windows)]
+   let sent = match path.map_or(RequestAction::Pass, |path| {
+      crate::js::message_hooks::intercept(method, path, headers, sent.as_deref().unwrap_or(body))
+   }) {
+      RequestAction::Pass => sent,
+      RequestAction::Drop => return RequestAction::Drop,
+      RequestAction::Replace(body) => Some(body),
+   };
+   match observe_request(method, url, headers, sent.as_deref().unwrap_or(body)) {
+      RequestAction::Pass => sent.map_or(RequestAction::Pass, RequestAction::Replace),
+      action => action,
    }
 }
 
