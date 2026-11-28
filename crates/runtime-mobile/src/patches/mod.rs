@@ -389,6 +389,7 @@ struct Patches {
    commands:       Vec<Command>,
    interceptors:   usize,
    pickers:        usize,
+   sticker_picks:  usize,
    event_hooks:    Vec<EventHookMeta>,
    node_watchers:  Vec<NodeWatcher>,
    prop_rules:     Vec<PropPatch>,
@@ -680,6 +681,15 @@ pub fn set_emoji_pickers(count: usize) {
    }
    patches().pickers = count;
    emoji::unlock(count > 0);
+}
+
+/// How many `onStickerPick` handlers plugins hold, so sticker presses in the
+/// picker are taken only while one exists.
+pub fn set_sticker_pickers(count: usize) {
+   if count > 0 {
+      ACTIVE.store(true, Ordering::Release);
+   }
+   patches().sticker_picks = count;
 }
 
 /// Drops everything `plugin` added.

@@ -22,6 +22,7 @@ use rquickjs::{
 
 use crate::{
    js::{
+      messages::Picker,
       ui::Callbacks,
       view::EventHook,
    },
@@ -40,6 +41,8 @@ pub struct Mobile<'js> {
    pub commands:      RefCell<HashMap<String, (String, Function<'js>)>>,
    /// `phoenix.messages.onEmojiPick` handlers in registration order, by id.
    pub pickers:       RefCell<Vec<(u64, String, Function<'js>)>>,
+   /// `phoenix.messages.onStickerPick` handlers in registration order, by id.
+   pub sticker_picks: RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.onEvent` handlers, by id.
    pub event_hooks:   RefCell<Vec<EventHook<'js>>>,
    /// `phoenix.ui.onNode` watchers, by id.
@@ -76,10 +79,11 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       .commands
       .borrow_mut()
       .retain(|_, (plugin, _)| plugin != name);
-   let mut pickers = registry.pickers.borrow_mut();
-   pickers.retain(|(_, plugin, _)| plugin != name);
-   patches::set_emoji_pickers(pickers.len());
-   drop(pickers);
+   for picker in Picker::ALL {
+      let mut handlers = picker.handlers(&registry).borrow_mut();
+      handlers.retain(|(_, plugin, _)| plugin != name);
+      picker.count(handlers.len());
+   }
    registry
       .event_hooks
       .borrow_mut()

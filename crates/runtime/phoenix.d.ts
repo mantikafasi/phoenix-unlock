@@ -1242,6 +1242,10 @@ declare namespace Phoenix {
     /// Reactions and the rest keep the lock, and nothing else about Nitro changes. Desktop has no
     /// picker presses to report: the handler is never called there, only the unlock applies.
     onEmojiPick(handler: (emojiId: string, ctx: UiContext) => string | void): Remover;
+    /// Runs when a sticker is pressed in the picker under the message box, with its id. Return
+    /// `true` to take the press, so Phoenix neither sends the sticker nor shows a Nitro ad, or
+    /// nothing to leave it to Phoenix. Desktop has no picker presses to report.
+    onStickerPick(handler: (stickerId: string, ctx: UiContext) => boolean | void): Remover;
   }
 
   /// `channelId` is the open channel, `reply` posts a local message there.

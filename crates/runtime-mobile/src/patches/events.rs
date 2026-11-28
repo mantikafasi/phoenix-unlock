@@ -192,6 +192,20 @@ impl Patches {
          });
          return true;
       }
+      if self.sticker_picks > 0
+         && event == Prop::PRESS.key()
+         && let Some(id) = self
+            .mirror
+            .accessibility_id(node)
+            .and_then(|aid| aid.strip_prefix("expression.sticker:"))
+         && self.in_message_picker(node)
+      {
+         queue(Job::Sticker {
+            id:    id.to_owned(),
+            frame: raw,
+         });
+         return true;
+      }
       if let Some(input) = self.sending(node, event)
          && let Some((_, text)) = self.mirror.composer()
       {

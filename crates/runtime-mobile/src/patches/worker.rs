@@ -146,6 +146,12 @@ pub enum Job {
       text:  String,
       frame: Vec<u8>,
    },
+   /// A press on sticker `id` in the picker, held for the `onStickerPick`
+   /// handlers.
+   Sticker {
+      id:    String,
+      frame: Vec<u8>,
+   },
    /// Re-apply declarative `PatchTarget::List` prop patches to live lists.
    RefreshPropPatches,
    /// Send a raw `Op::Update` requested by `phoenix.ui.update`.
@@ -282,6 +288,7 @@ pub fn run(job: Job) -> Vec<Op> {
          text,
          frame,
       } => emoji::pick(input, &id, text, &frame),
+      Job::Sticker { id, frame } => emoji::pick_sticker_press(&id, &frame),
       Job::RefreshPropPatches => patches().refresh_list_patches(),
       Job::UpdateNode { node, props } => vec![Op::Update { id: node, props }],
       Job::ViewEvent {

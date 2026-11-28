@@ -1,12 +1,16 @@
-//! Custom emoji presses in the emoji picker under the message box, for
-//! `phoenix.messages.onEmojiPick`, and Phoenix's emoji check, which while a
-//! handler exists stops locking emojis that need Nitro in the message box.
+//! Custom emoji and sticker presses in the picker under the message box, for
+//! `phoenix.messages.onEmojiPick` and `onStickerPick`, and Phoenix's emoji
+//! check, which while a handler exists stops locking emojis that need Nitro in
+//! the message box.
 
 use phoenix_ui_mobile::Op;
 
 use crate::{
    bridge,
-   js::messages::pick_emoji,
+   js::messages::{
+      pick_emoji,
+      pick_sticker,
+   },
    patches::{
       Patches,
       Place,
@@ -24,11 +28,7 @@ pub(super) fn pick(input: i32, id: &str, text: String, frame: &[u8]) -> Vec<Op> 
    let Some(insert) =
       phoenix_runtime::engine().and_then(|engine| pick_emoji(&engine, id, &context))
    else {
-      patches().resent.push(frame.to_owned());
-      if !bridge::inject(frame) {
-         patches().resent.retain(|sent| *sent != frame);
-         log::warn!("patches: the emoji picker did not take the press back");
-      }
+      give_back(frame);
       return Vec::new();
    };
    let text = text + &insert;
@@ -37,6 +37,24 @@ pub(super) fn pick(input: i32, id: &str, text: String, frame: &[u8]) -> Vec<Op> 
    }
    patches().mirror.set_composer_text(input, text.clone());
    vec![commands::force_text(input, &text)]
+}
+
+/// Gives Phoenix the press back unless an `onStickerPick` handler took it.
+pub(super) fn pick_sticker_press(id: &str, frame: &[u8]) -> Vec<Op> {
+   let context = press_context(&Place::Screen);
+   let taken = phoenix_runtime::engine().is_some_and(|engine| pick_sticker(&engine, id, &context));
+   if !taken {
+      give_back(frame);
+   }
+   Vec::new()
+}
+
+fn give_back(frame: &[u8]) {
+   patches().resent.push(frame.to_owned());
+   if !bridge::inject(frame) {
+      patches().resent.retain(|sent| *sent != frame);
+      log::warn!("patches: the picker did not take the press back");
+   }
 }
 
 impl Patches {

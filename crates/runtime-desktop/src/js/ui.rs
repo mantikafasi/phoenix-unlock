@@ -1512,8 +1512,8 @@ pub fn press_notice(id: u64) {
    });
 }
 
-/// Wires desktop `phoenix.ui`, `phoenix.messages.onSend` / `onEmojiPick`, and
-/// `phoenix.commands` onto the plugin's API objects.
+/// Wires desktop `phoenix.ui`, `phoenix.messages.onSend` / `onEmojiPick` /
+/// `onStickerPick`, and `phoenix.commands` onto the plugin's API objects.
 pub fn desktop_patch_api<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
@@ -1535,6 +1535,12 @@ pub fn desktop_patch_api<'js>(
          ctx.clone(),
          move |ctx: Ctx<'js>, _function: Opt<Value<'js>>| on_emoji_pick(&ctx, &name),
       )?,
+   )?;
+   messages.set(
+      "onStickerPick",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, _function: Opt<Value<'js>>| {
+         noop_handle(&ctx)
+      })?,
    )?;
    let commands = Object::new(ctx.clone())?;
    commands.set(
