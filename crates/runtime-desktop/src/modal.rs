@@ -8,6 +8,7 @@
 //! overlays.
 
 use std::{
+   collections::HashMap,
    ffi::c_void,
    mem::MaybeUninit,
    ops::{
@@ -166,6 +167,17 @@ pub enum ModalSection {
       checked:     bool,
       on_toggle:   Arc<dyn Fn(bool) + Send + Sync>,
    },
+   /// A native text box holding `initial` when the page opens, whose text
+   /// goes to `on_change` on a worker thread each time it changes. Its `id`
+   /// keeps the same box across frames.
+   Field {
+      id:          String,
+      label:       String,
+      description: Option<String>,
+      initial:     String,
+      multiline:   bool,
+      on_change:   Arc<dyn Fn(String) + Send + Sync>,
+   },
 }
 
 /// Specification for a native GPUI plugin page (`phoenix.ui.openPage`).
@@ -222,6 +234,8 @@ struct CodeEditorModal {
    plugin:       String,
    pending_init: Option<String>,
    status:       FieldStatus,
+   /// The page it opened over, which comes back when it closes.
+   under:        Option<(u64, PageModalSpec)>,
 }
 
 #[derive(Clone)]
@@ -241,25 +255,16 @@ impl FieldStatus {
    }
 }
 
-/// What a plugin's text, number or secret setting holds.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum FieldKind {
-   Text,
-   /// Text over several lines, in a `TextArea`.
-   Lines,
-   Number,
-   /// Starts empty rather than showing the stored value.
-   Secret,
-}
-
-/// A plugin setting edited in the one-line field.
+/// A plugin's secret setting, typed into the one-line field. Other settings
+/// are edited in place on the plugin's page, but a secret is never drawn, so
+/// the field starts empty.
 #[derive(Clone)]
 pub struct SettingField {
-   pub plugin:  String,
-   pub key:     String,
-   pub title:   String,
-   pub initial: String,
-   pub kind:    FieldKind,
+   pub plugin: String,
+   pub key:    String,
+   pub title:  String,
+   /// Runs on a worker thread once the value is saved.
+   pub then:   Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A one-line field a plugin asks for, like `phoenix.ui.addProfileTab`'s
@@ -284,6 +289,8 @@ struct InstallUrlModal {
    target:       FieldTarget,
    pending_init: Option<String>,
    status:       FieldStatus,
+   /// The page it opened over, which comes back when it closes.
+   under:        Option<(u64, PageModalSpec)>,
 }
 
 #[derive(Clone)]
@@ -707,6 +714,7 @@ fn snapshot_modal(modal: &mut ActiveModal, take_init: bool) -> Snapshot {
                None
             },
             status:       ed.status.clone(),
+            under:        None,
          })
       },
       ActiveModal::InstallUrl(inst) => {
@@ -718,6 +726,7 @@ fn snapshot_modal(modal: &mut ActiveModal, take_init: bool) -> Snapshot {
                None
             },
             status:       inst.status.clone(),
+            under:        None,
          })
       },
    }
@@ -816,16 +825,80 @@ fn wrap_scale_fade(
 /// Main-thread-owned GPUI `Entity<FieldState>` handles, lazily created on first
 /// render when `window` and `app` are live.
 struct FieldEntities {
-   url:  Option<RawEntity>,
-   code: Option<RawEntity>,
+   url:    Option<RawEntity>,
+   code:   Option<RawEntity>,
+   search: Option<RawEntity>,
 }
 
 static FIELD_ENTITIES: LazyLock<Mutex<FieldEntities>> = LazyLock::new(|| {
    Mutex::new(FieldEntities {
-      url:  None,
-      code: None,
+      url:    None,
+      code:   None,
+      search: None,
    })
 });
+
+/// A page's text box, with the text last seen in it, and whether it waits to
+/// be filled from its section's `initial`.
+struct PageFieldState {
+   entity: RawEntity,
+   seen:   String,
+   refill: bool,
+}
+
+/// Page text boxes by section id, kept while Discord runs.
+static PAGE_FIELDS: LazyLock<Mutex<HashMap<String, PageFieldState>>> =
+   LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Fills every page text box from its section's value again on its next
+/// frame, for a page that opens fresh.
+pub fn refill_page_fields() {
+   for field in PAGE_FIELDS
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .values_mut()
+   {
+      field.refill = true;
+   }
+}
+
+/// Which kept field entity a field draws: the modals' one-line and multiline
+/// fields, or the Sunbird page's search box.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldSlot {
+   Url,
+   Code,
+   Search,
+}
+
+/// A text box drawn on a page, and what it holds.
+pub struct PageField {
+   pub element: RawAnyElement,
+   pub text:    String,
+}
+
+/// The Sunbird page's search box, which keeps its text while the page is
+/// closed.
+pub fn search_field(app: *mut c_void, window: *mut c_void) -> Option<PageField> {
+   let tf = FIELD_SYM.get()?;
+   // SAFETY: called from the settings section's render on the GPUI main
+   // thread, with its live `app` and `window`.
+   let ent =
+      unsafe { ensure_field_entity(app, window, FieldSlot::Search, "Search for a plugin...") }?;
+   // SAFETY: as above, and the field's entity is not leased while the section
+   // renders.
+   let text = unsafe { read_field_text(app, &ent) }.unwrap_or_default();
+   // SAFETY: builds a hosted `TextInput` from `&Entity<FieldState>` in a
+   // buffer that fits it, and moves it into an `AnyElement`.
+   let element = unsafe {
+      let mut ti = RawTextInput::zeroed();
+      (tf.text_input_new)(&raw mut ti, &raw const ent);
+      let mut any = MaybeUninit::<RawAnyElement>::uninit();
+      (tf.text_input_into_any)(any.as_mut_ptr(), &raw mut ti);
+      any.assume_init()
+   };
+   Some(PageField { element, text })
+}
 
 #[derive(Clone)]
 enum ModalAction {
@@ -1333,7 +1406,11 @@ pub fn open_choice(
    resolve_pending_choice();
    let under = match active_modal().active.as_ref() {
       Some(ActiveModal::Page { id, spec }) => Some((*id, spec.clone())),
-      Some(ActiveModal::Choice { under, .. }) => under.clone(),
+      Some(
+         ActiveModal::Choice { under, .. }
+         | ActiveModal::InstallUrl(InstallUrlModal { under, .. })
+         | ActiveModal::CodeEditor(CodeEditorModal { under, .. }),
+      ) => under.clone(),
       _ => None,
    };
 
@@ -1419,7 +1496,15 @@ fn uncover(closing: &ActiveModal) -> Option<ActiveModal> {
       ActiveModal::Choice {
          under: Some((id, spec)),
          ..
-      } => {
+      }
+      | ActiveModal::InstallUrl(InstallUrlModal {
+         under: Some((id, spec)),
+         ..
+      })
+      | ActiveModal::CodeEditor(CodeEditorModal {
+         under: Some((id, spec)),
+         ..
+      }) => {
          Some(ActiveModal::Page {
             id:   *id,
             spec: spec.clone(),
@@ -1463,10 +1548,12 @@ pub fn close_page(id: u64) {
 /// Opens a native GPUI multiline code editor modal for `plugin`.
 pub fn open_code_editor(plugin: String, initial_source: String) {
    resolve_pending_choice();
+   let under = page_shown();
    set_active(ActiveModal::CodeEditor(CodeEditorModal {
       plugin,
       pending_init: Some(initial_source),
       status: FieldStatus::Idle,
+      under,
    }));
 }
 
@@ -1477,17 +1564,28 @@ pub fn open_install_url() {
       target:       FieldTarget::Install,
       pending_init: Some(String::new()),
       status:       FieldStatus::Idle,
+      under:        None,
    }));
 }
 
-/// Opens the one-line field on a plugin's text, number or secret setting.
+/// Opens the one-line field on a plugin's secret setting.
 pub fn open_setting_editor(field: SettingField) {
    resolve_pending_choice();
+   let under = page_shown();
    set_active(ActiveModal::InstallUrl(InstallUrlModal {
-      pending_init: Some(field.initial.clone()),
-      target:       FieldTarget::Setting(field),
-      status:       FieldStatus::Idle,
+      pending_init: Some(String::new()),
+      target: FieldTarget::Setting(field),
+      status: FieldStatus::Idle,
+      under,
    }));
+}
+
+/// The page on screen, which a field opened over it returns to.
+fn page_shown() -> Option<(u64, PageModalSpec)> {
+   match active_modal().active.as_ref() {
+      Some(ActiveModal::Page { id, spec }) => Some((*id, spec.clone())),
+      _ => None,
+   }
 }
 
 /// Opens the one-line field for `prompt`, which gets the text when it is
@@ -1498,37 +1596,28 @@ pub fn open_prompt(prompt: Prompt) {
       target:       FieldTarget::Prompt(prompt),
       pending_init: Some(String::new()),
       status:       FieldStatus::Idle,
+      under:        None,
    }));
 }
 
 /// Stores the field's text as `field`'s value and closes the modal, or says
 /// why it can't.
 fn save_setting(app: *mut c_void, field: &SettingField) {
-   let raw = if field.kind == FieldKind::Lines {
-      read_code_field(app)
-   } else {
-      read_url_field(app)
-   };
-   let Some(raw) = raw else {
+   let Some(raw) = read_url_field(app) else {
       set_install_status(FieldStatus::Failed(
          "Could not read the text field".to_owned(),
       ));
       return;
    };
-   let text = raw.trim();
-   let value = if field.kind == FieldKind::Number {
-      match text.parse::<f64>() {
-         Ok(number) if number.is_finite() => phoenix_runtime::Chosen::Number(number),
-         _ => {
-            set_install_status(FieldStatus::Failed("Enter a number".to_owned()));
-            return;
-         },
-      }
-   } else {
-      phoenix_runtime::Chosen::Text(text.to_owned())
-   };
-   phoenix_runtime::set_setting(&field.plugin, &field.key, value);
+   phoenix_runtime::set_setting(
+      &field.plugin,
+      &field.key,
+      phoenix_runtime::Chosen::Text(raw.trim().to_owned()),
+   );
    close_active();
+   if let Some(then) = field.then.clone() {
+      std::thread::spawn(move || then());
+   }
 }
 
 fn close_active() {
@@ -1846,23 +1935,39 @@ fn install_transitions(image: &Image<'static>) {
 unsafe fn ensure_field_entity(
    app: *mut c_void,
    window: *mut c_void,
+   which: FieldSlot,
+   placeholder: &'static str,
+) -> Option<RawEntity> {
+   let multiline = which == FieldSlot::Code;
+   let mut guard = FIELD_ENTITIES
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+   let slot = match which {
+      FieldSlot::Url => &mut guard.url,
+      FieldSlot::Code => &mut guard.code,
+      FieldSlot::Search => &mut guard.search,
+   };
+   if let Some(ent) = *slot {
+      return Some(ent);
+   }
+   // SAFETY: as this function's.
+   let ent = unsafe { new_field_entity(app, window, multiline, placeholder) }?;
+   *slot = Some(ent);
+   drop(guard);
+   Some(ent)
+}
+
+/// A new single-line or multi-line `Entity<FieldState>` showing
+/// `placeholder` while empty.
+unsafe fn new_field_entity(
+   app: *mut c_void,
+   window: *mut c_void,
    multiline: bool,
    placeholder: &'static str,
 ) -> Option<RawEntity> {
    let tf = FIELD_SYM.get()?;
    if app.is_null() || window.is_null() {
       return None;
-   }
-   let mut guard = FIELD_ENTITIES
-      .lock()
-      .unwrap_or_else(PoisonError::into_inner);
-   let slot = if multiline {
-      &mut guard.code
-   } else {
-      &mut guard.url
-   };
-   if let Some(ent) = *slot {
-      return Some(ent);
    }
    // SAFETY: invoked on the GPUI main thread inside `WindowRoot::render` with
    // valid `app` and `window` pointers.
@@ -1892,7 +1997,6 @@ unsafe fn ensure_field_entity(
       }
       ent
    };
-   *slot = Some(ent);
    Some(ent)
 }
 
@@ -2370,7 +2474,13 @@ fn build_code_box(
    Some(box_div)
 }
 
-fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> {
+#[expect(clippy::too_many_lines, reason = "one arm per section kind")]
+fn build_page_body(
+   msym: &ModalSymbols,
+   spec: &PageModalSpec,
+   window: *mut c_void,
+   app: *mut c_void,
+) -> Option<RawDiv> {
    let muted = col_muted();
    let mut body = gpui::v_stack(14.0)?;
    gpui::style_div(&mut body, |s| s.length(s.at.size[0], W_FULL));
@@ -2463,9 +2573,127 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
                body = gpui::push_div(body, row);
             }
          },
+         ModalSection::Field {
+            id,
+            label,
+            description,
+            initial,
+            multiline,
+            on_change,
+         } => {
+            let field = PageFieldSpec {
+               id,
+               initial,
+               multiline: *multiline,
+               on_change,
+            };
+            let block = field_block(window, app, label, description.as_deref(), &field)?;
+            body = gpui::push_div(body, block);
+         },
       }
    }
    Some(body)
+}
+
+/// What [`page_field`] draws and reports to.
+struct PageFieldSpec<'a> {
+   id:        &'a str,
+   initial:   &'a str,
+   multiline: bool,
+   on_change: &'a Arc<dyn Fn(String) + Send + Sync>,
+}
+
+/// A [`ModalSection::Field`]: its label, description, and text box.
+fn field_block(
+   window: *mut c_void,
+   app: *mut c_void,
+   label: &str,
+   description: Option<&str>,
+   field: &PageFieldSpec<'_>,
+) -> Option<RawDiv> {
+   let mut block = gpui::v_stack(6.0)?;
+   if let Some(hdr) = plain_text_div(label, None, 14.0) {
+      block = gpui::push_div(block, hdr);
+   }
+   if let Some(desc) = description.filter(|desc| !desc.is_empty())
+      && let Some(line) = plain_text_div(desc, Some(col_muted()), 12.0)
+   {
+      block = gpui::push_div(block, line);
+   }
+   // SAFETY: called while the overlay renders on the GPUI main thread, with
+   // that frame's live `window` and `app`.
+   if let Some(mut element) = unsafe { page_field(window, app, field) } {
+      let mut wrap = gpui::raw_div()?;
+      gpui::style_div(&mut wrap, |s| s.length(s.at.size[0], W_FULL));
+      if gpui::push_any(&mut wrap, &mut element) {
+         block = gpui::push_div(block, wrap);
+      }
+   }
+   Some(block)
+}
+
+/// Section `id`'s text box: made and filled with `initial` the first time,
+/// filled again after [`refill_page_fields`], and its text handed to
+/// `on_change` whenever it differs from the last frame's.
+unsafe fn page_field(
+   window: *mut c_void,
+   app: *mut c_void,
+   spec: &PageFieldSpec<'_>,
+) -> Option<RawAnyElement> {
+   let PageFieldSpec {
+      id,
+      initial,
+      multiline,
+      on_change,
+   } = *spec;
+   let tf = FIELD_SYM.get()?;
+   let mut fields = PAGE_FIELDS.lock().unwrap_or_else(PoisonError::into_inner);
+   if !fields.contains_key(id) {
+      // SAFETY: as this function's.
+      let entity = unsafe { new_field_entity(app, window, multiline, "") }?;
+      fields.insert(id.to_owned(), PageFieldState {
+         entity,
+         seen: String::new(),
+         refill: true,
+      });
+   }
+   let field = fields.get_mut(id)?;
+   if field.refill {
+      // SAFETY: `app` is live and the field's entity is not leased mid-render.
+      unsafe { set_field_text(app, &field.entity, initial) };
+      initial.clone_into(&mut field.seen);
+      field.refill = false;
+   }
+   // SAFETY: as above.
+   let text = unsafe { read_field_text(app, &field.entity) }.unwrap_or_default();
+   if text != field.seen {
+      field.seen.clone_from(&text);
+      let on_change = Arc::clone(on_change);
+      std::thread::spawn(move || on_change(text));
+   }
+   let entity = field.entity;
+   drop(fields);
+   // SAFETY: builds a hosted `TextInput`, or a `TextArea` of
+   // [`SETTING_ROWS`] rows, from `&Entity<FieldState>` in a buffer that fits
+   // it, and moves it into an `AnyElement`.
+   let element = unsafe {
+      let mut any = MaybeUninit::<RawAnyElement>::uninit();
+      if multiline {
+         let mut ta = RawTextArea::zeroed();
+         (tf.text_area_new)(&raw mut ta, &raw const entity);
+         if let Some(rows) = tf.layout.text_area_rows {
+            ta.put(rows, [1u8, SETTING_ROWS]);
+            ta.put(rows + 2, [1u8, SETTING_ROWS]);
+         }
+         (tf.text_area_into_any)(any.as_mut_ptr(), &raw mut ta);
+      } else {
+         let mut ti = RawTextInput::zeroed();
+         (tf.text_input_new)(&raw mut ti, &raw const entity);
+         (tf.text_input_into_any)(any.as_mut_ptr(), &raw mut ti);
+      }
+      any.assume_init()
+   };
+   Some(element)
 }
 
 #[expect(
@@ -2499,7 +2727,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
       Vec<RawButton>,
    ) = match modal_snapshot {
       Snapshot::Page(spec) => {
-         let body = build_page_body(msym, &spec);
+         let body = build_page_body(msym, &spec, window, app);
          let mut footer = Vec::new();
          if let Some(close_btn) = make_modal_button(
             "sunbird-modal-close",
@@ -2523,7 +2751,12 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
             }
             if let Some(tf) = FIELD_SYM.get()
                && let Some(ent) = unsafe {
-                  ensure_field_entity(app, window, true, "// Plugin JavaScript source...")
+                  ensure_field_entity(
+                     app,
+                     window,
+                     FieldSlot::Code,
+                     "// Plugin JavaScript source...",
+                  )
                }
             {
                if let Some(init) = &ed.pending_init {
@@ -2599,43 +2832,28 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
          )
       },
       Snapshot::InstallUrl(inst) => {
-         let lines =
-            matches!(&inst.target, FieldTarget::Setting(field) if field.kind == FieldKind::Lines);
          let mut body = gpui::v_stack(10.0);
          if let Some(ref mut b) = body {
             gpui::style_div(b, |s| s.length(s.at.size[0], W_FULL));
             if let Some(tf) = FIELD_SYM.get()
                && let Some(ent) = unsafe {
-                  ensure_field_entity(app, window, lines, match &inst.target {
+                  ensure_field_entity(app, window, FieldSlot::Url, match &inst.target {
                      FieldTarget::Install => "https://example.com/plugin.js",
-                     FieldTarget::Setting(field) if field.kind == FieldKind::Secret => {
-                        "Leave empty to clear"
-                     },
-                     FieldTarget::Setting(_) | FieldTarget::Prompt(_) => "",
+                     FieldTarget::Setting(_) => "Leave empty to clear",
+                     FieldTarget::Prompt(_) => "",
                   })
                }
             {
                if let Some(init) = &inst.pending_init {
                   unsafe { set_field_text(app, &ent, init) };
                }
-               // SAFETY: constructs hosted `TextInput`, or `TextArea` for a
-               // multiline setting, from `&Entity<FieldState>` in a buffer that
-               // fits it and converts to `AnyElement`.
+               // SAFETY: constructs hosted `TextInput` from `&Entity<FieldState>`
+               // in a buffer that fits it and converts to `AnyElement`.
                let mut ti_any = unsafe {
                   let mut any = MaybeUninit::<RawAnyElement>::uninit();
-                  if lines {
-                     let mut ta = RawTextArea::zeroed();
-                     (tf.text_area_new)(&raw mut ta, &raw const ent);
-                     if let Some(rows) = tf.layout.text_area_rows {
-                        ta.put(rows, [1u8, SETTING_ROWS]);
-                        ta.put(rows + 2, [1u8, SETTING_ROWS]);
-                     }
-                     (tf.text_area_into_any)(any.as_mut_ptr(), &raw mut ta);
-                  } else {
-                     let mut ti = RawTextInput::zeroed();
-                     (tf.text_input_new)(&raw mut ti, &raw const ent);
-                     (tf.text_input_into_any)(any.as_mut_ptr(), &raw mut ti);
-                  }
+                  let mut ti = RawTextInput::zeroed();
+                  (tf.text_input_new)(&raw mut ti, &raw const ent);
+                  (tf.text_input_into_any)(any.as_mut_ptr(), &raw mut ti);
                   any.assume_init()
                };
                if let Some(mut wrap) = gpui::v_stack(4.0) {

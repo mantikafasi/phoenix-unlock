@@ -616,7 +616,7 @@ impl<'ix> Func<'ix> {
    /// The steps of the arm64 outlined stub of at most `most` instructions at
    /// `target`, through its closing `b T` or `ret`, or `None` when `target` is
    /// a function of its own.
-   fn outlined(&self, target: usize, most: usize) -> Option<Vec<Step>> {
+   pub(crate) fn outlined(&self, target: usize, most: usize) -> Option<Vec<Step>> {
       if self.ix.isa != Isa::Aarch64 {
          return None;
       }

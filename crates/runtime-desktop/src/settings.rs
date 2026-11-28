@@ -727,10 +727,14 @@ unsafe extern "C" fn section_detour(
    window: *mut c_void,
    cx: *mut c_void,
 ) -> *mut RawAnyElement {
-   if !cx.is_null() {
+   let app = if cx.is_null() {
+      ptr::null_mut()
+   } else {
       // SAFETY: `[cx]` is `*mut gpui::App` inside `Context<T>`.
-      let app = unsafe { *(cx.cast::<*mut c_void>()) };
-      // SAFETY: `app` is null or a live `&mut gpui::App` on the UI thread.
+      unsafe { *(cx.cast::<*mut c_void>()) }
+   };
+   if !app.is_null() {
+      // SAFETY: `app` is a live `&mut gpui::App` on the UI thread.
       unsafe { crate::mana_theme::flush_pending(app) };
    }
    if !host_state.is_null() && !sret.is_null() {
@@ -744,8 +748,8 @@ unsafe extern "C" fn section_detour(
          None => false,
       };
       if show {
-         let rendered =
-            std::panic::catch_unwind(|| gpui::render_sunbird_page(sret)).unwrap_or(false);
+         let rendered = std::panic::catch_unwind(|| gpui::render_sunbird_page(sret, window, app))
+            .unwrap_or(false);
          if rendered {
             return sret;
          }

@@ -385,10 +385,11 @@ fn sel(name: &CStr) -> Sel {
 /// `objc_msgSend` cast to one method's exact signature, which arm64 needs
 /// since it passes variadic arguments differently.
 macro_rules! msg_send {
-   ($name:ident ($($arg:ident: $ty:ty),*) -> $ret:ty) => {
+   ($name:ident ($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty) => {
       /// # Safety
       ///
       /// `object` is nil or responds to `selector` with this signature.
+      #[allow(clippy::too_many_arguments, reason = "one per argument of the method")]
       unsafe fn $name(object: Id, selector: Sel $(, $arg: $ty)*) -> $ret {
          // SAFETY: the caller matches the method's signature.
          unsafe {
@@ -418,6 +419,8 @@ msg_send!(send_monitor(mask: u64, handler: *const Block) -> Id);
 msg_send!(send_symbol(name: Id, description: Id) -> Id);
 msg_send!(send_item(title: Id, action: Sel, key: Id) -> Id);
 msg_send!(send_tag() -> isize);
+
+#[cfg(debug_assertions)] pub mod input;
 
 /// An autoreleased `NSString`, stripping interior NUL bytes so `AppKit` calls
 /// that reject `nil` never throw `NSInvalidArgumentException`.

@@ -39,8 +39,10 @@ pub const DURATION: Duration = Duration::from_secs(5);
 const MAX_SHOWN: usize = 3;
 /// Banners kept, shown or waiting: past it the oldest go.
 const MAX_KEPT: usize = 50;
-const WIDTH: f32 = 340.0;
+const WIDTH: f32 = 400.0;
 const MARGIN: f32 = 16.0;
+/// How often a counting-down banner's bar moves.
+const TICK: Duration = Duration::from_millis(50);
 
 const POSITION_ABSOLUTE: u8 = 1;
 /// `CursorStyle::PointingHand`, GPUI's sixth cursor.
@@ -146,9 +148,12 @@ fn expire() {
       let next = shown.iter().filter_map(|shown| shown.until).min();
       drop(match next {
          Some(until) => {
-            WAKE
-               .wait_timeout(shown, until - now)
-               .map_or_else(|err| err.into_inner().0, |(shown, _)| shown)
+            let shown = WAKE
+               .wait_timeout(shown, (until - now).min(TICK))
+               .map_or_else(|err| err.into_inner().0, |(shown, _)| shown);
+            drop(shown);
+            crate::modal::force_redraw();
+            continue;
          },
          None => WAKE.wait(shown).unwrap_or_else(PoisonError::into_inner),
       });
@@ -238,7 +243,7 @@ unsafe fn close_press(
 /// the header as tall as its text.
 fn push_close(header: RawDiv, id: u64) -> Option<RawDiv> {
    let muted = crate::mana_theme::color_to_argb(crate::mana_theme::sunbird_palette().text_muted);
-   let mut cross = text("\u{d7}", muted, 16.0)?;
+   let mut cross = text("\u{d7}", muted, 20.0)?;
    gpui::style_div(&mut cross, |s| {
       s.lengths(&[s.at.padding[1], s.at.padding[3]], gpui_px(4.0));
       s.set(s.at.mouse_cursor, CURSOR_POINTING_HAND);
@@ -262,11 +267,17 @@ fn waiting_pill(waiting: usize) -> Option<RawDiv> {
       s.lengths(&s.at.corner_radii, gpui_px(10.0));
       s.lengths(&s.at.border_widths, gpui_px(1.0));
       s.hsla(s.at.border_color, crate::mana_theme::color_to_hsla(pal.border, None));
-      s.solid_background(crate::mana_theme::color_to_hsla(pal.bg_surface, Some(0.98)));
+      s.solid_background(surface());
    });
    // An empty first child pushes the pill to the right.
    let row = gpui::push_div(gpui::h_row(0.0, true)?, gpui::raw_div()?);
    Some(gpui::push_div(row, pill))
+}
+
+/// Banners sit on the theme's darkest base, as Discord's own popouts do,
+/// rather than its raised surface, which reads as gray against dark themes.
+fn surface() -> [f32; 4] {
+   crate::mana_theme::color_to_hsla(crate::mana_theme::sunbird_palette().bg_code, Some(0.98))
 }
 
 fn text(text: &str, argb: u32, font_px: f32) -> Option<RawDiv> {
@@ -282,42 +293,39 @@ fn text(text: &str, argb: u32, font_px: f32) -> Option<RawDiv> {
 
 /// One banner. Button IDs go by `slot`, so they stay a handful however many
 /// banners come and go.
-fn banner(slot: usize, id: u64, notice: &Notice) -> Option<RawDiv> {
+fn banner(slot: usize, id: u64, notice: &Notice, left: Option<f32>) -> Option<RawDiv> {
+   const ALIGN_START: u8 = 2;
    let pal = crate::mana_theme::sunbird_palette();
    let accent_hsla = notice.accent.map_or_else(
       || crate::mana_theme::color_to_hsla(pal.accent, None),
       argb_to_hsla,
    );
-   let muted_argb = crate::mana_theme::color_to_argb(pal.text_muted);
-   let title_argb = crate::mana_theme::color_to_argb(pal.text);
-   let mut dot = gpui::raw_div()?;
-   gpui::style_div(&mut dot, |s| {
-      s.lengths(&s.at.size, gpui_px(8.0));
-      s.lengths(&s.at.corner_radii, gpui_px(4.0));
-      s.solid_background(accent_hsla);
-   });
-   let mut source = gpui::h_row(6.0, false)?;
-   source = gpui::push_div(source, dot);
-   source = gpui::push_div(source, text(&notice.source, muted_argb, 12.0)?);
-   let mut header = gpui::h_row(8.0, true)?;
-   header = gpui::push_div(header, source);
-   header = push_close(header, id)?;
 
-   let mut card = gpui::v_stack(4.0)?;
+   // Mana's own title and subtitle, the only text Discord draws bold.
+   let mut words = gpui::raw_div()?;
+   gpui::style_div(&mut words, |s| {
+      s.length(s.at.min_size[0], gpui_px(0.0));
+      s.float(s.at.flex_shrink, 1.0);
+   });
+   let body = notice.body.as_deref().unwrap_or_default();
+   words = gpui::push_div(words, gpui::text_block(&notice.title, body)?);
+   let mut heading = gpui::h_row(8.0, true)?;
+   gpui::style_div(&mut heading, |s| s.set(s.at.align_items, ALIGN_START));
+   heading = gpui::push_div(heading, words);
+   heading = push_close(heading, id)?;
+
+   let mut card = gpui::v_stack(12.0)?;
    gpui::style_div(&mut card, |s| {
-      s.lengths(&s.at.padding, gpui_px(12.0));
+      s.lengths(&s.at.padding, gpui_px(16.0));
       s.lengths(&s.at.corner_radii, gpui_px(8.0));
       s.lengths(&s.at.border_widths, gpui_px(1.0));
-      s.hsla(s.at.border_color, crate::mana_theme::color_to_hsla(pal.border, None));
-      s.solid_background(crate::mana_theme::color_to_hsla(pal.bg_surface, Some(0.98)));
+      s.hsla(
+         s.at.border_color,
+         crate::mana_theme::color_to_hsla(pal.border, Some(0.5)),
+      );
+      s.solid_background(surface());
    });
-   card = gpui::push_div(card, header);
-   let mut words = gpui::v_stack(4.0)?;
-   words = gpui::push_div(words, text(&notice.title, title_argb, 14.0)?);
-   if let Some(body) = notice.body.as_deref().filter(|body| !body.is_empty()) {
-      words = gpui::push_div(words, text(body, muted_argb, 13.0)?);
-   }
-   card = gpui::push_div(card, words);
+   card = gpui::push_div(card, heading);
    if notice.pressable
       && let Some(open) = gpui::build_raw_button(
          &format!("sunbird-notice-{slot}-open"),
@@ -328,8 +336,20 @@ fn banner(slot: usize, id: u64, notice: &Notice) -> Option<RawDiv> {
          id,
       )
    {
-      let row = gpui::h_row(8.0, false)?;
+      // An empty first child pushes the button to the right.
+      let row = gpui::push_div(gpui::h_row(0.0, true)?, gpui::raw_div()?);
       card = gpui::push_div(card, gpui::push_raw_button(row, open));
+   }
+   // What is left of a timed banner, shrinking toward its close.
+   if let Some(left) = left {
+      let mut bar = gpui::raw_div()?;
+      gpui::style_div(&mut bar, |s| {
+         s.length(s.at.size[0], gpui::fraction(left));
+         s.length(s.at.size[1], gpui_px(3.0));
+         s.lengths(&s.at.corner_radii, gpui_px(2.0));
+         s.solid_background(accent_hsla);
+      });
+      card = gpui::push_div(card, bar);
    }
    Some(card)
 }
@@ -338,7 +358,7 @@ fn banner(slot: usize, id: u64, notice: &Notice) -> Option<RawDiv> {
 /// under a count of those waiting, or `None` when there are none.
 pub fn build() -> Option<RawDiv> {
    let now = Instant::now();
-   let (up, waiting): (Vec<(u64, Notice)>, usize) = {
+   let (up, waiting): (Vec<(u64, Notice, Option<f32>)>, usize) = {
       let mut shown = shown();
       shown.retain(|shown| shown.until.is_none_or(|until| until > now));
       let waiting = shown.len().saturating_sub(MAX_SHOWN);
@@ -354,7 +374,17 @@ pub fn build() -> Option<RawDiv> {
       }
       let up = shown[waiting..]
          .iter()
-         .map(|shown| (shown.id, shown.notice.clone()))
+         .map(|shown| {
+            let left = shown
+               .until
+               .zip(shown.notice.duration)
+               .map(|(until, duration)| {
+                  (until.saturating_duration_since(now).as_secs_f32()
+                     / duration.as_secs_f32().max(f32::EPSILON))
+                  .clamp(0.0, 1.0)
+               });
+            (shown.id, shown.notice.clone(), left)
+         })
          .collect();
       drop(shown);
       if started {
@@ -378,8 +408,8 @@ pub fn build() -> Option<RawDiv> {
    if waiting > 0 {
       stack = gpui::push_div(stack, waiting_pill(waiting)?);
    }
-   for (slot, (id, notice)) in up.iter().enumerate() {
-      if let Some(banner) = banner(slot, *id, notice) {
+   for (slot, (id, notice, left)) in up.iter().enumerate() {
+      if let Some(banner) = banner(slot, *id, notice, *left) {
          stack = gpui::push_div(stack, banner);
       }
    }

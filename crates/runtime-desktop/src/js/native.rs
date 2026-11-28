@@ -307,9 +307,9 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
    Ok(native)
 }
 
-/// `phoenix.native.hook`, on `phoenix_hook::x86::observe`, which saves the
+/// `phoenix.native.hook`, on `phoenix_hook`'s `observe` stubs, which save the
 /// argument registers.
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 mod observe {
    use std::{
       cell::Cell,
@@ -328,12 +328,19 @@ mod observe {
       },
    };
 
+   #[cfg(target_os = "macos")]
+   use phoenix_hook::arm64::{
+      Regs,
+      observe,
+   };
    use phoenix_hook::{
+      Observed,
       image::Image,
-      x86::{
-         Observed,
-         Regs,
-      },
+   };
+   #[cfg(any(windows, target_os = "linux"))]
+   use phoenix_hook::x86::{
+      Regs,
+      observe,
    };
    use serde::Serialize;
 
@@ -412,7 +419,7 @@ mod observe {
       slot.limit.store(limit, Ordering::Relaxed);
       // SAFETY: the debug console's user picks a function start. A wrong pick
       // can crash Discord, which a reversing tool accepts.
-      let hook = unsafe { phoenix_hook::x86::observe(image, addr, on_hit, id) }
+      let hook = unsafe { observe(image, addr, on_hit, id) }
          .map_err(|err| err.to_string())?;
       observed[id] = Some(hook);
       drop(observed);
@@ -487,8 +494,8 @@ mod observe {
    }
 }
 
-/// `phoenix.native.hook` where `phoenix_hook::x86::observe` has no stub.
-#[cfg(not(any(windows, target_os = "linux")))]
+/// `phoenix.native.hook` where `phoenix_hook` has no `observe` stub.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod observe {
    use phoenix_hook::image::Image;
 

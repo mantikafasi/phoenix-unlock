@@ -16,13 +16,6 @@ pub trait DesktopOs {
    fn force_redraw(validation_offset: usize);
 
    /// The calling thread's id as the OS and debuggers show it.
-   #[cfg_attr(
-      not(any(windows, target_os = "linux")),
-      expect(
-         dead_code,
-         reason = "phoenix.native.hook, its one reader, runs on Windows and Linux"
-      )
-   )]
    fn current_thread_id() -> u32;
 
    /// Where `image` is mapped, so addresses print as the offsets `sigscan`

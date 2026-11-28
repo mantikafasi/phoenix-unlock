@@ -43,12 +43,21 @@ const HEAD: usize = 40;
 /// mov qword ptr [rbx + kind], kind_value
 /// ```
 ///
-/// Every copy must agree.
+/// arm64 copies through an outlined stub that loads the length before its
+/// `b memcpy`. Every copy must agree.
 pub fn submenu(ix: &Index<'_>) -> Found<SubmenuLayout> {
+   let sp = ix.isa.sp();
    let mut found = ix
-      .heads(HEAD, |head| shape(head).is_some())
+      .heads(HEAD, |head| shape(head, sp, |_| Some(0)).is_some())
       .iter()
-      .filter_map(|func| shape(&func.head(HEAD)))
+      .filter_map(|func| {
+         shape(&func.head(HEAD), sp, |target| {
+            func
+               .outlined(target, 4)?
+               .iter()
+               .find_map(|step| imm(step.op))
+         })
+      })
       .collect::<Vec<_>>();
    found.sort_unstable();
    found.dedup();
@@ -80,9 +89,15 @@ struct Stored {
    word:   Word,
 }
 
-/// `(step, base, offset, size)`: a field's address, and the first constant
-/// loaded after it, the length of the copy to it.
-type Field = (usize, Reg, isize, Option<u64>);
+/// `(step, base, offset)`: a field's address.
+type Field = (usize, Reg, isize);
+
+const fn imm(op: Op) -> Option<u64> {
+   match op {
+      Op::Imm { value, .. } => Some(value),
+      _ => None,
+   }
+}
 
 /// The head's 8-byte stores and field addresses.
 fn trace(head: &[Step]) -> (Vec<Stored>, Vec<Field>) {
@@ -137,23 +152,21 @@ fn trace(head: &[Step]) -> (Vec<Stored>, Vec<Field>) {
             if let Some(slot) = regs.get_mut(usize::from(reg)) {
                *slot = Word::Imm(value);
             }
-            for field in fields.iter_mut().filter(|field| field.3.is_none()) {
-               field.3 = Some(value);
-            }
          },
          Op::Addr { reg, .. } => {
             if let Some(slot) = regs.get_mut(usize::from(reg)) {
                *slot = Word::Addr;
             }
          },
-         Op::Offset { base, offset, .. } => fields.push((index, base, offset, None)),
+         Op::Offset { base, offset, .. } => fields.push((index, base, offset)),
          _ => {},
       }
    }
    (stores, fields)
 }
 
-fn shape(head: &[Step]) -> Option<SubmenuLayout> {
+/// `copied` reads the length an outlined copy stub at its address loads.
+fn shape(head: &[Step], sp: Reg, copied: impl Fn(usize) -> Option<u64>) -> Option<SubmenuLayout> {
    let (stores, fields) = trace(head);
    let small = |word| matches!(word, Word::Imm(imm) if imm < 0x10);
    let at = |base, offset| {
@@ -164,7 +177,7 @@ fn shape(head: &[Step]) -> Option<SubmenuLayout> {
    };
    let tag = stores
       .iter()
-      .find(|store| store.offset == 0 && small(store.word))?;
+      .find(|store| store.offset == 0 && store.base != sp && small(store.word))?;
    let base = tag.base;
    let builder = stores.iter().find(|store| {
       store.base == base
@@ -176,8 +189,14 @@ fn shape(head: &[Step]) -> Option<SubmenuLayout> {
       .iter()
       .find(|store| store.base == base && store.offset > builder.offset + 8 && small(store.word))?;
    // The props are copied in before the variant's words go on.
-   let &(_, _, props, size) = fields.iter().find(|&&(step, field_base, offset, _)| {
+   let &(field, _, props) = fields.iter().find(|&&(step, field_base, offset)| {
       step < tag.step && field_base == base && offset > kind.offset
+   })?;
+   let size = head.get(field + 1..tag.step)?.iter().find_map(|step| {
+      match step.op {
+         Op::Call(target) | Op::Jump(target) => Some(copied(target)),
+         op => imm(op).map(Some),
+      }
    })?;
    let word = |word| {
       match word {

@@ -23,7 +23,6 @@ use crate::image::Image;
 #[cfg(any(windows, target_os = "linux"))]
 use crate::{
    Error,
-   Hook as _,
    image::{
       absolute_jump,
       alloc_exec,
@@ -1163,32 +1162,6 @@ impl Regs {
 #[cfg(any(windows, target_os = "linux"))]
 pub type Observer = extern "C" fn(ctx: usize, regs: &Regs);
 
-/// A function [`observe`] redirects through its stub.
-#[cfg(any(windows, target_os = "linux"))]
-pub struct Observed {
-   addr: usize,
-   hook: crate::Inline,
-}
-
-#[cfg(any(windows, target_os = "linux"))]
-impl Observed {
-   #[must_use]
-   pub const fn addr(&self) -> usize {
-      self.addr
-   }
-
-   /// Puts the function's first bytes back. The stub stays allocated, since a
-   /// thread may still run it.
-   ///
-   /// # Safety
-   ///
-   /// As for [`Hook::detach`].
-   pub unsafe fn remove(self) -> Result<(), Error> {
-      // SAFETY: forwarded from the caller.
-      unsafe { self.hook.detach() }
-   }
-}
-
 /// Makes every call to the function at `addr` run `observer(ctx, regs)` first,
 /// then the function unchanged, through a sunhook entry hook.
 ///
@@ -1201,7 +1174,7 @@ pub unsafe fn observe(
    addr: usize,
    observer: Observer,
    ctx: usize,
-) -> Result<Observed, Error> {
+) -> Result<crate::Observed, Error> {
    const JMP_RIP: usize = 6;
 
    let mut code = stub(observer, ctx);
@@ -1226,7 +1199,7 @@ pub unsafe fn observe(
    // SAFETY: forwarded from the caller, and the stub keeps the function's
    // arguments.
    let hook = unsafe { crate::Inline::attach_into(target, stub, slot) }?;
-   Ok(Observed { addr, hook })
+   Ok(crate::Observed { addr, hook })
 }
 
 /// Saves the argument registers and `rax`, calls `observer(ctx, &regs)` on a

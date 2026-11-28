@@ -182,15 +182,9 @@ static SUBMENUS: LazyLock<Mutex<ClickTable<PendingSubmenu>>> = LazyLock::new(|| 
    })
 });
 
-static SUBMENU_VTBL: RcFnVtbl = RcFnVtbl {
-   drop_in_place: ptr::null(),
-   size:          size_of::<u64>(),
-   align:         align_of::<u64>(),
-   call_once:     build_submenu as *const c_void,
-   call_mut:      build_submenu as *const c_void,
-   call:          build_submenu as *const c_void,
-   extra:         ptr::null(),
-};
+/// Plugin submenus' builder vtable, entering [`build_submenu`] through an
+/// `sret_callee` thunk on arm64.
+static SUBMENU_VTBL: OnceLock<RcFnVtbl> = OnceLock::new();
 
 static MENU_ACTION_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: ptr::null(),
@@ -340,7 +334,7 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    }
    if !crate::X86_CODE {
       #[cfg(target_os = "macos")]
-      arm64::install(image);
+      arm64::install(image, ix);
       return;
    }
    let menu = match desktop::message_context_menu(image) {
@@ -379,9 +373,7 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
          separator_tag:     Some(layout::MENU_ITEM_SEPARATOR_TAG),
          layout:            menu.layout,
          id_offset:         None,
-         submenu:           menu::submenu(ix)
-            .inspect_err(|err| log::warn!("desktop context menu: {err}, submenus show inline"))
-            .ok(),
+         submenu:           submenu(ix),
       }
    };
    let syms = MenuSymbols {
@@ -638,6 +630,35 @@ fn action_item(
    Some(finish_item(syms, item, at.props, action))
 }
 
+/// The layout plugin submenus copy, with [`SUBMENU_VTBL`] set up for it.
+fn submenu(ix: &Index<'_>) -> Option<SubmenuLayout> {
+   let layout = menu::submenu(ix)
+      .inspect_err(|err| log::warn!("desktop context menu: {err}, submenus show inline"))
+      .ok()?;
+   let build = build_submenu as *const () as usize;
+   let Some(call) = (if crate::X86_CODE {
+      Some(build)
+   } else {
+      phoenix_hook::image::sret_callee(build)
+   }) else {
+      log::warn!("desktop context menu: no memory for the submenu thunk, submenus show inline");
+      return None;
+   };
+   let call = ptr::with_exposed_provenance::<c_void>(call);
+   SUBMENU_VTBL.get_or_init(|| {
+      RcFnVtbl {
+         drop_in_place: ptr::null(),
+         size: size_of::<u64>(),
+         align: align_of::<u64>(),
+         call_once: call,
+         call_mut: call,
+         call,
+         extra: ptr::null(),
+      }
+   });
+   Some(layout)
+}
+
 /// A native submenu whose builder lists `action`'s children when it opens.
 fn submenu_item(
    syms: &MenuSymbols,
@@ -646,6 +667,7 @@ fn submenu_item(
    message: u64,
    channel: u64,
 ) -> Option<RawMenuItem> {
+   let vtbl = SUBMENU_VTBL.get()?;
    if submenu.props_size != syms.layout.props_size {
       return None;
    }
@@ -662,7 +684,7 @@ fn submenu_item(
    let mut item = RawMenuItem::zeroed();
    item.put(0, submenu.tag);
    item.put(submenu.builder, rc_ptr);
-   item.put(submenu.builder + 8, &raw const SUBMENU_VTBL);
+   item.put(submenu.builder + 8, ptr::from_ref(vtbl));
    item.put(submenu.kind, submenu.kind_value);
    Some(finish_item(syms, item, submenu.props, action))
 }
@@ -736,6 +758,7 @@ mod arm64 {
       Image,
       sret_caller,
    };
+   use phoenix_sigs::index::Index;
 
    use super::{
       ACTIVE_COUNT,
@@ -769,7 +792,7 @@ mod arm64 {
       (1 << 32..1 << 63).contains(&value)
    }
 
-   pub fn install(image: &Image<'static>) {
+   pub fn install(image: &Image<'static>, ix: &Index<'_>) {
       let menu = match phoenix_sigs::macos::message_context_menu(image) {
          Ok(menu) => menu,
          Err(err) => {
@@ -818,7 +841,7 @@ mod arm64 {
             separator_tag:     menu.separator_tag,
             layout:            menu.layout,
             id_offset:         None,
-            submenu:           None,
+            submenu:           super::submenu(ix),
          }
       };
       syms.id_offset = super::inline_id_offset(&syms);

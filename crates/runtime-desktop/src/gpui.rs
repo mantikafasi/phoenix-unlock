@@ -13,6 +13,7 @@ use std::{
    mem::MaybeUninit,
    ptr,
    sync::{
+      Arc,
       LazyLock,
       Mutex,
       OnceLock,
@@ -42,7 +43,9 @@ use phoenix_sigs::{
 };
 
 use crate::modal::{
-   FieldKind,
+   ModalButton,
+   ModalSection,
+   PageModalSpec,
    SettingField,
 };
 
@@ -228,6 +231,49 @@ pub fn gpui_px(px: f32) -> u64 {
    u64::from(px.to_bits()) << 32
 }
 
+/// Encodes `Some(Length::Definite(DefiniteLength::Fraction(f)))`, a share of
+/// the parent like [`W_FULL`].
+pub fn fraction(f: f32) -> u64 {
+   (u64::from(f.to_bits()) << 32) | 2
+}
+
+/// `CursorStyle::PointingHand`.
+const CURSOR_POINTING_HAND: u8 = 5;
+
+/// A press on a plain element made clickable by [`Builder::clickable`]. It is
+/// zero-sized, so the action's id plus one rides in its data pointer, which
+/// GPUI never reads or frees.
+static PRESS_VTBL: RcFnVtbl = RcFnVtbl {
+   drop_in_place: noop_drop as *const c_void,
+   size:          0,
+   align:         1,
+   call_once:     element_press as *const c_void,
+   call_mut:      element_press as *const c_void,
+   call:          element_press as *const c_void,
+   extra:         ptr::null(),
+};
+
+const unsafe extern "C" fn noop_drop(_data: *mut u8) {}
+
+/// Rust ABI like the `Fn::call` slot it fills, see `modal::scrim_press`.
+unsafe fn element_press(
+   data: *const u8,
+   _event: *mut u8,
+   phase: u8,
+   hitbox: *const c_void,
+   window: *const c_void,
+   _app: *mut u8,
+) {
+   let _ = std::panic::catch_unwind(|| {
+      if phase == crate::modal::PHASE_BUBBLE
+         && crate::modal::hovered(hitbox, window)
+         && let Some(action) = lookup_action((data as u64).wrapping_sub(1))
+      {
+         run(action);
+         crate::modal::force_redraw();
+      }
+   });
+}
 type DivNewFn = unsafe extern "C" fn(*mut RawDiv, *const c_void) -> *mut RawDiv;
 type DivMutFn = unsafe extern "C" fn(*mut RawDiv, *mut RawDiv) -> *mut RawDiv;
 type DivStyleMutFn = unsafe extern "C" fn(*mut RawDiv) -> *mut u8;
@@ -300,16 +346,17 @@ enum PluginFilter {
    Disabled,
 }
 
+#[derive(Clone)]
 struct UiState {
-   tab:              Tab,
-   filter:           PluginFilter,
-   expanded_plugins: HashSet<String>,
-   open_select:      Option<(String, String)>,
-   open_groups:      HashSet<CatalogGroup>,
+   tab:                 Tab,
+   filter:              PluginFilter,
+   filter_open:         bool,
+   catalog_filter:      Option<CatalogGroup>,
+   catalog_filter_open: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
+/// The catalog's plugins by desktop support.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CatalogGroup {
    Desktop,
    Partial,
@@ -319,11 +366,11 @@ enum CatalogGroup {
 impl Default for UiState {
    fn default() -> Self {
       Self {
-         tab:              Tab::Plugins,
-         filter:           PluginFilter::All,
-         expanded_plugins: HashSet::new(),
-         open_select:      None,
-         open_groups:      HashSet::from([CatalogGroup::Desktop]),
+         tab:                 Tab::Plugins,
+         filter:              PluginFilter::All,
+         filter_open:         false,
+         catalog_filter:      None,
+         catalog_filter_open: false,
       }
    }
 }
@@ -334,17 +381,10 @@ static UI_STATE: LazyLock<Mutex<UiState>> = LazyLock::new(|| Mutex::new(UiState:
 enum Action {
    SetTab(Tab),
    SetFilter(PluginFilter),
-   ToggleExpandPlugin(String),
-   ToggleSelectDropdown {
-      plugin: String,
-      key:    String,
-   },
-   PickSelectOption {
-      plugin: String,
-      key:    String,
-      value:  String,
-   },
-   ToggleCatalogGroup(CatalogGroup),
+   ToggleFilterMenu,
+   SetCatalogFilter(Option<CatalogGroup>),
+   ToggleCatalogFilterMenu,
+   OpenPlugin(String),
    ToggleStaff,
    ToggleAutoStart,
    ToggleAutoUpdate,
@@ -354,20 +394,10 @@ enum Action {
    ApplyUpdates,
    RefreshCatalog,
    TogglePlugin(String),
-   ReloadPlugin(String),
    EditPluginCode(String),
-   EditSetting(SettingField),
    OpenInstallUrl,
    InstallFromFile,
    UninstallPlugin(String),
-   ToggleSetting {
-      plugin: String,
-      key:    String,
-   },
-   PressButton {
-      plugin: String,
-      key:    String,
-   },
    InstallCatalog(String),
 }
 
@@ -421,15 +451,11 @@ unsafe fn switch_callback(
             std::thread::spawn(move || crate::config::save_or_report(config));
          },
          Action::TogglePlugin(name) => phoenix_runtime::set_enabled(&name, on),
-         Action::ToggleSetting { plugin, key } => {
-            phoenix_runtime::set_setting(&plugin, &key, Chosen::Switch(on));
-         },
          _ => {},
       }
    });
 }
 
-#[expect(clippy::too_many_lines, reason = "one arm per callback kind")]
 unsafe extern "C" fn button_callback(
    self_ptr: *const u64,
    _event: *const c_void,
@@ -443,56 +469,44 @@ unsafe extern "C" fn button_callback(
       // SAFETY: `self_ptr` points to `RcInner.action_id` inside our `Rc<dyn
       // Fn>`.
       let id = unsafe { *self_ptr };
-      let Some(action) = lookup_action(id) else {
-         return;
-      };
+      if let Some(action) = lookup_action(id) {
+         run(action);
+      }
+   });
+}
+
+/// Runs a pressed button's or element's action.
+fn run(action: Action) {
+   let _ = std::panic::catch_unwind(move || {
       match action {
          Action::SetTab(tab) => {
             let mut ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
             ui.tab = tab;
-            ui.open_select = None;
          },
          Action::SetFilter(filter) => {
-            UI_STATE
-               .lock()
-               .unwrap_or_else(PoisonError::into_inner)
-               .filter = filter;
-         },
-         Action::ToggleExpandPlugin(name) => {
             let mut ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
-            if !ui.expanded_plugins.remove(&name) {
-               ui.expanded_plugins.insert(name);
-            }
-            ui.open_select = None;
+            ui.filter = filter;
+            ui.filter_open = false;
          },
-         Action::ToggleSelectDropdown { plugin, key } => {
+         Action::ToggleFilterMenu => {
             let mut ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
-            let target = (plugin, key);
-            if ui.open_select.as_ref() == Some(&target) {
-               ui.open_select = None;
-            } else {
-               ui.open_select = Some(target);
-            }
+            ui.filter_open = !ui.filter_open;
          },
-         Action::PickSelectOption { plugin, key, value } => {
-            phoenix_runtime::set_setting(&plugin, &key, Chosen::Text(value));
-            UI_STATE
-               .lock()
-               .unwrap_or_else(PoisonError::into_inner)
-               .open_select = None;
-         },
-         Action::ToggleCatalogGroup(group) => {
+         Action::SetCatalogFilter(group) => {
             let mut ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
-            if !ui.open_groups.remove(&group) {
-               ui.open_groups.insert(group);
-            }
+            ui.catalog_filter = group;
+            ui.catalog_filter_open = false;
          },
+         Action::ToggleCatalogFilterMenu => {
+            let mut ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
+            ui.catalog_filter_open = !ui.catalog_filter_open;
+         },
+         Action::OpenPlugin(name) => open_plugin_page(&name),
          Action::ReloadAll => phoenix_runtime::reload_all(),
          Action::OpenDevTools => phoenix_ui_desktop::open_devtools(),
          Action::CheckUpdates => update::check_now(),
          Action::ApplyUpdates => update::apply(),
          Action::RefreshCatalog => update::fetch_catalog(),
-         Action::ReloadPlugin(name) => phoenix_runtime::reload(&name),
          Action::EditPluginCode(name) => {
             let Some(source) = phoenix_runtime::source(&name) else {
                phoenix_ui_desktop::toast(&format!("Could not read source for {name}"));
@@ -502,9 +516,6 @@ unsafe extern "C" fn button_callback(
          },
          Action::OpenInstallUrl => {
             crate::modal::open_install_url();
-         },
-         Action::EditSetting(field) => {
-            crate::modal::open_setting_editor(field);
          },
          Action::InstallFromFile => {
             std::thread::spawn(|| {
@@ -529,7 +540,6 @@ unsafe extern "C" fn button_callback(
                log::warn!("sunbird settings: uninstall {name}: {err}");
             }
          },
-         Action::PressButton { plugin, key } => phoenix_runtime::press(&plugin, &key),
          Action::InstallCatalog(name) => {
             std::thread::spawn(move || {
                match update::install_listed(&name) {
@@ -1002,6 +1012,50 @@ impl Builder {
       true
    }
 
+   /// `div`, running `action` when pressed.
+   fn clickable(&self, mut div: RawDiv, action: Action) -> RawDiv {
+      let id = register_action(action);
+      self.style_div(&mut div, |s| s.set(s.at.mouse_cursor, CURSOR_POINTING_HAND));
+      crate::modal::listen_mouse_down(&mut div, (id + 1) as *mut u8, &PRESS_VTBL);
+      div
+   }
+
+   /// Draws `div` like Discord's text inputs: the darkest surface, a subtle
+   /// border, and rounded corners.
+   fn input_surface(&self, div: &mut RawDiv) {
+      let pal = crate::mana_theme::sunbird_palette();
+      self.style_div(div, |s| {
+         s.lengths(&s.at.border_widths, gpui_px(1.0));
+         s.lengths(&s.at.corner_radii, gpui_px(8.0));
+         s.lengths(&[s.at.padding[0], s.at.padding[2]], gpui_px(10.0));
+         s.lengths(&[s.at.padding[1], s.at.padding[3]], gpui_px(12.0));
+         s.hsla(
+            s.at.border_color,
+            crate::mana_theme::color_to_hsla(pal.border, Some(0.6)),
+         );
+         s.solid_background(crate::mana_theme::color_to_hsla(pal.bg_code, None));
+      });
+   }
+
+   /// An 18px icon drawn from `svg`, or `fallback` as text when icons cannot
+   /// be drawn, running `action` when pressed.
+   fn icon_button(&self, svg: &str, fallback: &str, action: Action) -> Option<RawDiv> {
+      let pal = crate::mana_theme::sunbird_palette();
+      let color = crate::mana_theme::color_to_hsla(pal.text_muted, None);
+      let mut button = chain(self.sym.div_flex, self.raw_div());
+      self.style_div(&mut button, |s| {
+         s.lengths(&s.at.padding, gpui_px(4.0));
+         s.lengths(&s.at.corner_radii, gpui_px(4.0));
+      });
+      if let (Some(svgs), Some(path)) = (SVG.get(), crate::icons::register(svg)) {
+         let mut icon = svg_icon(self, svgs, path, 18.0, color);
+         self.push_any(&mut button, &mut icon);
+      } else {
+         button = self.push_div(button, self.text_line(fallback, color, 16.0)?);
+      }
+      Some(self.clickable(button, action))
+   }
+
    fn text_line(&self, text: &str, color_hsla: [f32; 4], font_px: f32) -> Option<RawDiv> {
       let str_into_any = self.sym.str_into_any?;
       let mut line_div = self.raw_div();
@@ -1192,6 +1246,16 @@ pub fn push_raw_button(mut parent: RawDiv, mut btn: RawButton) -> RawDiv {
    // SAFETY: appends native Mana `Button` directly into `parent`.
    unsafe { (sym.div_child_button)(&raw mut out, &raw mut parent, &raw mut btn) };
    out
+}
+
+/// Mana's `TextBlock`: `title` in its heading weight over `subtitle`.
+pub fn text_block(title: &str, subtitle: &str) -> Option<RawDiv> {
+   Some(
+      Builder {
+         sym: SYMBOLS.get()?,
+      }
+      .text_block(title, subtitle),
+   )
 }
 
 pub fn write_any(div: RawDiv, sret: *mut RawAnyElement) {
@@ -1571,11 +1635,13 @@ const DESKTOP_FULL: &[&str] = &[
    "disable-call-idle",
    "font-changer",
    "collapse-channels",
+   "desktop-themes",
+   "fakenitro",
 ];
 
-const DESKTOP_PARTIAL: &[&str] = &["fakenitro"];
+const DESKTOP_PARTIAL: &[&str] = &["hide-composer-buttons", "reviewdb"];
 
-const MOBILE_ONLY: &[&str] = &["hide-composer-buttons", "reviewdb", "taptap", "example"];
+const MOBILE_ONLY: &[&str] = &["taptap", "example"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DesktopCompat {
@@ -1621,8 +1687,13 @@ impl DesktopCompat {
    }
 }
 
-/// Renders the categorized native Sunbird Settings page into `sret`.
-pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
+/// Draws the Sunbird page into `sret`. `window` and `app` are the settings
+/// section's, which the search box's `TextInput` is built with.
+pub fn render_sunbird_page(
+   sret: *mut RawAnyElement,
+   window: *mut c_void,
+   app: *mut c_void,
+) -> bool {
    let Some(sym) = SYMBOLS.get() else {
       return false;
    };
@@ -1633,20 +1704,13 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
       .unwrap_or_else(PoisonError::into_inner)
       .clear();
 
-   let (tab, filter, expanded_plugins, open_select, open_groups) = {
-      let ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
-      (
-         ui.tab,
-         ui.filter,
-         ui.expanded_plugins.clone(),
-         ui.open_select.clone(),
-         ui.open_groups.clone(),
-      )
-   };
+   let ui = UI_STATE
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .clone();
 
    let plugins = phoenix_runtime::plugins();
    let enabled_count = plugins.iter().filter(|p| p.state.is_on()).count();
-   let disabled_count = plugins.len().saturating_sub(enabled_count);
 
    let mut root = b.v_stack(16.0);
 
@@ -1660,7 +1724,7 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
    root = b.push_div(root, b.text_block("Sunbird", &summary));
 
    let variant_for = |t: Tab| {
-      if tab == t {
+      if ui.tab == t {
          BtnVariant::Primary
       } else {
          BtnVariant::Secondary
@@ -1695,22 +1759,15 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
    root = b.push_div(root, b.divider());
 
    // 2. Active Category Content
-   match tab {
+   match ui.tab {
       Tab::Plugins => {
-         root = render_plugins_tab(
-            &b,
-            root,
-            &plugins,
-            enabled_count,
-            disabled_count,
-            filter,
-            &expanded_plugins,
-            open_select.as_ref(),
-         );
+         let search = crate::modal::search_field(app, window);
+         root = render_plugins_tab(&b, root, &plugins, &ui, search);
       },
       Tab::Catalog => {
+         let search = crate::modal::search_field(app, window);
          let installed: HashSet<String> = plugins.iter().map(|p| p.name.clone()).collect();
-         root = render_catalog_tab(&b, root, &installed, &open_groups);
+         root = render_catalog_tab(&b, root, &installed, &ui, search);
       },
       Tab::General => {
          root = render_general_tab(&b, root);
@@ -1721,479 +1778,374 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
    true
 }
 
-#[expect(
-   clippy::too_many_arguments,
-   clippy::too_many_lines,
-   reason = "one GPUI element tree, built top to bottom from the page state"
-)]
-fn render_plugins_tab(
+/// Settings' gear, for a card whose plugin has settings.
+const GEAR_SVG: &str =
+   "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><path fill-rule=\"evenodd\" \
+    d=\"M19.90 9.81 L22.64 10.17 L22.64 13.83 L19.90 14.19 L19.13 16.04 L20.82 18.23 L18.23 20.82 \
+    L16.04 19.13 L14.19 19.90 L13.83 22.64 L10.17 22.64 L9.81 19.90 L7.96 19.13 L5.77 20.82 L3.18 \
+    18.23 L4.87 16.04 L4.10 14.19 L1.36 13.83 L1.36 10.17 L4.10 9.81 L4.87 7.96 L3.18 5.77 L5.77 \
+    3.18 L7.96 4.87 L9.81 4.10 L10.17 1.36 L13.83 1.36 L14.19 4.10 L16.04 4.87 L18.23 3.18 L20.82 \
+    5.77 L19.13 7.96Z M12 8.6 A3.4 3.4 0 1 0 12 15.4 A3.4 3.4 0 1 0 12 8.6Z\"/></svg>";
+
+/// An `i` in a ring, for a card whose plugin has only details.
+const INFO_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><path \
+                        fill-rule=\"evenodd\" d=\"M12 2 A10 10 0 1 0 12 22 A10 10 0 1 0 12 2Z M12 \
+                        3.8 A8.2 8.2 0 1 1 12 20.2 A8.2 8.2 0 1 1 12 3.8Z M10.9 10.5 H13.1 V17 \
+                        H10.9Z M12 6.4 A1.35 1.35 0 1 0 12 9.1 A1.35 1.35 0 1 0 12 6.4Z\"/></svg>";
+
+impl PluginFilter {
+   const fn label(self) -> &'static str {
+      match self {
+         Self::All => "Show All",
+         Self::Enabled => "Show Enabled",
+         Self::Disabled => "Show Disabled",
+      }
+   }
+
+   const fn keeps(self, plugin: &phoenix_runtime::PluginInfo) -> bool {
+      match self {
+         Self::All => true,
+         Self::Enabled => plugin.state.is_on(),
+         Self::Disabled => !plugin.state.is_on(),
+      }
+   }
+}
+
+impl CatalogGroup {
+   const fn label(group: Option<Self>) -> &'static str {
+      match group {
+         None => "Show All",
+         Some(Self::Desktop) => "Desktop Ready",
+         Some(Self::Partial) => "Partial Desktop Support",
+         Some(Self::Other) => "Mobile Only & Unverified",
+      }
+   }
+
+   fn of(name: &str) -> Self {
+      match DesktopCompat::of(name) {
+         DesktopCompat::Full => Self::Desktop,
+         DesktopCompat::Partial => Self::Partial,
+         DesktopCompat::MobileOnly | DesktopCompat::Unverified => Self::Other,
+      }
+   }
+}
+
+/// Whether `name` or `description` holds `query`, ignoring case.
+fn matches_query(name: &str, description: Option<&str>, query: &str) -> bool {
+   let query = query.trim().to_lowercase();
+   name.to_lowercase().contains(&query)
+      || description.is_some_and(|desc| desc.to_lowercase().contains(&query))
+}
+
+/// "Filters", the search box and the dropdown with `actions` beside it, and
+/// the dropdown's menu while it is open. Returns what the box holds.
+fn render_filters(
    b: &Builder,
    mut root: RawDiv,
-   plugins: &[phoenix_runtime::PluginInfo],
-   enabled_count: usize,
-   disabled_count: usize,
-   filter: PluginFilter,
-   expanded: &HashSet<String>,
-   open_select: Option<&(String, String)>,
-) -> RawDiv {
-   // Filter pills + Reload All toolbar
-   let filt_var = |f: PluginFilter| {
-      if filter == f {
-         BtnVariant::Primary
-      } else {
-         BtnVariant::Secondary
-      }
-   };
-   let mut left_pills = b.h_row(6.0, false);
-   left_pills = b.push_button(
-      left_pills,
-      "sunbird-filter-all",
-      &format!("All ({})", plugins.len()),
-      filt_var(PluginFilter::All),
-      BtnSize::Small,
-      Action::SetFilter(PluginFilter::All),
-   );
-   left_pills = b.push_button(
-      left_pills,
-      "sunbird-filter-enabled",
-      &format!("Enabled ({enabled_count})"),
-      filt_var(PluginFilter::Enabled),
-      BtnSize::Small,
-      Action::SetFilter(PluginFilter::Enabled),
-   );
-   left_pills = b.push_button(
-      left_pills,
-      "sunbird-filter-disabled",
-      &format!("Disabled ({disabled_count})"),
-      filt_var(PluginFilter::Disabled),
-      BtnSize::Small,
-      Action::SetFilter(PluginFilter::Disabled),
-   );
+   search: Option<crate::modal::PageField>,
+   dropdown: Dropdown,
+   actions: RawDiv,
+) -> (RawDiv, String) {
+   let pal = crate::mana_theme::sunbird_palette();
+   let text = crate::mana_theme::color_to_hsla(pal.text, None);
+   if let Some(label) = b.text_line("Filters", text, 16.0) {
+      root = b.push_div(root, label);
+   }
 
-   let mut right_actions = b.h_row(6.0, false);
-   right_actions = b.push_button(
-      right_actions,
+   let mut query = String::new();
+   if let Some(mut field) = search {
+      let mut wrap = b.raw_div();
+      b.style_div(&mut wrap, |s| s.length(s.at.size[0], W_FULL));
+      if b.push_any(&mut wrap, &mut field.element) {
+         root = b.push_div(root, wrap);
+         query = field.text;
+      }
+   }
+
+   let mut controls = b.h_row(12.0, true);
+   let muted = crate::mana_theme::color_to_hsla(pal.text_muted, None);
+   let mut picker = b.h_row(8.0, true);
+   b.input_surface(&mut picker);
+   b.style_div(&mut picker, |s| s.length(s.at.size[0], fraction(0.5)));
+   if let Some(label) = b.text_line(dropdown.label, text, 15.0) {
+      picker = b.push_div(picker, label);
+   }
+   let chevron = if dropdown.open {
+      "\u{25b4}"
+   } else {
+      "\u{25be}"
+   };
+   if let Some(chevron) = b.text_line(chevron, muted, 14.0) {
+      picker = b.push_div(picker, chevron);
+   }
+   controls = b.push_div(controls, b.clickable(picker, dropdown.toggle));
+   controls = b.push_div(controls, actions);
+   root = b.push_div(root, controls);
+
+   if dropdown.open {
+      let mut menu = b.v_stack(2.0);
+      b.input_surface(&mut menu);
+      b.style_div(&mut menu, |s| {
+         s.lengths(&s.at.padding, gpui_px(4.0));
+         s.length(s.at.size[0], fraction(0.5));
+      });
+      let chosen_bg = crate::mana_theme::color_to_hsla(pal.accent, Some(0.18));
+      for (label, chosen, action) in dropdown.options {
+         if let Some(mut option) = b.text_line(label, if chosen { text } else { muted }, 14.0) {
+            b.style_div(&mut option, |s| {
+               s.lengths(&[s.at.padding[0], s.at.padding[2]], gpui_px(8.0));
+               s.lengths(&[s.at.padding[1], s.at.padding[3]], gpui_px(10.0));
+               s.lengths(&s.at.corner_radii, gpui_px(6.0));
+               if chosen {
+                  s.solid_background(chosen_bg);
+               }
+            });
+            menu = b.push_div(menu, b.clickable(option, action));
+         }
+      }
+      root = b.push_div(root, menu);
+   }
+   (root, query)
+}
+
+/// A dropdown under the search box: its label, whether its menu shows, and
+/// each option with whether it is the chosen one.
+struct Dropdown {
+   label:   &'static str,
+   open:    bool,
+   toggle:  Action,
+   options: Vec<(&'static str, bool, Action)>,
+}
+
+/// `cards` two to a row under a "`title` (count)" label, or `empty` when there
+/// are none.
+fn render_grid(
+   b: &Builder,
+   mut root: RawDiv,
+   title: &str,
+   cards: Vec<RawDiv>,
+   empty: &str,
+) -> RawDiv {
+   let pal = crate::mana_theme::sunbird_palette();
+   let text = crate::mana_theme::color_to_hsla(pal.text, None);
+   if let Some(label) = b.text_line(&format!("{title} ({})", cards.len()), text, 16.0) {
+      root = b.push_div(root, label);
+   }
+   if cards.is_empty() {
+      let mut box_div = b.card(8.0, 16.0, 8.0, 0.18);
+      box_div = b.push_div(box_div, b.text_block("Nothing here", empty));
+      return b.push_div(root, box_div);
+   }
+   let mut grid = b.v_stack(12.0);
+   let mut cards = cards.into_iter();
+   while let Some(first) = cards.next() {
+      let mut row = chain(b.sym.div_flex, b.raw_div());
+      b.style_div(&mut row, |s| s.lengths(&s.at.gap, gpui_px(12.0)));
+      row = b.push_div(row, first);
+      if let Some(second) = cards.next() {
+         row = b.push_div(row, second);
+      } else {
+         // An empty half keeps a lone last card as wide as the others.
+         let mut spacer = b.raw_div();
+         b.style_div(&mut spacer, |s| s.length(s.at.size[0], fraction(0.5)));
+         row = b.push_div(row, spacer);
+      }
+      grid = b.push_div(grid, row);
+   }
+   b.push_div(root, grid)
+}
+
+/// A half-width card: `title` and `desc` on the left, `controls` on the
+/// right.
+fn grid_card(b: &Builder, title: &str, desc: &str, controls: RawDiv) -> RawDiv {
+   const ALIGN_START: u8 = 2;
+   const JUSTIFY_SPACE_BETWEEN: u8 = 6;
+   let pal = crate::mana_theme::sunbird_palette();
+   let mut card = chain(b.sym.div_flex, b.raw_div());
+   b.style_div(&mut card, |s| {
+      s.lengths(&s.at.gap, gpui_px(12.0));
+      s.set(s.at.align_items, ALIGN_START);
+      s.set(s.at.justify_content, JUSTIFY_SPACE_BETWEEN);
+      s.lengths(&s.at.border_widths, gpui_px(1.0));
+      s.lengths(&s.at.corner_radii, gpui_px(8.0));
+      s.lengths(&s.at.padding, gpui_px(12.0));
+      s.hsla(
+         s.at.border_color,
+         crate::mana_theme::color_to_hsla(pal.border, Some(0.24)),
+      );
+      // A faint tint of the text color lifts the card off whatever the theme
+      // paints behind it, where a solid surface gray clashed with dark themes.
+      s.solid_background(crate::mana_theme::color_to_hsla(pal.text, Some(0.03)));
+      s.length(s.at.size[0], fraction(0.5));
+      // Flex items keep their content's width unless allowed below it, which
+      // pushed the pair past the page and the text past the controls.
+      s.length(s.at.min_size[0], gpui_px(0.0));
+   });
+   let mut text = b.raw_div();
+   b.style_div(&mut text, |s| {
+      s.length(s.at.min_size[0], gpui_px(0.0));
+      s.float(s.at.flex_shrink, 1.0);
+   });
+   text = b.push_div(text, b.text_block(title, desc));
+   card = b.push_div(card, text);
+   let mut controls = controls;
+   b.style_div(&mut controls, |s| s.float(s.at.flex_shrink, 0.0));
+   b.push_div(card, controls)
+}
+
+/// The filters, then the plugins as a grid of cards. A card's gear or info
+/// icon opens its modal.
+fn render_plugins_tab(
+   b: &Builder,
+   root: RawDiv,
+   plugins: &[phoenix_runtime::PluginInfo],
+   ui: &UiState,
+   search: Option<crate::modal::PageField>,
+) -> RawDiv {
+   let mut actions = b.h_row(6.0, false);
+   actions = b.push_button(
+      actions,
       "sunbird-toolbar-install-url",
       "+ URL",
       BtnVariant::Primary,
       BtnSize::Small,
       Action::OpenInstallUrl,
    );
-   right_actions = b.push_button(
-      right_actions,
+   actions = b.push_button(
+      actions,
       "sunbird-toolbar-install-file",
       "+ File...",
       BtnVariant::Secondary,
       BtnSize::Small,
       Action::InstallFromFile,
    );
-   right_actions = b.push_button(
-      right_actions,
+   actions = b.push_button(
+      actions,
       "sunbird-toolbar-reload-all",
       "Reload All",
       BtnVariant::Secondary,
       BtnSize::Small,
       Action::ReloadAll,
    );
+   let filters = [
+      PluginFilter::All,
+      PluginFilter::Enabled,
+      PluginFilter::Disabled,
+   ];
+   let dropdown = Dropdown {
+      label:   ui.filter.label(),
+      open:    ui.filter_open,
+      toggle:  Action::ToggleFilterMenu,
+      options: filters
+         .into_iter()
+         .map(|filter| {
+            (
+               filter.label(),
+               filter == ui.filter,
+               Action::SetFilter(filter),
+            )
+         })
+         .collect(),
+   };
+   let (root, query) = render_filters(b, root, search, dropdown, actions);
 
-   let mut toolbar = b.h_row(8.0, true);
-   toolbar = b.push_div(toolbar, left_pills);
-   toolbar = b.push_div(toolbar, right_actions);
-   root = b.push_div(root, toolbar);
-
-   let filtered: Vec<&phoenix_runtime::PluginInfo> = plugins
+   let cards = plugins
       .iter()
-      .filter(|p| {
-         match filter {
-            PluginFilter::All => true,
-            PluginFilter::Enabled => p.state.is_on(),
-            PluginFilter::Disabled => !p.state.is_on(),
-         }
+      .filter(|plugin| {
+         ui.filter.keeps(plugin)
+            && matches_query(&plugin.name, plugin.header.description.as_deref(), &query)
       })
+      .map(|plugin| plugin_card(b, plugin))
       .collect();
-
-   if filtered.is_empty() {
-      let msg = if plugins.is_empty() {
-         "Open the Plugin Catalog tab to install plugins."
-      } else {
-         "No plugins match the current filter."
-      };
-      let mut empty = b.card(8.0, 16.0, 8.0, 0.18);
-      empty = b.push_div(empty, b.text_block("Nothing here", msg));
-      return b.push_div(root, empty);
-   }
-
-   let mut list = b.v_stack(10.0);
-   for plugin in filtered {
-      let is_open = expanded.contains(&plugin.name);
-      let compat = DesktopCompat::of(&plugin.name);
-      let badge = b.compat_badge(compat);
-      let mut card = b.card(10.0, 14.0, 8.0, if plugin.state.is_on() { 0.22 } else { 0.14 });
-
-      let mut title = plugin.header.version.as_ref().map_or_else(
-         || plugin.name.clone(),
-         |ver| format!("{}  v{ver}", plugin.name),
-      );
-      if badge.is_none()
-         && let Some(tag) = compat.tag()
-      {
-         title.push_str("  [");
-         title.push_str(tag);
-         title.push(']');
-      }
-      let mut desc_parts = Vec::new();
-      if let Some(d) = &plugin.header.description {
-         desc_parts.push(d.clone());
-      }
-      if let Some(a) = &plugin.header.author {
-         desc_parts.push(format!("by {a}"));
-      }
-      if badge.is_none() {
-         match compat {
-            DesktopCompat::Full => {},
-            DesktopCompat::Partial => desc_parts.push("Partial desktop support".to_owned()),
-            DesktopCompat::MobileOnly => {
-               desc_parts.push("Targets mobile UI; may not work on desktop".to_owned());
-            },
-            DesktopCompat::Unverified => desc_parts.push("Unverified on desktop".to_owned()),
-         }
-      }
-      if plugin.permissions.is_empty() {
-         desc_parts.push("No permissions".to_owned());
-      } else {
-         let labels = plugin.permissions.iter().map(|permission| permission.label());
-         desc_parts.push(format!("Reaches {}", labels.collect::<Vec<_>>().join(", ")));
-      }
-      if let Some(err) = plugin.state.error() {
-         desc_parts.push(format!("Error: {err}"));
-      }
-      let desc = desc_parts.join(" · ");
-
-      card = b.push_div(
-         card,
-         b.switch_row(
-            &format!("sunbird-plugin-{}", plugin.name),
-            &title,
-            (!desc.is_empty()).then_some(desc.as_str()),
-            plugin.state.is_on(),
-            Action::TogglePlugin(plugin.name.clone()),
-         ),
-      );
-
-      let has_settings = plugin.state.is_on() && !plugin.settings.is_empty();
-      let mut buttons = b.h_row(8.0, false);
-      if has_settings {
-         let lbl = if is_open {
-            format!("▾ Hide Settings ({})", plugin.settings.len())
-         } else {
-            format!("▸ Settings ({})", plugin.settings.len())
-         };
-         buttons = b.push_button(
-            buttons,
-            &format!("sunbird-expand-{}", plugin.name),
-            &lbl,
-            if is_open {
-               BtnVariant::Primary
-            } else {
-               BtnVariant::Secondary
-            },
-            BtnSize::Small,
-            Action::ToggleExpandPlugin(plugin.name.clone()),
-         );
-      }
-      buttons = b.push_button(
-         buttons,
-         &format!("sunbird-edit-{}", plugin.name),
-         "Edit Code",
-         BtnVariant::Secondary,
-         BtnSize::Small,
-         Action::EditPluginCode(plugin.name.clone()),
-      );
-      if plugin.state.is_on() && plugin.installed {
-         buttons = b.push_button(
-            buttons,
-            &format!("sunbird-reload-{}", plugin.name),
-            "Reload",
-            BtnVariant::Secondary,
-            BtnSize::Small,
-            Action::ReloadPlugin(plugin.name.clone()),
-         );
-      }
-      if !plugin.state.is_on() && plugin.installed {
-         buttons = b.push_button(
-            buttons,
-            &format!("sunbird-remove-{}", plugin.name),
-            "Remove",
-            BtnVariant::Critical,
-            BtnSize::Small,
-            Action::UninstallPlugin(plugin.name.clone()),
-         );
-      }
-      let footer = if let Some(badge_div) = badge {
-         let mut row = b.h_row(8.0, true);
-         row = b.push_div(row, buttons);
-         b.push_div(row, badge_div)
-      } else {
-         buttons
-      };
-      card = b.push_div(card, footer);
-
-      // Collapsible per-plugin settings dropdown drawer
-      if has_settings && is_open {
-         card = b.push_div(card, b.divider());
-         let mut drawer = b.card(10.0, 12.0, 6.0, 0.14);
-         for setting in &plugin.settings {
-            let sid = format!("sunbird-set-{}-{}", plugin.name, setting.key);
-            let sdesc = setting.description.as_deref().unwrap_or("");
-            // A text, number or secret setting: its value, and Edit for an
-            // input.
-            let edit_row = |shown: &str, initial: String, kind: FieldKind| {
-               let sub = if sdesc.is_empty() {
-                  shown.to_owned()
-               } else {
-                  format!("{sdesc} · {shown}")
-               };
-               b.action_row(
-                  &sid,
-                  &setting.title,
-                  &sub,
-                  "Edit",
-                  BtnVariant::Secondary,
-                  BtnSize::Small,
-                  Action::EditSetting(SettingField {
-                     plugin: plugin.name.clone(),
-                     key: setting.key.clone(),
-                     title: setting.title.clone(),
-                     initial,
-                     kind,
-                  }),
-               )
-            };
-            match &setting.control {
-               Control::Switch(val) => {
-                  drawer = b.push_div(
-                     drawer,
-                     b.switch_row(
-                        &sid,
-                        &setting.title,
-                        setting.description.as_deref(),
-                        *val,
-                        Action::ToggleSetting {
-                           plugin: plugin.name.clone(),
-                           key:    setting.key.clone(),
-                        },
-                     ),
-                  );
-               },
-               Control::Select { options, chosen } => {
-                  let cur_label = options
-                     .iter()
-                     .find(|o| o.value == *chosen)
-                     .map_or(chosen.as_str(), |o| o.label.as_str());
-                  let dropdown_open =
-                     open_select.is_some_and(|(p, k)| p == &plugin.name && k == &setting.key);
-                  let trigger_lbl = if dropdown_open {
-                     format!("{cur_label} ▴")
-                  } else {
-                     format!("{cur_label} ▾")
-                  };
-                  drawer = b.push_div(
-                     drawer,
-                     b.action_row(
-                        &sid,
-                        &setting.title,
-                        sdesc,
-                        &trigger_lbl,
-                        if dropdown_open {
-                           BtnVariant::Primary
-                        } else {
-                           BtnVariant::Secondary
-                        },
-                        BtnSize::Small,
-                        Action::ToggleSelectDropdown {
-                           plugin: plugin.name.clone(),
-                           key:    setting.key.clone(),
-                        },
-                     ),
-                  );
-                  if dropdown_open && !options.is_empty() {
-                     let mut menu = b.card(6.0, 8.0, 6.0, 0.24);
-                     for opt in options {
-                        let selected = opt.value == *chosen;
-                        let opt_lbl = if selected {
-                           format!("✓  {}", opt.label)
-                        } else {
-                           opt.label.clone()
-                        };
-                        menu = b.push_button(
-                           menu,
-                           &format!("{sid}-opt-{}", opt.value),
-                           &opt_lbl,
-                           if selected {
-                              BtnVariant::Primary
-                           } else {
-                              BtnVariant::Secondary
-                           },
-                           BtnSize::Small,
-                           Action::PickSelectOption {
-                              plugin: plugin.name.clone(),
-                              key:    setting.key.clone(),
-                              value:  opt.value.clone(),
-                           },
-                        );
-                     }
-                     drawer = b.push_div(drawer, menu);
-                  }
-               },
-               Control::Button => {
-                  drawer = b.push_div(
-                     drawer,
-                     b.action_row(
-                        &sid,
-                        &setting.title,
-                        sdesc,
-                        &setting.title,
-                        BtnVariant::Secondary,
-                        BtnSize::Small,
-                        Action::PressButton {
-                           plugin: plugin.name.clone(),
-                           key:    setting.key.clone(),
-                        },
-                     ),
-                  );
-               },
-               Control::Text(val) => {
-                  let count = val.lines().filter(|line| !line.trim().is_empty()).count();
-                  let shown = match (setting.multiline, count) {
-                     (_, 0) => "empty".to_owned(),
-                     (true, 1) => "1 line".to_owned(),
-                     (true, n) => format!("{n} lines"),
-                     (false, _) => val.clone(),
-                  };
-                  let kind = if setting.multiline {
-                     FieldKind::Lines
-                  } else {
-                     FieldKind::Text
-                  };
-                  drawer = b.push_div(drawer, edit_row(&shown, val.clone(), kind));
-               },
-               Control::Secret(val) => {
-                  let shown = if val.is_empty() { "not set" } else { "set" };
-                  drawer = b.push_div(drawer, edit_row(shown, String::new(), FieldKind::Secret));
-               },
-               Control::Number(val) => {
-                  let shown = val.to_string();
-                  drawer = b.push_div(drawer, edit_row(&shown, shown.clone(), FieldKind::Number));
-               },
-            }
-         }
-         card = b.push_div(card, drawer);
-      }
-
-      list = b.push_div(list, card);
-   }
-
-   b.push_div(root, list)
+   let empty = if plugins.is_empty() {
+      "Open the Plugin Catalog tab to install plugins."
+   } else {
+      "No plugins match the current filters."
+   };
+   render_grid(b, root, "Plugins", cards, empty)
 }
 
-#[expect(clippy::too_many_arguments, reason = "one per GPUI row part")]
-fn render_catalog_group(
-   b: &Builder,
-   mut root: RawDiv,
-   group: CatalogGroup,
-   title: &str,
-   subtitle: &str,
-   items: &[&Listed],
-   installed: &HashSet<String>,
-   open: bool,
-) -> RawDiv {
-   if items.is_empty() {
-      return root;
+/// A plugin's card: its name and description, the gear or info icon, and its
+/// switch.
+fn plugin_card(b: &Builder, plugin: &phoenix_runtime::PluginInfo) -> RawDiv {
+   let mut desc = plugin.header.description.clone().unwrap_or_default();
+   // The modal shows the whole error; a stack trace would stretch the card.
+   if let Some(err) = plugin.state.error().and_then(|err| err.lines().next()) {
+      if !desc.is_empty() {
+         desc.push_str(" · ");
+      }
+      desc.push_str("Error: ");
+      desc.push_str(err);
    }
-   let btn_lbl = if open {
-      format!("▾ Hide ({})", items.len())
+   let mut controls = b.h_row(8.0, false);
+   let (svg, fallback) = if plugin.settings.is_empty() {
+      (INFO_SVG, "i")
    } else {
-      format!("▸ Show ({})", items.len())
+      (GEAR_SVG, "\u{2699}")
    };
-   let mut section = b.card(10.0, 14.0, 8.0, 0.18);
-   section = b.push_div(
-      section,
-      b.action_row(
-         &format!("sunbird-cat-group-{}", group as u8),
-         title,
-         subtitle,
-         &btn_lbl,
-         BtnVariant::Secondary,
-         BtnSize::Small,
-         Action::ToggleCatalogGroup(group),
+   if let Some(icon) = b.icon_button(svg, fallback, Action::OpenPlugin(plugin.name.clone())) {
+      controls = b.push_div(controls, icon);
+   }
+   controls = b.push_div(
+      controls,
+      b.switch_row(
+         &format!("sunbird-plugin-{}", plugin.name),
+         "",
+         None,
+         plugin.state.is_on(),
+         Action::TogglePlugin(plugin.name.clone()),
       ),
    );
-   if open {
-      section = b.push_div(section, b.divider());
-      let mut list = b.v_stack(8.0);
-      for item in items {
-         let is_installed = installed.contains(&item.name);
-         let compat = DesktopCompat::of(&item.name);
-         let sub = match &item.warning {
-            Some(w) if !w.is_empty() => format!("{} · Note: {w}", item.description),
-            _ => item.description.clone(),
-         };
-         let mut row_card = b.card(8.0, 12.0, 6.0, 0.14);
-         row_card = b.push_div(
-            row_card,
-            b.action_row(
-               &format!("sunbird-cat-{}", item.name),
-               &item.name,
-               &sub,
-               if is_installed { "Reinstall" } else { "Install" },
-               if is_installed {
-                  BtnVariant::Secondary
-               } else {
-                  BtnVariant::Primary
-               },
-               BtnSize::Small,
-               Action::InstallCatalog(item.name.clone()),
-            ),
-         );
-         if let Some(badge) = b.compat_badge(compat) {
-            let tag_row = b.push_div(b.h_row(6.0, false), badge);
-            row_card = b.push_div(row_card, tag_row);
-         }
-         list = b.push_div(list, row_card);
-      }
-      section = b.push_div(section, list);
-   }
-   root = b.push_div(root, section);
-   root
+   grid_card(b, &plugin.name, &desc, controls)
 }
 
-#[expect(
-   clippy::too_many_lines,
-   reason = "one GPUI element tree, built top to bottom"
-)]
+/// The filters, then the site's plugins as a grid of cards, each with its
+/// install button.
 fn render_catalog_tab(
    b: &Builder,
    mut root: RawDiv,
    installed: &HashSet<String>,
-   open_groups: &HashSet<CatalogGroup>,
+   ui: &UiState,
+   search: Option<crate::modal::PageField>,
 ) -> RawDiv {
-   root = b.push_div(
-      root,
-      b.action_row(
-         "sunbird-catalog-refresh",
-         "Official Plugin Catalog",
-         "Install plugins directly from assets.sunbird.tools.",
-         "Refresh",
-         BtnVariant::Secondary,
-         BtnSize::Small,
-         Action::RefreshCatalog,
-      ),
+   let actions = b.push_button(
+      b.h_row(6.0, false),
+      "sunbird-catalog-refresh",
+      "Refresh",
+      BtnVariant::Secondary,
+      BtnSize::Small,
+      Action::RefreshCatalog,
    );
+   let groups = [
+      None,
+      Some(CatalogGroup::Desktop),
+      Some(CatalogGroup::Partial),
+      Some(CatalogGroup::Other),
+   ];
+   let dropdown = Dropdown {
+      label:   CatalogGroup::label(ui.catalog_filter),
+      open:    ui.catalog_filter_open,
+      toggle:  Action::ToggleCatalogFilterMenu,
+      options: groups
+         .into_iter()
+         .map(|group| {
+            (
+               CatalogGroup::label(group),
+               group == ui.catalog_filter,
+               Action::SetCatalogFilter(group),
+            )
+         })
+         .collect(),
+   };
+   let (filtered_root, query) = render_filters(b, root, search, dropdown, actions);
+   root = filtered_root;
 
    let catalog = update::catalog();
-   match catalog {
-      Catalog::Unfetched => {
-         update::fetch_catalog();
+   if matches!(catalog, Catalog::Unfetched) {
+      update::fetch_catalog();
+   }
+   let items = match catalog {
+      Catalog::Unfetched | Catalog::Loading => {
          let mut box_div = b.card(8.0, 14.0, 8.0, 0.18);
          box_div = b.push_div(
             box_div,
@@ -2202,18 +2154,7 @@ fn render_catalog_tab(
                "Loading official plugins from assets.sunbird.tools.",
             ),
          );
-         root = b.push_div(root, box_div);
-      },
-      Catalog::Loading => {
-         let mut box_div = b.card(8.0, 14.0, 8.0, 0.18);
-         box_div = b.push_div(
-            box_div,
-            b.text_block(
-               "Fetching catalog...",
-               "Loading official plugins from assets.sunbird.tools.",
-            ),
-         );
-         root = b.push_div(root, box_div);
+         return b.push_div(root, box_div);
       },
       Catalog::Failed(err) => {
          let mut box_div = b.card(8.0, 14.0, 8.0, 0.22);
@@ -2229,60 +2170,299 @@ fn render_catalog_tab(
                Action::RefreshCatalog,
             ),
          );
-         root = b.push_div(root, box_div);
+         return b.push_div(root, box_div);
       },
-      Catalog::Loaded(items) => {
-         let desktop: Vec<&Listed> = items
+      Catalog::Loaded(items) => items,
+   };
+
+   let cards = items
+      .iter()
+      .filter(|item| {
+         ui.catalog_filter
+            .is_none_or(|group| CatalogGroup::of(&item.name) == group)
+            && matches_query(&item.name, Some(&item.description), &query)
+      })
+      .map(|item| catalog_card(b, item, installed.contains(&item.name)))
+      .collect();
+   render_grid(
+      b,
+      root,
+      "Plugins",
+      cards,
+      "No plugins match the current filters.",
+   )
+}
+
+/// A site plugin's card: its name, description and note, and its install
+/// button over its desktop support.
+fn catalog_card(b: &Builder, item: &Listed, installed: bool) -> RawDiv {
+   const ALIGN_END: u8 = 3;
+   let mut desc = item.description.clone();
+   if let Some(note) = item.warning.as_deref().filter(|note| !note.is_empty()) {
+      desc.push_str(" · Note: ");
+      desc.push_str(note);
+   }
+   // The tag goes under the button, in the space the description leaves.
+   let mut column = b.v_stack(8.0);
+   b.style_div(&mut column, |s| s.set(s.at.align_items, ALIGN_END));
+   let mut controls = b.push_button(
+      column,
+      &format!("sunbird-cat-{}", item.name),
+      if installed { "Reinstall" } else { "Install" },
+      if installed {
+         BtnVariant::Secondary
+      } else {
+         BtnVariant::Primary
+      },
+      BtnSize::Small,
+      Action::InstallCatalog(item.name.clone()),
+   );
+   if let Some(badge) = b.compat_badge(DesktopCompat::of(&item.name)) {
+      controls = b.push_div(controls, badge);
+   }
+   grid_card(b, &item.name, &desc, controls)
+}
+
+/// The page the last gear or info icon opened, rebuilt after each change on
+/// it.
+static PLUGIN_PAGE: Mutex<Option<u64>> = Mutex::new(None);
+
+fn open_plugin_page(name: &str) {
+   crate::modal::refill_page_fields();
+   if let Some(spec) = plugin_page(name) {
+      *PLUGIN_PAGE.lock().unwrap_or_else(PoisonError::into_inner) =
+         Some(crate::modal::open_page(spec));
+   }
+}
+
+/// Shows `name`'s page again with what changed, and the cards under it.
+fn refresh_plugin_page(name: &str) {
+   let id = *PLUGIN_PAGE.lock().unwrap_or_else(PoisonError::into_inner);
+   if let (Some(id), Some(spec)) = (id, plugin_page(name)) {
+      crate::modal::replace_page(id, spec);
+   }
+   crate::modal::force_redraw();
+}
+
+fn page_button(
+   label: &str,
+   primary: bool,
+   on_press: impl Fn() + Send + Sync + 'static,
+) -> ModalButton {
+   ModalButton {
+      label: label.to_owned(),
+      danger: false,
+      primary,
+      on_press: Arc::new(on_press),
+   }
+}
+
+/// A plugin's modal: what it is and reaches, its actions, and its settings
+/// while it is on.
+fn plugin_page(name: &str) -> Option<PageModalSpec> {
+   let plugin = phoenix_runtime::plugins()
+      .into_iter()
+      .find(|p| p.name == name)?;
+   let mut sections = Vec::new();
+   if let Some(desc) = &plugin.header.description {
+      sections.push(ModalSection::Text {
+         title: None,
+         text:  desc.clone(),
+      });
+   }
+
+   let mut about = Vec::new();
+   match (&plugin.header.version, &plugin.header.author) {
+      (Some(version), Some(author)) => about.push(format!("v{version} by {author}")),
+      (Some(version), None) => about.push(format!("v{version}")),
+      (None, Some(author)) => about.push(format!("By {author}")),
+      (None, None) => {},
+   }
+   if plugin.permissions.is_empty() {
+      about.push("No permissions".to_owned());
+   } else {
+      let labels = plugin
+         .permissions
+         .iter()
+         .map(|permission| permission.label());
+      about.push(format!("Reaches {}", labels.collect::<Vec<_>>().join(", ")));
+   }
+   match DesktopCompat::of(&plugin.name) {
+      DesktopCompat::Full => {},
+      DesktopCompat::Partial => about.push("Partial desktop support".to_owned()),
+      DesktopCompat::MobileOnly => {
+         about.push("Targets mobile UI; may not work on desktop".to_owned());
+      },
+      DesktopCompat::Unverified => about.push("Unverified on desktop".to_owned()),
+   }
+   if let Some(err) = plugin.state.error() {
+      about.push(format!("Error: {err}"));
+   }
+   sections.push(ModalSection::Text {
+      title: Some("About".to_owned()),
+      text:  about.join("\n"),
+   });
+
+   let mut actions = Vec::new();
+   let owned = plugin.name.clone();
+   actions.push(page_button("Edit Code", false, move || {
+      run(Action::EditPluginCode(owned.clone()));
+   }));
+   if plugin.state.is_on() && plugin.installed {
+      let owned = plugin.name.clone();
+      actions.push(page_button("Reload", false, move || {
+         phoenix_runtime::reload(&owned);
+         refresh_plugin_page(&owned);
+      }));
+   }
+   if !plugin.state.is_on() && plugin.installed {
+      let owned = plugin.name.clone();
+      actions.push(ModalButton {
+         label:    "Remove".to_owned(),
+         danger:   true,
+         primary:  false,
+         on_press: Arc::new(move || {
+            run(Action::UninstallPlugin(owned.clone()));
+            let page = *PLUGIN_PAGE.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(id) = page {
+               crate::modal::close_page(id);
+            }
+         }),
+      });
+   }
+   sections.push(ModalSection::Buttons {
+      title:   None,
+      buttons: actions,
+   });
+
+   if plugin.settings.is_empty() {
+      return Some(PageModalSpec {
+         title: plugin.name,
+         sections,
+      });
+   }
+   if !plugin.state.is_on() {
+      sections.push(ModalSection::Text {
+         title: Some("Settings".to_owned()),
+         text:  "Turn the plugin on to change them.".to_owned(),
+      });
+      return Some(PageModalSpec {
+         title: plugin.name,
+         sections,
+      });
+   }
+   for setting in &plugin.settings {
+      sections.push(setting_section(&plugin.name, setting));
+   }
+   Some(PageModalSpec {
+      title: plugin.name,
+      sections,
+   })
+}
+
+/// One setting on a plugin's modal. Each change shows the page again.
+fn setting_section(plugin: &str, setting: &phoenix_runtime::Setting) -> ModalSection {
+   let title = |shown: Option<&str>| {
+      let mut line = setting.title.clone();
+      for part in [setting.description.as_deref(), shown]
+         .into_iter()
+         .flatten()
+      {
+         if !part.is_empty() {
+            line.push_str(" · ");
+            line.push_str(part);
+         }
+      }
+      Some(line)
+   };
+   let (plugin, key) = (plugin.to_owned(), setting.key.clone());
+   match &setting.control {
+      Control::Switch(checked) => {
+         ModalSection::Switch {
+            id:          format!("sunbird-set-{plugin}-{key}"),
+            label:       setting.title.clone(),
+            description: setting.description.clone(),
+            checked:     *checked,
+            on_toggle:   Arc::new(move |on| {
+               phoenix_runtime::set_setting(&plugin, &key, Chosen::Switch(on));
+               refresh_plugin_page(&plugin);
+            }),
+         }
+      },
+      Control::Select { options, chosen } => {
+         let buttons = options
             .iter()
-            .filter(|i| DesktopCompat::of(&i.name) == DesktopCompat::Full)
-            .collect();
-         let partial: Vec<&Listed> = items
-            .iter()
-            .filter(|i| DesktopCompat::of(&i.name) == DesktopCompat::Partial)
-            .collect();
-         let other: Vec<&Listed> = items
-            .iter()
-            .filter(|i| {
-               matches!(
-                  DesktopCompat::of(&i.name),
-                  DesktopCompat::MobileOnly | DesktopCompat::Unverified
-               )
+            .map(|option| {
+               let (plugin, key, value) = (plugin.clone(), key.clone(), option.value.clone());
+               page_button(&option.label, option.value == *chosen, move || {
+                  phoenix_runtime::set_setting(&plugin, &key, Chosen::Text(value.clone()));
+                  refresh_plugin_page(&plugin);
+               })
             })
             .collect();
-
-         root = render_catalog_group(
-            b,
-            root,
-            CatalogGroup::Desktop,
-            "Desktop Ready",
-            "Confirmed working on Desktop Phoenix.",
-            &desktop,
-            installed,
-            open_groups.contains(&CatalogGroup::Desktop),
-         );
-         root = render_catalog_group(
-            b,
-            root,
-            CatalogGroup::Partial,
-            "Partial Desktop Support",
-            "Core hooks work on desktop; some features are still pending or unconfirmed.",
-            &partial,
-            installed,
-            open_groups.contains(&CatalogGroup::Partial),
-         );
-         root = render_catalog_group(
-            b,
-            root,
-            CatalogGroup::Other,
-            "Mobile Only & Unverified",
-            "Targets Android Phoenix's UI tree or has not been confirmed on desktop yet.",
-            &other,
-            installed,
-            open_groups.contains(&CatalogGroup::Other),
-         );
+         ModalSection::Buttons {
+            title: title(None),
+            buttons,
+         }
+      },
+      Control::Button => {
+         ModalSection::Buttons {
+            title:   setting.description.clone(),
+            buttons: vec![page_button(&setting.title, false, move || {
+               phoenix_runtime::press(&plugin, &key);
+            })],
+         }
+      },
+      Control::Text(value) => {
+         ModalSection::Field {
+            id:          format!("sunbird-set-{plugin}-{key}"),
+            label:       setting.title.clone(),
+            description: setting.description.clone(),
+            initial:     value.clone(),
+            multiline:   setting.multiline,
+            on_change:   Arc::new(move |text| {
+               phoenix_runtime::set_setting(&plugin, &key, Chosen::Text(text));
+            }),
+         }
+      },
+      Control::Number(value) => {
+         ModalSection::Field {
+            id:          format!("sunbird-set-{plugin}-{key}"),
+            label:       setting.title.clone(),
+            description: setting.description.clone(),
+            initial:     value.to_string(),
+            multiline:   false,
+            // Text that is not a number yet waits for the next change.
+            on_change:   Arc::new(move |text| {
+               if let Ok(number) = text.trim().parse::<f64>()
+                  && number.is_finite()
+               {
+                  phoenix_runtime::set_setting(&plugin, &key, Chosen::Number(number));
+               }
+            }),
+         }
+      },
+      // A secret is never drawn, so it is typed into the editor, which starts
+      // empty.
+      Control::Secret(value) => {
+         let shown = if value.is_empty() { "not set" } else { "set" };
+         let reopen = plugin.clone();
+         let field = SettingField {
+            plugin,
+            key,
+            title: setting.title.clone(),
+            // Closing the editor brings the page back, still showing the old
+            // value.
+            then: Some(Arc::new(move || refresh_plugin_page(&reopen))),
+         };
+         ModalSection::Buttons {
+            title:   title(Some(shown)),
+            buttons: vec![page_button("Edit", false, move || {
+               crate::modal::open_setting_editor(field.clone());
+            })],
+         }
       },
    }
-   root
 }
 
 fn render_general_tab(b: &Builder, mut root: RawDiv) -> RawDiv {

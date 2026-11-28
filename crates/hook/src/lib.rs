@@ -40,6 +40,38 @@ pub mod x86;
 ))]
 pub type Inline = shadowhook::ShadowHook;
 
+/// A function `observe` redirects through its stub, on x86-64 or arm64.
+#[cfg(any(
+   all(target_arch = "x86_64", any(target_os = "linux", windows)),
+   all(target_os = "macos", target_arch = "aarch64"),
+))]
+pub struct Observed {
+   addr: usize,
+   hook: Inline,
+}
+
+#[cfg(any(
+   all(target_arch = "x86_64", any(target_os = "linux", windows)),
+   all(target_os = "macos", target_arch = "aarch64"),
+))]
+impl Observed {
+   #[must_use]
+   pub const fn addr(&self) -> usize {
+      self.addr
+   }
+
+   /// Puts the function's first bytes back. The stub stays allocated, since a
+   /// thread may still run it.
+   ///
+   /// # Safety
+   ///
+   /// As for [`Hook::detach`].
+   pub unsafe fn remove(self) -> Result<(), Error> {
+      // SAFETY: forwarded from the caller.
+      unsafe { self.hook.detach() }
+   }
+}
+
 #[derive(Debug, flub::Error)]
 pub enum Error {
    #[error("{backend} failed to initialize: {message}")]

@@ -5,12 +5,15 @@ const PRESETS: Record<string, string[]> = {
   "Catppuccin Latte": ["#dce0e8", "#e6e9ef", "#eff1f5", "#ccd0da", "#8839ef", "#4c4f69", "#6c6f85", "#bcc0cc"],
 };
 
-const presetCss = (colors: string[]) => {
+const LIGHT_PRESETS = new Set(["Catppuccin Latte"]);
+
+const presetCss = (name: string, colors: string[]) => {
   const vars = [
     "bg-tertiary", "bg-secondary", "bg-primary", "bg-elevated",
     "accent-color", "text-normal", "text-muted", "ui-border-color",
   ];
-  return `:root { ${vars.map((v, i) => `--${v}: ${colors[i]};`).join(" ")} }`;
+  const mode = LIGHT_PRESETS.has(name) ? "/* @mode light */ " : "";
+  return `${mode}:root { ${vars.map((v, i) => `--${v}: ${colors[i]};`).join(" ")} }`;
 };
 
 const themes = phoenix.themes;
@@ -21,7 +24,7 @@ if (!themes?.supported()) {
   const apply = (theme: string) => {
     try {
       if (theme.startsWith("file:")) themes.apply(theme.slice(5));
-      else if (PRESETS[theme]) themes.setCss(presetCss(PRESETS[theme]));
+      else if (PRESETS[theme]) themes.setCss(presetCss(theme, PRESETS[theme]));
       else themes.clear();
     } catch (err) {
       phoenix.log.warn(`desktop-themes: ${err}`);

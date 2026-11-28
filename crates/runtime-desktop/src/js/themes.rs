@@ -93,7 +93,7 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
                "themes are not supported on this build",
             ));
          }
-         crate::mana_theme::apply_file_ephemeral(&dir, &id)
+         crate::mana_theme::apply_file(&dir, &id)
             .map_err(|err| Exception::throw_message(&ctx, &err))?;
          set_active(Some((owner.clone(), Some(id))));
          Ok(())
@@ -104,6 +104,7 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
       "setCss",
       Function::new(ctx.clone(), move |css: String| {
          set_active(Some((owner.clone(), None)));
+         crate::mana_theme::forget_saved();
          gpui_theme::set_css(&css)
       })?,
    )?;

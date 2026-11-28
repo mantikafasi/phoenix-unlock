@@ -108,6 +108,19 @@ impl Isa {
    pub const fn ret(self) -> Reg {
       0
    }
+
+   /// The register the hidden pointer to a large return value arrives in.
+   #[must_use]
+   pub const fn sret(self) -> Reg {
+      match self {
+         #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+         Self::X86_64 { win64: true } => 1,
+         #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+         Self::X86_64 { win64: false } => 7,
+         Self::Aarch64 => 8,
+         Self::Thumb2 => 0,
+      }
+   }
 }
 
 /// One instruction, reduced to what locators branch on.

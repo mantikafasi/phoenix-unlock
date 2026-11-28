@@ -263,6 +263,14 @@ fn check(
          .map(|registry| format!("{} events", registry.iter().count()))
          .map_err(Clone::clone),
    );
+   report(
+      "handler ok word",
+      registry
+         .as_ref()
+         .map_err(Clone::clone)
+         .and_then(|registry| registry.ok_word(image, ix.isa))
+         .map(|word| format!("{word:#x}")),
+   );
    match machine {
       Machine::X86_64 => {
          let abi = x86::Abi::of(image);

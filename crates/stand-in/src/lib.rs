@@ -61,9 +61,11 @@ struct Event {
    rest: [u64; REST_WORDS],
 }
 
+const OK: HandlerResult = HandlerResult::ok(usize::MAX - 1);
+
 /// The result shape the loader expects on this target.
 const fn bad_payload() -> HandlerResult {
-   let mut result = HandlerResult::OK;
+   let mut result = OK;
    result.0[0] = 0;
    result.0[1] = 1;
    result
@@ -151,7 +153,7 @@ extern "C" fn message_create(
    );
    // SAFETY: dispatch passes the locked store.
    unsafe { &mut *store }.messages.push(message);
-   HandlerResult::OK
+   OK
 }
 
 extern "C" fn message_update(
@@ -173,7 +175,7 @@ extern "C" fn message_update(
       println!("[stand-in] edited {}: {}", update.id, update.content);
       *message = update;
    }
-   HandlerResult::OK
+   OK
 }
 
 extern "C" fn message_delete(
@@ -190,7 +192,7 @@ extern "C" fn message_delete(
       .messages
       .retain(|message| message.id != deleted.id);
    println!("[stand-in] deleted {}", deleted.id);
-   HandlerResult::OK
+   OK
 }
 
 #[derive(Deserialize)]
@@ -234,5 +236,5 @@ pub unsafe extern "C" fn stand_in_gateway_receive(frame: *const u8, len: usize) 
       .unwrap_or_else(std::sync::PoisonError::into_inner);
    let result = (entry.handler)(&raw mut *store, &raw const event, std::ptr::null_mut());
    drop(store);
-   result.is_ok()
+   result.is(OK.0[0])
 }

@@ -1026,6 +1026,7 @@ declare namespace Phoenix {
     /// The raw view tree methods are present with `hooks`. Icon URLs must point at Discord's CDN
     /// without `http`.
     readonly ui: Ui;
+    readonly platform: Platform;
     readonly commands: Commands;
     readonly log: Log;
     readonly storage: Storage;
@@ -1092,7 +1093,8 @@ declare namespace Phoenix {
     supported(): boolean;
     /// The `*.theme.css` files in the themes folder, by file name.
     list(): InstalledTheme[];
-    /// Applies a theme from `list()`.
+    /// Applies a theme from `list()` and keeps it after a restart until `clear()`, `setCss()`, or
+    /// unloading the plugin.
     apply(id: string): void;
     /// Applies stylesheet text, such as a bundled preset. Returns whether it themes anything.
     setCss(css: string): boolean;
@@ -1131,6 +1133,8 @@ declare namespace Phoenix {
   /// - `messages` `phoenix.messages`, which reads and rewrites message and composer text.
   /// - `hooks` `bridge`, the raw view tree and `gateway.onSend`, plus everything above.
   type Permission = "gateway" | "discord" | "http" | "messages" | "hooks";
+
+  type Platform = "android" | "ios" | "windows" | "linux" | "macos";
 
   interface Bridge {
     /// Invokes a native Phoenix host module method by its `hh.jb` numeric IDs (see
@@ -1280,7 +1284,9 @@ declare namespace Phoenix {
     onEmojiPick(handler: (emojiId: string, ctx: UiContext) => string | void): Remover;
     /// Runs when a sticker is pressed in the picker under the message box, with its id. Return
     /// `true` to take the press, so Phoenix neither sends the sticker nor shows a Nitro ad, or
-    /// nothing to leave it to Phoenix. Desktop has no picker presses to report.
+    /// nothing to leave it to Phoenix. Desktop also runs it for stickers sent from autocomplete,
+    /// and while a handler exists, a sticker needing Nitro that no handler takes goes to Discord,
+    /// which refuses it.
     onStickerPick(handler: (stickerId: string, ctx: UiContext) => boolean | void): Remover;
   }
 
@@ -1493,7 +1499,8 @@ declare namespace Phoenix {
     /// member list button (where Discord shows one), with `label` as its tooltip and `icon` mapped
     /// to Mana's icon of that name (`res://ic_mana_panel_open` is `PanelOpen`); `tint` is ignored.
     addHeaderButton(options: ButtonOptions): ButtonRemover;
-    /// In the message box, left of the emoji button.
+    /// In the message box, left of the emoji button. On Desktop Phoenix, a button labeled `label`
+    /// left of the chat bar, drawn as the primary button while `tint` is set; `icon` is ignored.
     addComposerButton(options: ButtonOptions): ButtonRemover;
     /// A line under each message's content, or after its timestamp with `placement: "header"`.
     /// It runs once per message and place, and the result is kept until `update`.

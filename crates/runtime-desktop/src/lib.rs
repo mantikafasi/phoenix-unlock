@@ -44,6 +44,7 @@ mod shortcuts;
 mod sidebar;
 mod spotify;
 mod staff;
+mod sticker;
 mod toolbar;
 
 use std::{
@@ -258,11 +259,13 @@ pub fn prepare() -> Result<(), Error> {
    feature("counts", || counts::install(&image, &ix));
    feature("icons", || icons::install(&image));
    feature("composer", || composer::install(&image));
+   feature("composer_buttons", || composer::buttons::install(&image, &ix));
    feature("spotify", || spotify::install(&ix));
    feature("sidebar", || sidebar::install(&image, &ix));
    feature("toolbar", || toolbar::install(&image, &ix));
    feature("badges", || badges::install(&image, &ix));
    feature("emoji", || emoji::install(&image, &ix));
+   feature("sticker", || sticker::install(&image, &ix));
    feature("call_idle_dm", || call_idle::install_dm(&image, &ix));
    feature("call_idle_afk", || call_idle::install_guild_afk(&image, &ix));
    feature("gpui_font", || gpui_font::install(&image, &ix));
@@ -707,13 +710,155 @@ impl Platform for Desktop {
                Err(err) => Some(remote::err("409 Conflict", &err)),
             }
          },
+         #[cfg(all(target_os = "macos", debug_assertions))]
+         ("GET", "/ui/screen") => Some(screen()),
+         #[cfg(all(target_os = "macos", debug_assertions))]
+         ("POST", "/ui/input") => Some(input(&request.body)),
          _ => None,
       }
    }
 
    fn routes(&self) -> &'static str {
-      ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health, GET /themes/tokens, \
-       POST /themes/reload, GET /themes/quick-css, POST /themes/quick-css"
+      if cfg!(all(target_os = "macos", debug_assertions)) {
+         ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health, GET /themes/tokens, \
+          POST /themes/reload, GET /themes/quick-css, POST /themes/quick-css, GET /ui/screen, \
+          POST /ui/input"
+      } else {
+         ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health, GET /themes/tokens, \
+          POST /themes/reload, GET /themes/quick-css, POST /themes/quick-css"
+      }
+   }
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn screen() -> remote::Reply {
+   phoenix_ui_desktop::input::screenshot().map_or_else(
+      || remote::err("503 Service Unavailable", "no window to capture"),
+      |png| ("200 OK", "image/png", png),
+   )
+}
+
+/// One input for `POST /ui/input`, in points from the window's top left.
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum Input {
+   Click {
+      x:     f64,
+      y:     f64,
+      #[serde(default)]
+      count: u8,
+      #[serde(default)]
+      right: bool,
+   },
+   Scroll {
+      x:  f64,
+      y:  f64,
+      #[serde(default)]
+      dx: i32,
+      dy: i32,
+   },
+   Text {
+      text: String,
+   },
+   Key {
+      key:  KeyName,
+      #[serde(default)]
+      mods: Vec<Modifier>,
+   },
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Modifier {
+   Shift,
+   Control,
+   Option,
+   Command,
+}
+
+/// A named key, or one character like `"k"`.
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum KeyName {
+   Named(NamedKey),
+   Char(char),
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum NamedKey {
+   Return,
+   Tab,
+   Escape,
+   Backspace,
+   Delete,
+   Left,
+   Right,
+   Down,
+   Up,
+   Home,
+   End,
+   PageUp,
+   PageDown,
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn input(body: &[u8]) -> remote::Reply {
+   use phoenix_ui_desktop::input::{
+      Key,
+      modifier,
+   };
+   let Ok(input) = serde_json::from_slice::<Input>(body) else {
+      return remote::err(
+         "400 Bad Request",
+         "expected a click, scroll, text or key input",
+      );
+   };
+   let done = match input {
+      Input::Click { x, y, count, right } => phoenix_ui_desktop::input::click(x, y, count, right),
+      Input::Scroll { x, y, dx, dy } => phoenix_ui_desktop::input::scroll(x, y, dx, dy),
+      Input::Text { text } => phoenix_ui_desktop::input::type_text(&text),
+      Input::Key { key, mods } => {
+         let key = match key {
+            KeyName::Char(char) => Key::Char(char),
+            KeyName::Named(named) => {
+               match named {
+                  NamedKey::Return => Key::Return,
+                  NamedKey::Tab => Key::Tab,
+                  NamedKey::Escape => Key::Escape,
+                  NamedKey::Backspace => Key::Backspace,
+                  NamedKey::Delete => Key::Delete,
+                  NamedKey::Left => Key::Left,
+                  NamedKey::Right => Key::Right,
+                  NamedKey::Down => Key::Down,
+                  NamedKey::Up => Key::Up,
+                  NamedKey::Home => Key::Home,
+                  NamedKey::End => Key::End,
+                  NamedKey::PageUp => Key::PageUp,
+                  NamedKey::PageDown => Key::PageDown,
+               }
+            },
+         };
+         let flags = mods.into_iter().fold(0, |flags, held| {
+            flags
+               | match held {
+                  Modifier::Shift => modifier::SHIFT,
+                  Modifier::Control => modifier::CONTROL,
+                  Modifier::Option => modifier::OPTION,
+                  Modifier::Command => modifier::COMMAND,
+               }
+         });
+         phoenix_ui_desktop::input::press(key, flags)
+      },
+   };
+   if done {
+      remote::ok_json(&Done::Started)
+   } else {
+      remote::err("503 Service Unavailable", "no window to send input to")
    }
 }
 

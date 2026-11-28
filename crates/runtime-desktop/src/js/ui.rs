@@ -92,6 +92,7 @@ use crate::{
       self,
       Tweak,
    },
+   sticker,
    toolbar,
 };
 
@@ -1333,6 +1334,110 @@ pub fn press_header_button(engine: &Engine, id: u64) {
    });
 }
 
+/// `phoenix.ui.addComposerButton`: a button ahead of the chat bar's own.
+/// `update` changes its label or tint.
+fn add_composer_button<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   use composer::buttons::{
+      self,
+      Button,
+   };
+
+   static NEXT_BUTTON: AtomicU64 = AtomicU64::new(1);
+
+   let label = options.get::<_, String>("label")?;
+   let on = options.get::<_, Option<u32>>("tint")?.is_some();
+   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   let id = NEXT_BUTTON.fetch_add(1, Ordering::Relaxed);
+   registry
+      .composer_buttons
+      .borrow_mut()
+      .push((id, plugin.to_owned(), on_press));
+   drop(registry);
+   let state = Rc::new(RefCell::new((label.clone(), on)));
+   buttons::set(Button { id, label, on });
+
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      registry
+         .composer_buttons
+         .borrow_mut()
+         .retain(|(held, ..)| *held != id);
+      buttons::remove(&[id]);
+   })?;
+   remove.set(
+      "update",
+      Function::new(
+         ctx.clone(),
+         move |patch: Object<'js>| -> rquickjs::Result<()> {
+            let mut state = state.borrow_mut();
+            if let Some(label) = patch.get::<_, Option<String>>("label")? {
+               state.0 = label;
+            }
+            if patch.contains_key("tint")? {
+               state.1 = patch.get::<_, Option<u32>>("tint")?.is_some();
+            }
+            buttons::set(Button {
+               id,
+               label: state.0.clone(),
+               on: state.1,
+            });
+            Ok(())
+         },
+      )?,
+   )?;
+   Ok(remove)
+}
+
+/// Drops the composer buttons `plugin` added.
+pub fn unload_composer_buttons(registry: &Desktop<'_>, plugin: &str) {
+   let mut gone = Vec::new();
+   registry
+      .composer_buttons
+      .borrow_mut()
+      .retain(|&(id, ref owner, _)| {
+         let held = owner == plugin;
+         if held {
+            gone.push(id);
+         }
+         !held
+      });
+   composer::buttons::remove(&gone);
+}
+
+/// Runs the `onPress` of composer button `id`.
+pub fn press_composer_button(engine: &Engine, id: u64) {
+   engine.with(|ctx| {
+      let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+         return;
+      };
+      let found = registry
+         .composer_buttons
+         .borrow()
+         .iter()
+         .find(|(held, ..)| *held == id)
+         .map(|(_, plugin, press)| (plugin.clone(), press.clone()));
+      drop(registry);
+      let Some((plugin, press)) = found else {
+         return;
+      };
+      let Ok(arg) = build_message_context(&ctx, 0, 0, false) else {
+         return;
+      };
+      if let Err(err) = press.call::<_, Value<'_>>((arg,)).catch(&ctx) {
+         log::error!("[{plugin}] addComposerButton onPress: {err}");
+      }
+   });
+}
+
 /// `phoenix.ui.addShortcut`: `run` for a letter or digit pressed with Ctrl or
 /// Alt while Discord is focused, which Discord then never sees.
 fn add_shortcut<'js>(
@@ -1579,11 +1684,13 @@ pub fn desktop_patch_api<'js>(
          move |ctx: Ctx<'js>, _function: Opt<Value<'js>>| on_emoji_pick(&ctx, &name),
       )?,
    )?;
+   let name = plugin.to_owned();
    messages.set(
       "onStickerPick",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, _function: Opt<Value<'js>>| {
-         noop_handle(&ctx)
-      })?,
+      Function::new(
+         ctx.clone(),
+         move |ctx: Ctx<'js>, function: Function<'js>| on_sticker_pick(&ctx, &name, function),
+      )?,
    )?;
    let commands = Object::new(ctx.clone())?;
    commands.set(
@@ -1749,8 +1856,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          add_header_button(&ctx, &header_owner, &options)
       })?,
    )?;
-   for slot_fn in [
+   let composer_owner = plugin.to_owned();
+   ui.set(
       "addComposerButton",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         add_composer_button(&ctx, &composer_owner, &options)
+      })?,
+   )?;
+   for slot_fn in [
       "addProfileSection",
       "patchProps",
       "onNode",
@@ -1776,16 +1889,18 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          Function::new(ctx.clone(), |ctx: Ctx<'js>| Value::new_null(ctx))?,
       )?;
    }
+   let dialog_owner = plugin.to_owned();
    ui.set(
       "choose",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
-         choose_dialog(&ctx, &options)
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         choose_dialog(&ctx, &dialog_owner, &options)
       })?,
    )?;
+   let sheet_owner = plugin.to_owned();
    ui.set(
       "showSheet",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
-         sheet_dialog(&ctx, &options)
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         sheet_dialog(&ctx, &sheet_owner, &options)
       })?,
    )?;
    Ok(ui)
@@ -1795,6 +1910,7 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
 /// was dismissed.
 fn choose_dialog<'js>(
    ctx: &Ctx<'js>,
+   plugin: &str,
    options: &Object<'js>,
 ) -> rquickjs::Result<rquickjs::Promise<'js>> {
    let title = options.get::<_, Option<String>>("title")?;
@@ -1808,12 +1924,13 @@ fn choose_dialog<'js>(
    }
    let body = message.map(|text| ModalSection::Text { title: None, text });
    let title = title.unwrap_or_else(|| "Sunbird".to_owned());
-   in_background(ctx, move || answer(title, body, items))
+   in_background(ctx, plugin, move || answer(title, body, items))
 }
 
 /// `phoenix.ui.showSheet` as a native Mana modal with the code viewer.
 fn sheet_dialog<'js>(
    ctx: &Ctx<'js>,
+   plugin: &str,
    options: &Object<'js>,
 ) -> rquickjs::Result<rquickjs::Promise<'js>> {
    let title = options.get::<_, Option<String>>("title")?;
@@ -1832,7 +1949,7 @@ fn sheet_dialog<'js>(
       highlight,
    };
    let title = title.unwrap_or_else(|| "Sunbird".to_owned());
-   in_background(ctx, move || answer(title, Some(body), items))
+   in_background(ctx, plugin, move || answer(title, Some(body), items))
 }
 
 /// Opens a choose dialog and waits for the picked index, -1 when it is
@@ -1951,6 +2068,69 @@ fn on_emoji_pick<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function
          pickers.retain(|(existing, _)| *existing != id);
          emoji::unlock(!pickers.is_empty());
       }
+   })
+}
+
+fn on_sticker_pick<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   function: Function<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT: AtomicU64 = AtomicU64::new(0);
+
+   let id = NEXT.fetch_add(1, Ordering::Relaxed);
+   let registry = ctx
+      .userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .sticker_pickers
+      .borrow_mut()
+      .push((id, plugin.to_owned(), function));
+   sticker::set_active(true);
+   drop(registry);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut pickers = registry.sticker_pickers.borrow_mut();
+         pickers.retain(|(existing, ..)| *existing != id);
+         sticker::set_active(!pickers.is_empty());
+      }
+   })
+}
+
+/// Offers sticker `sticker_id`, chosen in `channel_id`, to the
+/// `onStickerPick` handlers, and whether one took it.
+pub fn pick_sticker(engine: &Engine, sticker_id: u64, channel_id: u64) -> bool {
+   engine.with(|ctx| {
+      let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+         return false;
+      };
+      let handlers = registry
+         .sticker_pickers
+         .borrow()
+         .iter()
+         .map(|(_, plugin, handler)| (plugin.clone(), handler.clone()))
+         .collect::<Vec<_>>();
+      drop(registry);
+      let Ok(context) = Object::new(ctx.clone()) else {
+         return false;
+      };
+      let _ = context.set("channelId", channel_id.to_string());
+      if let Ok(reply) = Function::new(ctx.clone(), String::new) {
+         let _ = context.set("reply", reply);
+      }
+      let id = sticker_id.to_string();
+      for (plugin, handler) in handlers {
+         restart_budget(&ctx);
+         match handler
+            .call::<_, Value<'_>>((id.as_str(), context.clone()))
+            .catch(&ctx)
+         {
+            Ok(taken) if taken.as_bool() == Some(true) => return true,
+            Ok(_) => {},
+            Err(err) => log::error!("[{plugin}] onStickerPick: {err}"),
+         }
+      }
+      false
    })
 }
 

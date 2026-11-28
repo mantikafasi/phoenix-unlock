@@ -90,13 +90,14 @@ pub fn storage<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js
 }
 
 /// `phoenix.stores`, read-only SQL over Phoenix's cache.
-pub fn stores_object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+pub fn stores_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    let stores = Object::new(ctx.clone())?;
+   let owner = plugin.to_owned();
    stores.set(
       "sql",
       Function::new(
          ctx.clone(),
-         |ctx: Ctx<'js>, sql: String, args: Rest<Value<'js>>| {
+         move |ctx: Ctx<'js>, sql: String, args: Rest<Value<'js>>| {
             let args = args
                .0
                .into_iter()
@@ -109,7 +110,7 @@ pub fn stores_object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
                })
                .collect::<rquickjs::Result<Vec<String>>>()?;
             let files = state().files_dir();
-            in_background(&ctx, move || {
+            in_background(&ctx, &owner, move || {
                Settlement::Rows(
                   store::database(&files).and_then(|db| store::query(&db, &sql, &args)),
                )
