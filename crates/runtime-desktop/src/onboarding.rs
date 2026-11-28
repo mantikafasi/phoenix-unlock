@@ -48,8 +48,11 @@ pub fn start() {
 }
 
 fn run() {
-   // Without the overlay hook the macOS panel fallback draws it, and nothing
-   // would ever mark the window seen.
+   // Without the overlay hook only the macOS panel fallback can draw it, and
+   // nothing would ever mark the window seen.
+   if !modal::hooked() && !cfg!(target_os = "macos") {
+      return;
+   }
    if modal::hooked() {
       let deadline = Instant::now() + WINDOW_WAIT;
       while !modal::window_seen() && Instant::now() < deadline {

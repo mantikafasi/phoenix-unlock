@@ -1,29 +1,65 @@
 //! Locators written once per source tree on [`Index`] queries. Each runs on
 //! every binary of its [`Family`], whatever the ISA.
 
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 pub mod call_idle;
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 pub mod channel;
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 pub mod composer;
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 pub mod counts;
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 pub mod message;
 pub mod menu;
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 pub mod ready;
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 pub mod settings;
 pub mod spotify;
 pub mod staff;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod sticker;
 
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 pub mod gpui;
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 pub mod mana_theme;
 
 use crate::{
@@ -108,7 +144,11 @@ pub const LOCATORS: &[Locator] = &[
       families: DESKTOP,
       run:      |ix| spotify::idle_activity(ix).map(|patch| format!("{patch:x?}")),
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "gpui builders",
       families: DESKTOP,
@@ -150,13 +190,21 @@ pub const LOCATORS: &[Locator] = &[
             .map(|check| format!("{:#x}, intention +{:#x}", check.func, check.intention))
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "message row",
       families: DESKTOP,
       run:      |ix| message::message_row(ix).map(|row| format!("{row:x?}")),
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "message body",
       families: DESKTOP,
@@ -166,7 +214,11 @@ pub const LOCATORS: &[Locator] = &[
             .map(|body| format!("{body:x?}"))
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "settings label",
       families: DESKTOP,
@@ -179,7 +231,11 @@ pub const LOCATORS: &[Locator] = &[
          })
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "settings visibility",
       families: DESKTOP,
@@ -193,7 +249,11 @@ pub const LOCATORS: &[Locator] = &[
          })
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "settings section",
       families: DESKTOP,
@@ -202,7 +262,11 @@ pub const LOCATORS: &[Locator] = &[
             .map(|section| format!("{:#x} (page +{:#x})", section.func, section.page_offset))
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "settings sidebar rows",
       families: DESKTOP,
@@ -225,7 +289,11 @@ pub const LOCATORS: &[Locator] = &[
          ))
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "settings title",
       families: DESKTOP,
@@ -251,7 +319,11 @@ pub const LOCATORS: &[Locator] = &[
             .and_then(|func| hookable(ix, func))
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "mana theme",
       families: DESKTOP,
@@ -272,7 +344,11 @@ pub const LOCATORS: &[Locator] = &[
          })
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "scene draw",
       families: DESKTOP,
@@ -289,7 +365,11 @@ pub const LOCATORS: &[Locator] = &[
          })
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "optimistic delete",
       families: DESKTOP,
@@ -304,7 +384,11 @@ pub const LOCATORS: &[Locator] = &[
          })
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "call idle",
       families: DESKTOP,
@@ -319,7 +403,11 @@ pub const LOCATORS: &[Locator] = &[
          ))
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "pending counts",
       families: DESKTOP,
@@ -337,7 +425,11 @@ pub const LOCATORS: &[Locator] = &[
          ))
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "home count",
       families: DESKTOP,
@@ -346,7 +438,11 @@ pub const LOCATORS: &[Locator] = &[
          hookable(ix, counts::home_count(ix, found.friend_requests)?)
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "home badge",
       families: DESKTOP,
@@ -355,7 +451,11 @@ pub const LOCATORS: &[Locator] = &[
          hookable(ix, counts::home_badge(ix, found.friend_requests)?)
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "relationship counts",
       families: DESKTOP,
@@ -367,7 +467,11 @@ pub const LOCATORS: &[Locator] = &[
             .map(|tallies| tallies.join(", "))
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "channel sidebar",
       families: DESKTOP,
@@ -410,7 +514,11 @@ pub const LOCATORS: &[Locator] = &[
          hookable(ix, ready::ready_text(ix, &parse)?)
       },
    },
-   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   #[cfg(any(
+      target_arch = "x86_64",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "aarch64")
+   ))]
    Locator {
       name:     "ready session",
       families: DESKTOP,
@@ -511,7 +619,11 @@ pub fn emoji_check(ix: &Index<'_>) -> Found<EmojiCheck> {
 }
 
 /// [`ready::ready_parse`] from the registry's READY handler.
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 fn ready_parse<'ix>(ix: &'ix Index<'ix>) -> Found<Func<'ix>> {
    let registry = ix.registry()?;
    let id = registry.id("READY").ok_or("the registry has no READY")?;
@@ -520,7 +632,11 @@ fn ready_parse<'ix>(ix: &'ix Index<'ix>) -> Found<Func<'ix>> {
 
 /// `func` with the whole instructions an x86-64 entry hook displaces there.
 /// arm64 hooks always displace four.
-#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+#[cfg(any(
+   target_arch = "x86_64",
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "aarch64")
+))]
 pub fn hookable(ix: &Index<'_>, func: usize) -> Found<String> {
    match ix.isa {
       crate::index::Isa::X86_64 { .. } => {

@@ -649,7 +649,7 @@ pub fn locate(image: &Image<'static>, ix: &Index<'_>) -> bool {
 /// The arm64 builders ([`phoenix_sigs::locate::gpui::gpui`]) with every one
 /// that returns through `x8` swapped for an `image::sret_caller` thunk, so they
 /// are called the x86 way, result slot first, like the types here say.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 fn arm64_builders(
    image: &Image<'_>,
    ix: &Index<'_>,
@@ -678,7 +678,7 @@ fn arm64_builders(
    Ok((thunked, layout, raw))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
 fn arm64_builders(
    _image: &Image<'_>,
    _ix: &Index<'_>,
@@ -1477,7 +1477,7 @@ pub fn locate_svg(image: &Image<'static>) {
    log::info!("desktop gpui: resolved Svg builders {found:x?}");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 fn arm64_svg_builders(image: &Image<'_>) -> Result<desktop::SvgBuilders, String> {
    let svg = phoenix_sigs::macos::svg_builders(image)?;
    let thunk = |addr: usize| {
@@ -1492,7 +1492,7 @@ fn arm64_svg_builders(image: &Image<'_>) -> Result<desktop::SvgBuilders, String>
    })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
 fn arm64_svg_builders(_image: &Image<'_>) -> Result<desktop::SvgBuilders, String> {
    Err("no arm64 Svg builders off macOS".to_owned())
 }
