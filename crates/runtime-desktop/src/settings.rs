@@ -170,15 +170,18 @@ type RowFn = unsafe extern "C" fn(
    closure: *const u8,
 ) -> *mut u8;
 
-/// What Sunbird's row is built from.
+/// What Sunbird's sidebar category (`Sunbird` header + `Plugins`, `Store`,
+/// `Settings`) is built from.
 struct Rows {
-   row:          RowFn,
-   click_vtable: usize,
-   click_offset: usize,
-   icon:         u16,
-   /// Sunbird's click with the layout of Log Out's closure, so Discord frees
+   row:           RowFn,
+   click_vtable:  usize,
+   click_offset:  usize,
+   icons:         [u16; 3],
+   separator_tag: Option<u32>,
+   header:        Option<(u32, usize)>,
+   /// Sunbird's clicks with the layout of Log Out's closure, so Discord frees
    /// the box Log Out's constructor makes.
-   click:        RcFnVtbl,
+   clicks:        [RcFnVtbl; 3],
 }
 
 /// How Sunbird reaches its page on this build.
@@ -213,10 +216,15 @@ pub fn hooked() -> bool {
    ORIG_SECTION.get().is_some()
 }
 
-/// Shows page 24, hooks `host::section`, and adds the Sunbird entry, or takes
-/// page 24 over where the entry can't be added.
+/// Whether Sunbird has its own native sidebar category (`Plugins`, `Store`,
+/// `Settings`), so the page does not need a fallback top tab bar.
+pub fn has_sidebar_category() -> bool {
+   matches!(MODE.get(), Some(Mode::Entry))
+}
+
+/// Hooks `host::section` and adds Sunbird's sidebar category, or unhides and
+/// takes page 24 over where the sidebar entry can't be added.
 pub fn install(image: &Image<'static>, ix: &Index<'_>) {
-   patch_page_visibility(image, ix);
    if !gpui::locate(image, ix) {
       return;
    }
@@ -225,8 +233,9 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    };
    if install_entry(image, ix, page_offset) {
       let _ = MODE.set(Mode::Entry);
-      log::info!("desktop settings: Sunbird has its own entry, page {PHOENIX_PAGE} stays Phoenix");
+      log::info!("desktop settings: Sunbird sidebar category installed");
    } else {
+      patch_page_visibility(image, ix);
       relabel(image, ix);
    }
 }
@@ -355,22 +364,31 @@ fn install_entry(image: &Image<'static>, ix: &Index<'_>, page_offset: usize) -> 
    ) else {
       return false;
    };
-   let _ = ROWS.set(Rows {
-      // SAFETY: the constructor the locator decoded, called with its out
-      // pointer first as `RowFn` has it.
-      row:          unsafe { std::mem::transmute::<usize, RowFn>(row) },
-      click_vtable: rows.click_vtable,
-      click_offset: rows.click_offset,
-      icon:         rows.gear,
-      click:        RcFnVtbl {
+   let make_click = |f: unsafe extern "C" fn(*const u64, *const c_void, *mut c_void, *mut c_void)| {
+      RcFnVtbl {
          drop_in_place: ptr::null(),
          size,
          align,
-         call_once: entry_clicked as *const c_void,
-         call_mut: entry_clicked as *const c_void,
-         call: entry_clicked as *const c_void,
+         call_once: f as *const c_void,
+         call_mut: f as *const c_void,
+         call: f as *const c_void,
          extra: ptr::null(),
-      },
+      }
+   };
+   let _ = ROWS.set(Rows {
+      // SAFETY: the constructor the locator decoded, called with its out
+      // pointer first as `RowFn` has it.
+      row:           unsafe { std::mem::transmute::<usize, RowFn>(row) },
+      click_vtable:  rows.click_vtable,
+      click_offset:  rows.click_offset,
+      icons:         [rows.plugins_icon, rows.store_icon, rows.gear],
+      separator_tag: rows.separator_tag,
+      header:        rows.header,
+      clicks:        [
+         make_click(tab_plugins_clicked),
+         make_click(tab_store_clicked),
+         make_click(tab_settings_clicked),
+      ],
    });
    // SAFETY: runs from `prepare` before Discord's threads; the detour has the
    // handler's `fn(state, cx)` ABI.
@@ -469,22 +487,29 @@ fn hook_header(
    Some(name)
 }
 
-/// Sunbird's name, as Discord's own page names are built.
+/// Sunbird's active tab title, as Discord's own page names are built.
 fn sunbird_title(sret: *mut c_void, title: &Title) -> *mut c_void {
-   const KEY: &str = "SUNBIRD";
-   const NAME: &str = "Sunbird";
-   /// No translation has it, so translate falls back to [`NAME`].
-   const HASH: u64 = 0x5355_4E42_4952_4400;
+   const KEYS: [&str; 3] = ["SUNBIRD_PLUGINS", "SUNBIRD_STORE", "SUNBIRD_SETTINGS"];
+   const NAMES: [&str; 3] = ["Plugins", "Store", "Settings"];
+   /// No translation has these hashes, so translate falls back to `NAMES[tab]`.
+   const HASHES: [u64; 3] = [
+      0x5355_4E42_4952_4401,
+      0x5355_4E42_4952_4402,
+      0x5355_4E42_4952_4403,
+   ];
 
+   let tab = gpui::active_sidebar_tab().min(2);
+   let key = KEYS[tab];
+   let name = NAMES[tab];
    let default = Untranslated {
-      text: NAME.as_ptr(),
-      len:  NAME.len(),
+      text: name.as_ptr(),
+      len:  name.len(),
       one:  1,
       zero: 0,
    };
    // SAFETY: `sret` is the caller's slot for a page's name, which translate
    // fills with the same type; the key and default are static.
-   unsafe { (title.translate)(sret, KEY.as_ptr(), KEY.len(), HASH, &raw const default) }
+   unsafe { (title.translate)(sret, key.as_ptr(), key.len(), HASHES[tab], &raw const default) }
 }
 
 /// The header's call of the page-name function for its title.
@@ -677,46 +702,106 @@ unsafe extern "C" fn push_detour(list: *mut c_void, entry: *mut u8) {
    unsafe { orig(list, entry) };
 }
 
-/// Builds Sunbird's row with Log Out's constructor, then swaps in its click.
+/// Builds Sunbird's own sidebar category (`Separator` + `Header("Sunbird")` +
+/// `Plugins`, `Store`, `Settings` + trailing `Separator`) right before Log Out.
 fn push_sunbird(push: PushFn, list: *mut c_void, rows: &Rows) {
-   const ID: &str = "sunbird-settings";
-   let mut entry = [0u64; MAX_ENTRY / 8];
-   let closure = [0u64; MAX_CLOSURE / 8];
-   let label = SharedString::from_static("Sunbird");
+   const ENTRIES: [(&str, &str); 3] = [
+      ("sunbird-plugins", "Plugins"),
+      ("sunbird-store", "Store"),
+      ("sunbird-settings", "Settings"),
+   ];
+   let push_separator = |tag: u32| {
+      let mut sep = [0u64; MAX_ENTRY / 8];
+      // SAFETY: `SidebarItem::Separator` carries only its `u32` discriminant at `+0`.
+      unsafe {
+         sep.as_mut_ptr().cast::<u32>().write_unaligned(tag);
+         push(list, sep.as_mut_ptr().cast::<u8>());
+      }
+   };
+   if let Some(sep_tag) = rows.separator_tag {
+      push_separator(sep_tag);
+   }
+   if let Some((header_tag, label_off)) = rows.header {
+      let mut hdr = [0u64; MAX_ENTRY / 8];
+      let label = SharedString::from_static("Sunbird");
+      // SAFETY: `SidebarItem::Header` carries its `u32` tag at `+0` and a
+      // static `SharedString` at `+label_off`, moved out by `push`.
+      unsafe {
+         let base = hdr.as_mut_ptr().cast::<u8>();
+         base.cast::<u32>().write_unaligned(header_tag);
+         base
+            .add(label_off)
+            .cast::<SharedString>()
+            .write_unaligned(label);
+         push(list, base);
+      }
+   }
    let open = OPEN.load(Ordering::Acquire);
-   // SAFETY: the constructor fills the entry (at most `MAX_ENTRY` bytes) and
-   // moves in the static label and the closure's `size` zero bytes, boxed with
-   // Log Out's layout. Sunbird's vtable keeps that layout and drops nothing,
-   // so Discord frees the box as usual, and the push moves the entry in.
-   unsafe {
-      let entry = entry.as_mut_ptr().cast::<u8>();
-      (rows.row)(
-         entry,
-         ID.as_ptr(),
-         ID.len(),
-         &raw const label,
-         rows.icon,
-         open,
-         false,
-         closure.as_ptr().cast(),
-      );
-      entry
-         .add(rows.click_offset)
-         .cast::<*const RcFnVtbl>()
-         .write_unaligned(&raw const rows.click);
-      push(list, entry);
+   let active_tab = gpui::active_sidebar_tab();
+   for (idx, &(id, title)) in ENTRIES.iter().enumerate() {
+      let mut entry = [0u64; MAX_ENTRY / 8];
+      let closure = [0u64; MAX_CLOSURE / 8];
+      let label = SharedString::from_static(title);
+      let selected = open && active_tab == idx;
+      // SAFETY: the constructor fills the entry (at most `MAX_ENTRY` bytes) and
+      // moves in the static label and the closure's `size` zero bytes, boxed
+      // with Log Out's layout. Sunbird's vtable keeps that layout and drops
+      // nothing, so Discord frees the box as usual, and the push moves it in.
+      unsafe {
+         let entry = entry.as_mut_ptr().cast::<u8>();
+         (rows.row)(
+            entry,
+            id.as_ptr(),
+            id.len(),
+            &raw const label,
+            rows.icons[idx],
+            selected,
+            false,
+            closure.as_ptr().cast(),
+         );
+         entry
+            .add(rows.click_offset)
+            .cast::<*const RcFnVtbl>()
+            .write_unaligned(&raw const rows.clicks[idx]);
+         push(list, entry);
+      }
+   }
+   if let Some(sep_tag) = rows.separator_tag {
+      push_separator(sep_tag);
    }
 }
 
-/// The Sunbird row's click, in the shape of [`gpui`]'s button callbacks.
-unsafe extern "C" fn entry_clicked(
+fn open_tab(idx: usize) {
+   gpui::select_sidebar_tab(idx);
+   OPEN.store(true, Ordering::Release);
+   crate::modal::force_redraw();
+}
+
+unsafe extern "C" fn tab_plugins_clicked(
    _self: *const u64,
    _event: *const c_void,
    _window: *mut c_void,
    _app: *mut c_void,
 ) {
-   OPEN.store(true, Ordering::Release);
-   crate::modal::force_redraw();
+   open_tab(0);
+}
+
+unsafe extern "C" fn tab_store_clicked(
+   _self: *const u64,
+   _event: *const c_void,
+   _window: *mut c_void,
+   _app: *mut c_void,
+) {
+   open_tab(1);
+}
+
+unsafe extern "C" fn tab_settings_clicked(
+   _self: *const u64,
+   _event: *const c_void,
+   _window: *mut c_void,
+   _app: *mut c_void,
+) {
+   open_tab(2);
 }
 
 unsafe extern "C" fn section_detour(
@@ -748,7 +833,7 @@ unsafe extern "C" fn section_detour(
          None => false,
       };
       if show {
-         let rendered = std::panic::catch_unwind(|| gpui::render_sunbird_page(sret, window, app))
+         let rendered = std::panic::catch_unwind(|| gpui::render_sunbird_page(sret, window, cx))
             .unwrap_or(false);
          if rendered {
             return sret;
