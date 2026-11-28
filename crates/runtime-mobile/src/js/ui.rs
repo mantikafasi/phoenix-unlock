@@ -415,7 +415,7 @@ fn add_sheets<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rquickjs::
                "choose needs options or a message",
             ));
          }
-         in_background(&ctx, move || {
+         in_background(&ctx, &owner, move || {
             let body = message.map(|text| {
                patches::menu::SheetBody {
                   text,
@@ -440,7 +440,7 @@ fn add_sheets<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rquickjs::
             .get::<_, Option<bool>>("highlight")?
             .unwrap_or_default();
          let items = parse_menu_items(&ctx, &owner, &options)?;
-         in_background(&ctx, move || {
+         in_background(&ctx, &owner, move || {
             let body = patches::menu::SheetBody {
                text,
                monospace,

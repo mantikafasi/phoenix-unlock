@@ -59,10 +59,13 @@ use phoenix_sigs::http::{
 };
 use serde::Deserialize;
 
-use crate::modal::{
-   self,
-   ChoiceOption,
-   ModalSection,
+use crate::{
+   commands,
+   modal::{
+      self,
+      ChoiceOption,
+      ModalSection,
+   },
 };
 
 /// Standard HTTP/1.x `http::header::StandardHeader` names in discriminant
@@ -699,7 +702,8 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
          }
 
          if installed.poll.is_some() {
-            watched = watch_response(&method, &url);
+            watched =
+               commands::watch(&method, &url).or_else(|| watch_response(&method, &url));
          }
       }))
       .is_err()
@@ -1047,6 +1051,11 @@ pub fn send_channel_id(path: &str) -> Option<&str> {
 /// Desktop has no composer hook, so `phoenix.messages.onSend` runs on the
 /// request that posts a message, before the shared request hooks.
 fn observe(method: &str, url: &str, headers: &[(String, String)], body: &[u8]) -> RequestAction {
+   if let Some(action) =
+      api_path(url).and_then(|path| commands::intercept(method, path, body))
+   {
+      return action;
+   }
    let channel = api_path(url)
       .filter(|_| method.eq_ignore_ascii_case("POST"))
       .and_then(send_channel_id);

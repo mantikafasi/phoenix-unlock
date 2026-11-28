@@ -1,6 +1,7 @@
 //! The desktop share of the `phoenix` object: `phoenix.ui` and message
 //! accessories, and `phoenix.native` for the console.
 
+pub mod commands;
 pub mod fonts;
 pub mod native;
 #[cfg(windows)] pub mod navigation_menus;
@@ -34,10 +35,13 @@ use crate::{
    },
    double_click,
    emoji,
-   js::ui::{
-      DesktopAccessory,
-      DesktopAction,
-      DesktopMember,
+   js::{
+      commands::Registered,
+      ui::{
+         DesktopAccessory,
+         DesktopAction,
+         DesktopMember,
+      },
    },
    members::Place,
    shortcuts,
@@ -89,6 +93,8 @@ pub struct Desktop<'js> {
    pub hidden_counts:    RefCell<Vec<(u64, String, Count)>>,
    /// `phoenix.ui.disableCallIdle` holds by id and plugin.
    pub idle_off:         RefCell<Vec<(u64, String, Timer)>>,
+   /// `phoenix.commands.register` commands by lowercase name.
+   pub commands:         RefCell<HashMap<String, Registered<'js>>>,
    #[cfg(windows)]
    surface_buttons:     RefCell<Vec<surfaces::Handler<'js>>>,
    #[cfg(windows)]
@@ -236,6 +242,7 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    off.retain(|(_, plugin, _)| plugin != name);
    call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
 
+   commands::unload(&registry, name);
    fonts::unload(name);
    themes::unload(name);
 }

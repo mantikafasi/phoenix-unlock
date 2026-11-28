@@ -73,7 +73,13 @@ use crate::{
    double_click,
    emoji,
    icons,
-   js::Desktop,
+   js::{
+      Desktop,
+      commands::{
+         self,
+         Outcome,
+      },
+   },
    members::Place,
    modal::{
       self,
@@ -1702,18 +1708,7 @@ pub fn desktop_patch_api<'js>(
          move |ctx: Ctx<'js>, function: Function<'js>| on_sticker_pick(&ctx, &name, function),
       )?,
    )?;
-   let commands = Object::new(ctx.clone())?;
-   commands.set(
-      "register",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, _options: Opt<Value<'js>>| {
-         noop_handle(&ctx)
-      })?,
-   )?;
-   commands.set(
-      "list",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>| rquickjs::Array::new(ctx))?,
-   )?;
-   api.set("commands", commands)?;
+   api.set("commands", commands::object(ctx, plugin)?)?;
    api.set("fonts", crate::js::fonts::object(ctx, plugin)?)?;
    api.set("themes", crate::js::themes::object(ctx, plugin)?)?;
    api.set("spotify", spotify_object(ctx, plugin)?)?;
@@ -1904,16 +1899,18 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          Function::new(ctx.clone(), |ctx: Ctx<'js>| Value::new_null(ctx))?,
       )?;
    }
+   let dialog_owner = plugin.to_owned();
    ui.set(
       "choose",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
-         choose_dialog(&ctx, &options)
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         choose_dialog(&ctx, &dialog_owner, &options)
       })?,
    )?;
+   let sheet_owner = plugin.to_owned();
    ui.set(
       "showSheet",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
-         sheet_dialog(&ctx, &options)
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         sheet_dialog(&ctx, &sheet_owner, &options)
       })?,
    )?;
    Ok(ui)
@@ -1923,6 +1920,7 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
 /// was dismissed.
 fn choose_dialog<'js>(
    ctx: &Ctx<'js>,
+   plugin: &str,
    options: &Object<'js>,
 ) -> rquickjs::Result<rquickjs::Promise<'js>> {
    let title = options.get::<_, Option<String>>("title")?;
@@ -1936,12 +1934,13 @@ fn choose_dialog<'js>(
    }
    let body = message.map(|text| ModalSection::Text { title: None, text });
    let title = title.unwrap_or_else(|| "Sunbird".to_owned());
-   in_background(ctx, move || answer(title, body, items))
+   in_background(ctx, plugin, move || answer(title, body, items))
 }
 
 /// `phoenix.ui.showSheet` as a native Mana modal with the code viewer.
 fn sheet_dialog<'js>(
    ctx: &Ctx<'js>,
+   plugin: &str,
    options: &Object<'js>,
 ) -> rquickjs::Result<rquickjs::Promise<'js>> {
    let title = options.get::<_, Option<String>>("title")?;
@@ -1960,7 +1959,7 @@ fn sheet_dialog<'js>(
       highlight,
    };
    let title = title.unwrap_or_else(|| "Sunbird".to_owned());
-   in_background(ctx, move || answer(title, Some(body), items))
+   in_background(ctx, plugin, move || answer(title, Some(body), items))
 }
 
 /// Opens a choose dialog and waits for the picked index, -1 when it is
@@ -1998,21 +1997,18 @@ fn parse_choice_options<'js>(options: &Object<'js>) -> rquickjs::Result<Vec<moda
       .collect())
 }
 
-/// Runs registered `phoenix.messages.onSend` hooks against the JSON payload
-/// of an outgoing `POST /channels/<channel_id>/messages` request on desktop.
+/// Runs a plugin command the message types out, then the
+/// `phoenix.messages.onSend` hooks, against the JSON payload of an outgoing
+/// `POST /channels/<channel_id>/messages` request on desktop.
 pub fn intercept_send_body(engine: &Engine, channel_id: &str, body: &[u8]) -> RequestAction {
    engine.with(|ctx| {
-      let Some(registry) = ctx.userdata::<Registry<'_>>() else {
-         return RequestAction::Pass;
-      };
-      let interceptors = registry
-         .interceptors
-         .borrow()
-         .iter()
-         .map(|(_, plugin, function)| (plugin.clone(), function.clone()))
-         .collect::<Vec<_>>();
-      drop(registry);
-      if interceptors.is_empty() {
+      let hooked = ctx
+         .userdata::<Registry<'_>>()
+         .is_some_and(|registry| !registry.interceptors.borrow().is_empty());
+      let commanded = ctx
+         .userdata::<Desktop<'_>>()
+         .is_some_and(|registry| !registry.commands.borrow().is_empty());
+      if !hooked && !commanded {
          return RequestAction::Pass;
       }
       let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(body) else {
@@ -2025,29 +2021,18 @@ pub fn intercept_send_body(engine: &Engine, channel_id: &str, body: &[u8]) -> Re
       else {
          return RequestAction::Pass;
       };
-      let Ok(argument) = Object::new(ctx.clone()) else {
-         return RequestAction::Pass;
+      let typed = match commands::typed(&original) {
+         Some((name, args)) => commands::run(&ctx, name, args, channel_id),
+         None => Outcome::Unknown,
       };
-      let _ = argument.set("channelId", channel_id);
-
-      let mut value = original.clone();
-      for (plugin, function) in interceptors {
-         restart_budget(&ctx);
-         match function
-            .call::<_, Value<'_>>((value.clone(), argument.clone()))
-            .catch(&ctx)
-         {
-            Ok(result) if result.as_bool() == Some(false) => {
-               return RequestAction::Drop;
-            },
-            Ok(result) => {
-               if let Some(text) = result.as_string().and_then(|text| text.to_string().ok()) {
-                  value = text;
-               }
-            },
-            Err(err) => log::error!("[{plugin}] onSend: {err}"),
-         }
-      }
+      let value = match typed {
+         Outcome::Unknown => original.clone(),
+         Outcome::Nothing => return RequestAction::Drop,
+         Outcome::Send(text) => text,
+      };
+      let Some(value) = intercept_text(&ctx, channel_id, value) else {
+         return RequestAction::Drop;
+      };
       if value == original {
          return RequestAction::Pass;
       }
@@ -2056,6 +2041,49 @@ pub fn intercept_send_body(engine: &Engine, channel_id: &str, body: &[u8]) -> Re
       }
       serde_json::to_vec(&payload).map_or(RequestAction::Pass, RequestAction::Replace)
    })
+}
+
+/// The context `onSend` hooks and commands get for a message to `channel_id`.
+pub fn send_context<'js>(ctx: &Ctx<'js>, channel_id: &str) -> rquickjs::Result<Object<'js>> {
+   let argument = Object::new(ctx.clone())?;
+   argument.set("channelId", channel_id)?;
+   argument.set("currentUserId", Value::new_null(ctx.clone()))?;
+   argument.set("reply", Function::new(ctx.clone(), String::new)?)?;
+   Ok(argument)
+}
+
+/// `text` after every `phoenix.messages.onSend` hook, or `None` when one
+/// cancels the send.
+pub fn intercept_text(ctx: &Ctx<'_>, channel_id: &str, text: String) -> Option<String> {
+   let interceptors = ctx.userdata::<Registry<'_>>().map_or_default(|registry| {
+      registry
+         .interceptors
+         .borrow()
+         .iter()
+         .map(|(_, plugin, function)| (plugin.clone(), function.clone()))
+         .collect::<Vec<_>>()
+   });
+   if interceptors.is_empty() {
+      return Some(text);
+   }
+   let argument = send_context(ctx, channel_id).ok()?;
+   let mut value = text;
+   for (plugin, function) in interceptors {
+      restart_budget(ctx);
+      match function
+         .call::<_, Value<'_>>((value.clone(), argument.clone()))
+         .catch(ctx)
+      {
+         Ok(result) if result.as_bool() == Some(false) => return None,
+         Ok(result) => {
+            if let Some(text) = result.as_string().and_then(|text| text.to_string().ok()) {
+               value = text;
+            }
+         },
+         Err(err) => log::error!("[{plugin}] onSend: {err}"),
+      }
+   }
+   Some(value)
 }
 
 /// Counts the handler toward the emoji unlock. Desktop has no picker presses

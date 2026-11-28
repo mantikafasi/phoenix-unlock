@@ -1703,7 +1703,8 @@ declare namespace Phoenix {
   }
 
   /// Slash commands typed in the message box. Matching ones are listed first in Discord's `/`
-  /// suggestions, and picking one fills in `/name `.
+  /// suggestions, and picking one fills in `/name `. Desktop lists them as a Sunbird app's
+  /// commands with one `args` option.
   interface Commands {
     /// `execute` runs when `/name args` is sent. Return text to send that instead, or nothing
     /// (or a promise) to send nothing.

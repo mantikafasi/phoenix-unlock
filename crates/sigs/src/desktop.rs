@@ -4138,7 +4138,7 @@ pub fn message_json(image: &Image<'_>) -> Found<MessageJson> {
 
 /// Each `lea r64, [rip + disp32]` in `code` mapped at `addr`, as (instruction,
 /// target).
-fn rip_leas(code: &[u8], addr: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+pub(crate) fn rip_leas(code: &[u8], addr: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
    memchr::memchr_iter(0x8D, code).filter_map(move |pos| {
       let rex = *code.get(pos.checked_sub(1)?)?;
       let modrm = *code.get(pos + 1)?;
