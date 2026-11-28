@@ -20,6 +20,7 @@ mod discord_version;
 mod double_click;
 mod emoji;
 mod fetch;
+mod forward;
 mod gateway_send;
 mod gpui;
 mod gpui_font;
@@ -264,6 +265,7 @@ pub fn prepare() -> Result<(), Error> {
    feature("toolbar", || toolbar::install(&image, &ix));
    feature("badges", || badges::install(&image, &ix));
    feature("emoji", || emoji::install(&image, &ix));
+   feature("forward", || forward::install(&image, &ix));
    feature("call_idle_dm", || call_idle::install_dm(&image, &ix));
    feature("call_idle_afk", || call_idle::install_guild_afk(&image, &ix));
    feature("gpui_font", || gpui_font::install(&image, &ix));

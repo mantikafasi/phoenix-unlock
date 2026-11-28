@@ -32,6 +32,7 @@ use crate::{
    },
    double_click,
    emoji,
+   forward,
    js::ui::{
       DesktopAccessory,
       DesktopAction,
@@ -84,6 +85,8 @@ pub struct Desktop<'js> {
    pub hidden_counts:    RefCell<Vec<(u64, String, Count)>>,
    /// `phoenix.ui.disableCallIdle` holds by id and plugin.
    pub idle_off:         RefCell<Vec<(u64, String, Timer)>>,
+   /// `phoenix.ui.disableForwardFollow` holds by id and plugin.
+   pub forward_off:      RefCell<Vec<(u64, String)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -214,6 +217,10 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let mut off = registry.idle_off.borrow_mut();
    off.retain(|(_, plugin, _)| plugin != name);
    call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
+
+   let mut forward_off = registry.forward_off.borrow_mut();
+   forward_off.retain(|(_, plugin)| plugin != name);
+   forward::turn_off(!forward_off.is_empty());
 
    fonts::unload(name);
    themes::unload(name);
