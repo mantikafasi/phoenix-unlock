@@ -76,7 +76,9 @@ pub fn load_gateway(image: &Image<'_>) -> Option<GatewayRegistry> {
          // Validate `{name_ptr, name_len, handler}` still matches this entry.
          let name_ptr = image.read_usize(slot)?;
          let name_len = image.read_usize(slot + size_of::<usize>())?;
-         if name_len != entry.name.len() || image.read(name_ptr, name_len) != Some(entry.name.as_bytes()) {
+         if name_len != entry.name.len()
+            || image.read(name_ptr, name_len) != Some(entry.name.as_bytes())
+         {
             return None;
          }
          slots.push(slot);
@@ -120,7 +122,7 @@ pub fn save_gateway(image: &Image<'_>, registry: &GatewayRegistry) {
       });
    }
    let cache = MacosCache {
-      version: CACHE_VERSION,
+      version:  CACHE_VERSION,
       build_id: build_id.to_string(),
       gateway,
    };
