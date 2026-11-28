@@ -131,8 +131,20 @@ static ACTIONS: LazyLock<RwLock<Vec<ActionMeta>>> = LazyLock::new(|| RwLock::new
 #[derive(Clone, Copy)]
 struct PendingClick {
    action:  u64,
-   message: u64,
-   channel: u64,
+   target:  ClickTarget,
+}
+
+#[derive(Clone, Copy)]
+enum ClickTarget {
+   Message {
+      message: u64,
+      channel: u64,
+   },
+   #[cfg(windows)]
+   Navigation {
+      menu: phoenix_sigs::locate::surfaces::Menu,
+      target: u64,
+   },
 }
 
 const MAX_PENDING_CLICKS: usize = 512;
@@ -217,12 +229,20 @@ fn ensure_worker() -> &'static mpsc::Sender<PendingClick> {
          .spawn(move || {
             while let Ok(click) = rx.recv() {
                if let Some(engine) = phoenix_runtime::engine() {
-                  crate::js::ui::invoke_message_action(
-                     &engine,
-                     click.action,
-                     click.message,
-                     click.channel,
-                  );
+                  match click.target {
+                     ClickTarget::Message { message, channel } => {
+                        crate::js::ui::invoke_message_action(
+                           &engine,
+                           click.action,
+                           message,
+                           channel,
+                        );
+                     },
+                     #[cfg(windows)]
+                     ClickTarget::Navigation { menu, target } => {
+                        crate::js::navigation_menus::press(&engine, click.action, menu, target);
+                     },
+                  }
                }
             }
          });
@@ -381,6 +401,8 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
       ..syms
    };
    let _ = MENU_SYMS.set(syms);
+   #[cfg(windows)]
+   crate::navigation_menus::install(image, ix, menu.layout.size);
    log::info!(
       "desktop context menu: hooked MessageContextMenu @ {:#x} (msg +{:#x}, id +{:#x}, ch +{:#x}) \
        {:x?}",
@@ -614,10 +636,17 @@ fn action_item(
    message: u64,
    channel: u64,
 ) -> Option<RawMenuItem> {
+   make_action_item(syms, action, ClickTarget::Message { message, channel })
+}
+
+fn make_action_item(
+   syms: &MenuSymbols,
+   action: &ActionMeta,
+   target: ClickTarget,
+) -> Option<RawMenuItem> {
    let token = register_click(PendingClick {
       action: action.id,
-      message,
-      channel,
+      target,
    });
    let rc_ptr = gpui::alloc_rc_u64(token)
       .or_else(|| (!crate::X86_CODE).then(|| gpui::pinned_rc_u64(token)))?;
@@ -657,6 +686,36 @@ fn submenu(ix: &Index<'_>) -> Option<SubmenuLayout> {
       }
    });
    Some(layout)
+}
+
+#[cfg(windows)]
+pub unsafe fn append_navigation_actions(
+   vec: *mut RawMenuVec,
+   actions: &[ActionMeta],
+   menu: phoenix_sigs::locate::surfaces::Menu,
+   target: u64,
+) {
+   let Some(syms) = MENU_SYMS.get() else {
+      return;
+   };
+   if vec.is_null() || actions.is_empty() {
+      return;
+   }
+   // SAFETY: caller passes the native menu Vec supplied to its item collector.
+   if unsafe { (*vec).len > 0 } && let Some(tag) = syms.separator_tag {
+      let mut separator = RawMenuItem::zeroed();
+      separator.put(0, tag);
+      // SAFETY: vec_push consumes a MenuItem with the verified layout.
+      unsafe { (syms.vec_push)(vec, &raw mut separator) };
+   }
+   for action in actions {
+      if let Some(mut item) =
+         make_action_item(syms, action, ClickTarget::Navigation { menu, target })
+      {
+         // SAFETY: vec_push consumes the item created with the same MenuItem layout.
+         unsafe { (syms.vec_push)(vec, &raw mut item) };
+      }
+   }
 }
 
 /// A native submenu whose builder lists `action`'s children when it opens.

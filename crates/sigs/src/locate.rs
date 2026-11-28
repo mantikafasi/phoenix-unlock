@@ -18,6 +18,8 @@ pub mod ready;
 pub mod settings;
 pub mod spotify;
 pub mod staff;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod surfaces;
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod gpui;

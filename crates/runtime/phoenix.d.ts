@@ -1440,6 +1440,35 @@ declare namespace Phoenix {
     update(patch: ButtonPatch): void;
   }
 
+  type UiSurface = "composer" | "messageToolbar" | "serverList" | "account" | "profile" | "mediaViewer";
+
+  interface SurfaceButtonOptions {
+    label: string;
+    priority?: number;
+    onPress(ctx: {
+      surface: UiSurface;
+      currentUserId: string | null;
+      channelId: string | null;
+      messageId?: string;
+      message?: Message | null;
+    }): void;
+  }
+
+  interface SurfaceButtonRemover {
+    (): void;
+    update(patch: Partial<Pick<SurfaceButtonOptions, "label" | "priority">>): void;
+  }
+
+  type NavigationMenu = "server" | "channel" | "user";
+
+  interface NavigationMenuAction {
+    label: string;
+    icon?: Icon;
+    danger?: boolean;
+    priority?: number;
+    onPress(ctx: { menu: NavigationMenu; targetId: string | null }): void;
+  }
+
   interface PageButton {
     label: string;
     /// A `res://` drawable URI, or a message action accessibility id to borrow its icon.
@@ -1483,6 +1512,15 @@ declare namespace Phoenix {
     /// In the message box, left of the emoji button. On Desktop Phoenix, a button labeled `label`
     /// left of the chat bar, drawn as the primary button while `tint` is set; `icon` is ignored.
     addComposerButton(options: ButtonOptions): ButtonRemover;
+    /// Windows. Whether the current Phoenix build has a native plugin button slot here.
+    hasSurface?(surface: UiSurface): boolean;
+    /// Windows. Adds a native button and throws if hasSurface reports it unavailable.
+    /// The composer surface places it by the emoji picker.
+    addSurfaceButton?(surface: UiSurface, options: SurfaceButtonOptions): SurfaceButtonRemover;
+    /// Windows. Whether a native navigation context menu can host plugin actions.
+    hasContextMenu?(menu: NavigationMenu): boolean;
+    /// Windows. Appends a native action to the menu and returns its remover.
+    addContextMenuAction?(menu: NavigationMenu, options: NavigationMenuAction): Remover;
     /// A line under each message's content, or after its timestamp with `placement: "header"`.
     /// It runs once per message and place, and the result is kept until `update`.
     addMessageAccessory(options: {

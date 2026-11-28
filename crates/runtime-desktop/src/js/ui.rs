@@ -141,7 +141,7 @@ impl DesktopAction<'_> {
    }
 }
 
-fn noop_handle<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Function<'js>> {
+pub(super) fn noop_handle<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Function<'js>> {
    let remove = Function::new(ctx.clone(), || {})?;
    remove.set("update", Function::new(ctx.clone(), || {})?)?;
    remove.set("close", Function::new(ctx.clone(), || {})?)?;
@@ -500,7 +500,11 @@ fn cached_message_and_me(channel_id: u64, message_id: u64) -> (Option<String>, O
    let msg_json = rows
       .ok()
       .and_then(|rows| rows.first("v").and_then(Cell::text).map(str::to_owned));
-   let me_id = store::meta(&db, "me")
+   (msg_json, cached_user_id(&db))
+}
+
+fn cached_user_id(db: &std::path::Path) -> Option<String> {
+   store::meta(db, "me")
       .ok()
       .flatten()
       .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
@@ -508,11 +512,17 @@ fn cached_message_and_me(channel_id: u64, message_id: u64) -> (Option<String>, O
          val.get("id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
-      });
-   (msg_json, me_id)
+      })
 }
 
-fn build_message_context<'js>(
+#[cfg(windows)]
+pub(super) fn current_user_id() -> Option<String> {
+   let state = phoenix_runtime::state()?;
+   let db = store::database(&state.files_dir()).ok()?;
+   cached_user_id(&db)
+}
+
+pub(super) fn build_message_context<'js>(
    ctx: &Ctx<'js>,
    message_id: u64,
    channel_id: u64,
@@ -1711,6 +1721,11 @@ pub fn desktop_patch_api<'js>(
 )]
 pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    let ui = Object::new(ctx.clone())?;
+   #[cfg(windows)]
+   {
+      super::surfaces::bind(ctx, &ui, plugin)?;
+      super::navigation_menus::bind(ctx, &ui, plugin)?;
+   }
    let toast_owner = plugin.to_owned();
    ui.set(
       "toast",

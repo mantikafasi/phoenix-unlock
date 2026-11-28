@@ -3,6 +3,8 @@
 
 pub mod fonts;
 pub mod native;
+#[cfg(windows)] pub mod navigation_menus;
+#[cfg(windows)] pub mod surfaces;
 pub mod themes;
 pub mod ui;
 
@@ -84,6 +86,10 @@ pub struct Desktop<'js> {
    pub hidden_counts:    RefCell<Vec<(u64, String, Count)>>,
    /// `phoenix.ui.disableCallIdle` holds by id and plugin.
    pub idle_off:         RefCell<Vec<(u64, String, Timer)>>,
+   #[cfg(windows)]
+   surface_buttons:     RefCell<Vec<surfaces::Handler<'js>>>,
+   #[cfg(windows)]
+   navigation_actions:  RefCell<Vec<navigation_menus::Handler<'js>>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -101,6 +107,12 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
    type Changed<'to> = Desktop<'to>;
 }
 
+#[cfg(windows)]
+fn unload_ui_extensions(registry: &Desktop<'_>, plugin: &str) {
+   surfaces::unload(registry, plugin);
+   navigation_menus::unload(registry, plugin);
+}
+
 /// Drops the accessories, member decorations, context menu actions, open page
 /// callbacks, banners, emoji pick handlers, hidden counts, call idle holds,
 /// sidebar collapses, header and composer buttons and shortcuts `name`
@@ -109,6 +121,8 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
    };
+   #[cfg(windows)]
+   unload_ui_extensions(&registry, name);
    let mut list = registry.accessories.borrow_mut();
    let before = list.len();
    list.retain(|entry| entry.plugin != name);
