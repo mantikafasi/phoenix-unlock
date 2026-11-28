@@ -18,6 +18,8 @@ mod counts;
 mod discord;
 mod discord_version;
 mod double_click;
+#[cfg(windows)]
+mod dwrite_fallback;
 mod emoji;
 mod fetch;
 mod gateway_send;

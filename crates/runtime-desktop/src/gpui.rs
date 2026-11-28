@@ -1573,7 +1573,7 @@ const DESKTOP_FULL: &[&str] = &[
    "collapse-channels",
 ];
 
-const DESKTOP_PARTIAL: &[&str] = &["fakenitro"];
+const DESKTOP_PARTIAL: &[&str] = &["fakenitro", "japanese-font"];
 
 const MOBILE_ONLY: &[&str] = &["hide-composer-buttons", "reviewdb", "taptap", "example"];
 
