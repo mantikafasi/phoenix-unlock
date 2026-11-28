@@ -40,10 +40,13 @@ use std::{
 };
 
 use phoenix_hook::image::Image;
-use phoenix_runtime::highlight::{
-   self,
-   JsonKind,
-   Kind,
+use phoenix_runtime::{
+   highlight::{
+      self,
+      JsonKind,
+      Kind,
+   },
+   js::At,
 };
 use phoenix_sigs::desktop::{
    self,
@@ -234,8 +237,56 @@ struct CodeEditorModal {
    plugin:       String,
    pending_init: Option<String>,
    status:       FieldStatus,
+   /// Where the last save stopped, drawn under the status.
+   excerpt:      Option<Excerpt>,
+   /// The code drawn read-only in color, or `None` while it is edited.
+   preview:      Option<String>,
    /// The page it opened over, which comes back when it closes.
    under:        Option<(u64, PageModalSpec)>,
+}
+
+/// The lines around where a plugin's code failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Excerpt {
+   /// The first line's number, counted from 1.
+   first: usize,
+   text:  String,
+   /// The failing line and column, marked with a caret.
+   caret: Option<(usize, usize)>,
+}
+
+impl Excerpt {
+   /// Lines shown before and after the failing one.
+   const AROUND: usize = 2;
+
+   fn of(code: &str, at: At) -> Option<Self> {
+      let lines: Vec<&str> = code
+         .split('\n')
+         .map(|line| line.trim_end_matches('\r'))
+         .collect();
+      let (first, last, caret) = match at {
+         At::Line { line, column } => {
+            let first = line.saturating_sub(Self::AROUND).max(1);
+            (
+               first,
+               (line + Self::AROUND).min(lines.len()),
+               Some((line, column)),
+            )
+         },
+         // A missing `}` shows at the end, so show the last lines that hold
+         // code.
+         At::End => {
+            let last = lines.iter().rposition(|line| !line.trim().is_empty())? + 1;
+            (last.saturating_sub(Self::AROUND).max(1), last, None)
+         },
+         At::Nowhere => return None,
+      };
+      Some(Self {
+         first,
+         text: lines.get(first - 1..last)?.join("\n"),
+         caret,
+      })
+   }
 }
 
 #[derive(Clone)]
@@ -714,6 +765,8 @@ fn snapshot_modal(modal: &mut ActiveModal, take_init: bool) -> Snapshot {
                None
             },
             status:       ed.status.clone(),
+            excerpt:      ed.excerpt.clone(),
+            preview:      ed.preview.clone(),
             under:        None,
          })
       },
@@ -907,6 +960,7 @@ enum ModalAction {
    Switch(Arc<dyn Fn(bool) + Send + Sync>),
    SaveCode(String),
    CopyCode,
+   TogglePreview,
    SubmitInstallUrl,
 }
 
@@ -1260,16 +1314,9 @@ unsafe extern "C" fn modal_button_callback(
                set_editor_status(FieldStatus::Failed("Could not read text field".to_owned()));
                return;
             };
-            match phoenix_runtime::save_source(&plugin, code) {
-               Ok(()) => {
-                  close_active();
-                  phoenix_ui_desktop::toast(&format!("Saved & reloaded {plugin}"));
-               },
-               Err(err) => {
-                  set_editor_status(FieldStatus::Failed(format!("Save failed: {err}")));
-               },
-            }
+            save_code(&plugin, &code);
          },
+         ModalAction::TogglePreview => toggle_preview(app),
          ModalAction::SubmitInstallUrl => {
             let target = match active_modal().active.as_ref() {
                Some(ActiveModal::InstallUrl(inst)) => inst.target.clone(),
@@ -1553,6 +1600,8 @@ pub fn open_code_editor(plugin: String, initial_source: String) {
       plugin,
       pending_init: Some(initial_source),
       status: FieldStatus::Idle,
+      excerpt: None,
+      preview: None,
       under,
    }));
 }
@@ -1636,12 +1685,69 @@ fn close_active() {
 }
 
 fn set_editor_status(status: FieldStatus) {
+   set_editor_failure(status, None);
+}
+
+fn set_editor_failure(status: FieldStatus, excerpt: Option<Excerpt>) {
    let mut guard = active_modal();
    if let Some(ActiveModal::CodeEditor(ed)) = guard.active.as_mut() {
       ed.status = status;
+      ed.excerpt = excerpt;
    }
    drop(guard);
    force_redraw();
+}
+
+/// Shows the code being edited read-only in color, or goes back to editing
+/// it. The field keeps its text in between.
+fn toggle_preview(app: *mut c_void) {
+   let previewing = matches!(
+      active_modal().active.as_ref(),
+      Some(ActiveModal::CodeEditor(ed)) if ed.preview.is_some()
+   );
+   let preview = if previewing {
+      None
+   } else {
+      let Some(code) = read_code_field(app) else {
+         set_editor_status(FieldStatus::Failed("Could not read text field".to_owned()));
+         return;
+      };
+      Some(code)
+   };
+   let mut guard = active_modal();
+   if let Some(ActiveModal::CodeEditor(ed)) = guard.active.as_mut() {
+      ed.preview = preview;
+   }
+   drop(guard);
+   force_redraw();
+}
+
+/// Parses `code` before it replaces `plugin`'s, so a typo shows where it is
+/// without reloading anything, then saves and reloads it.
+fn save_code(plugin: &str, code: &str) {
+   let saved = phoenix_runtime::installer::check(plugin, code)
+      .and_then(|()| phoenix_runtime::save_source(plugin, code.to_owned()));
+   let err = match saved {
+      Ok(()) => {
+         close_active();
+         phoenix_ui_desktop::toast(&format!("Saved & reloaded {plugin}"));
+         return;
+      },
+      Err(err) => err,
+   };
+   let (message, excerpt) = match err {
+      phoenix_runtime::Error::PluginSyntax { error, .. } => {
+         (format!("Not saved: {error}"), Excerpt::of(code, error.at))
+      },
+      phoenix_runtime::Error::PluginStart { error, .. } => {
+         (
+            format!("Not saved, it failed to start: {error}"),
+            Excerpt::of(code, error.at),
+         )
+      },
+      other => (format!("Save failed: {other}"), None),
+   };
+   set_editor_failure(FieldStatus::Failed(message), excerpt);
 }
 
 fn set_install_status(status: FieldStatus) {
@@ -2383,20 +2489,31 @@ fn coalesce<'a>(tokens: impl Iterator<Item = (u32, &'a str)>) -> Vec<(u32, Strin
    spans
 }
 
-fn build_code_box(
-   msym: &ModalSymbols,
-   box_id: &str,
-   text: &str,
-   monospace: bool,
-   do_highlight: bool,
-) -> Option<RawDiv> {
+/// The plain text color and the syntax palette for code, light or dark with
+/// Discord's theme.
+fn code_colors() -> (u32, &'static SyntaxColors) {
    let pal = crate::mana_theme::sunbird_palette();
-   let plain = crate::mana_theme::color_to_argb(pal.text);
    let syntax = if pal.bg_code.relative_luminance() > 0.35 {
       &SYNTAX_LIGHT
    } else {
       &SYNTAX_DARK
    };
+   (crate::mana_theme::color_to_argb(pal.text), syntax)
+}
+
+const fn js_color(kind: Kind, syntax: &SyntaxColors, plain: u32) -> u32 {
+   match kind {
+      Kind::Keyword => syntax.keyword,
+      Kind::String => syntax.string,
+      Kind::Number => syntax.number,
+      Kind::Comment => syntax.comment,
+      Kind::Plain => plain,
+   }
+}
+
+/// The rounded, scrolling box code sections draw in.
+fn code_frame(msym: &ModalSymbols, box_id: &str, monospace: bool) -> Option<RawDiv> {
+   let pal = crate::mana_theme::sunbird_palette();
    let mut box_div = gpui::v_stack(1.0)?;
    box_div = div_with_id(msym, box_div, box_id);
    gpui::style_div(&mut box_div, |s| {
@@ -2414,6 +2531,18 @@ fn build_code_box(
          set_mono_font(s, 12.5, 18.0);
       }
    });
+   Some(box_div)
+}
+
+fn build_code_box(
+   msym: &ModalSymbols,
+   box_id: &str,
+   text: &str,
+   monospace: bool,
+   do_highlight: bool,
+) -> Option<RawDiv> {
+   let (plain, syntax) = code_colors();
+   let mut box_div = code_frame(msym, box_id, monospace)?;
 
    let is_json = do_highlight && highlight::looks_like_json(text);
    for (idx, line) in text.split('\n').enumerate() {
@@ -2446,16 +2575,11 @@ fn build_code_box(
                (color, tok)
             }))
          } else {
-            coalesce(highlight::js(line).into_iter().map(|(kind, tok)| {
-               let color = match kind {
-                  Kind::Keyword => syntax.keyword,
-                  Kind::String => syntax.string,
-                  Kind::Number => syntax.number,
-                  Kind::Comment => syntax.comment,
-                  Kind::Plain => plain,
-               };
-               (color, tok)
-            }))
+            coalesce(
+               highlight::js(line)
+                  .into_iter()
+                  .map(|(kind, tok)| (js_color(kind, syntax, plain), tok)),
+            )
          };
          for (color, text) in &spans {
             if let Some(span) = mono_span(text, *color) {
@@ -2469,6 +2593,102 @@ fn build_code_box(
          }
       } else if let Some(div) = plain_text_div(line, Some(plain), 13.0) {
          box_div = gpui::push_div(box_div, div);
+      }
+   }
+   Some(box_div)
+}
+
+/// What a tab stands for in drawn code, which has no tab stops.
+const TAB: &str = "    ";
+
+/// `code`'s lines as colored spans. The whole text is tokenized at once, so a
+/// comment or template string spanning lines keeps its color.
+fn colored_lines(code: &str, syntax: &SyntaxColors, plain: u32) -> Vec<Vec<(u32, String)>> {
+   let code = code.replace("\r\n", "\n");
+   let mut lines: Vec<Vec<(u32, &str)>> = vec![Vec::new()];
+   for (kind, token) in highlight::js(&code) {
+      let color = js_color(kind, syntax, plain);
+      for (idx, piece) in token.split('\n').enumerate() {
+         if idx > 0 {
+            lines.push(Vec::new());
+         }
+         if let Some(line) = lines.last_mut()
+            && !piece.is_empty()
+         {
+            line.push((color, piece));
+         }
+      }
+   }
+   lines
+      .into_iter()
+      .map(|line| {
+         coalesce(line.into_iter())
+            .into_iter()
+            .map(|(color, text)| (color, text.replace('\t', TAB)))
+            .collect()
+      })
+      .collect()
+}
+
+/// Where a caret under `column` of `line` goes, counting tabs as [`TAB`].
+fn caret_indent(line: &str, column: usize) -> usize {
+   line
+      .chars()
+      .take(column.saturating_sub(1))
+      .map(|c| if c == '\t' { TAB.len() } else { 1 })
+      .sum()
+}
+
+/// Plugin `code` numbered from line `first` and colored as JavaScript, with a
+/// caret under `caret`'s line and column.
+fn numbered_code_box(
+   msym: &ModalSymbols,
+   box_id: &str,
+   first: usize,
+   code: &str,
+   caret: Option<(usize, usize)>,
+) -> Option<RawDiv> {
+   let (plain, syntax) = code_colors();
+   let mut box_div = code_frame(msym, box_id, true)?;
+   let lines = colored_lines(code, syntax, plain);
+   let width = (first + lines.len()).saturating_sub(1).to_string().len();
+   for (idx, spans) in lines.into_iter().enumerate() {
+      let number = first + idx;
+      let failing = caret.filter(|&(line, _)| line == number);
+      let Some(mut row) = gpui::h_row(0.0, false) else {
+         continue;
+      };
+      gpui::style_div(&mut row, |s| {
+         s.set(s.at.white_space, WHITE_SPACE_NOWRAP);
+         s.set(s.at.flex_wrap, FLEX_NOWRAP);
+      });
+      let gutter_color = if failing.is_some() {
+         col_error()
+      } else {
+         col_muted()
+      };
+      if let Some(gutter) = mono_span(&format!("{number:>width$}  "), gutter_color) {
+         row = gpui::push_div(row, gutter);
+      }
+      if idx < MAX_HIGHLIGHT_LINES {
+         for (color, text) in &spans {
+            if let Some(span) = mono_span(text, *color) {
+               row = gpui::push_div(row, span);
+            }
+         }
+      } else {
+         let text: String = spans.into_iter().map(|(_, text)| text).collect();
+         if let Some(span) = mono_span(&text, plain) {
+            row = gpui::push_div(row, span);
+         }
+      }
+      box_div = gpui::push_div(box_div, row);
+      if let Some((_, column)) = failing {
+         let line = code.lines().nth(idx).unwrap_or_default();
+         let pad = width + 2 + caret_indent(line, column);
+         if let Some(mark) = mono_span(&format!("{:pad$}^", ""), col_error()) {
+            box_div = gpui::push_div(box_div, mark);
+         }
       }
    }
    Some(box_div)
@@ -2749,7 +2969,22 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
             {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), st);
             }
-            if let Some(tf) = FIELD_SYM.get()
+            if let Some(excerpt) = &ed.excerpt
+               && let Some(lines) = numbered_code_box(
+                  msym,
+                  "sunbird-edit-excerpt",
+                  excerpt.first,
+                  &excerpt.text,
+                  excerpt.caret,
+               )
+            {
+               *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), lines);
+            }
+            if let Some(code) = &ed.preview {
+               if let Some(view) = numbered_code_box(msym, "sunbird-edit-preview", 1, code, None) {
+                  *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), view);
+               }
+            } else if let Some(tf) = FIELD_SYM.get()
                && let Some(ent) = unsafe {
                   ensure_field_entity(
                      app,
@@ -2811,6 +3046,19 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
             BtnVariant::Secondary,
             BtnSize::Medium,
             ModalAction::CopyCode,
+         ) {
+            footer.push(btn);
+         }
+         if let Some(btn) = make_modal_button(
+            "sunbird-edit-preview",
+            if ed.preview.is_some() {
+               "Edit"
+            } else {
+               "Preview"
+            },
+            BtnVariant::Secondary,
+            BtnSize::Medium,
+            ModalAction::TogglePreview,
          ) {
             footer.push(btn);
          }
@@ -3005,5 +3253,54 @@ mod tests {
          (4, "12".to_owned()),
          (3, ",".to_owned()),
       ]);
+   }
+
+   const CODE: &str = "// @name p\n\"use strict\";\nconst a = 1;\nconst b = ;\nphoenix.log(a);\n\n";
+
+   #[test]
+   fn an_excerpt_holds_the_lines_around_the_error() {
+      let excerpt = super::Excerpt::of(CODE, super::At::Line {
+         line:   4,
+         column: 11,
+      })
+      .unwrap();
+      assert_eq!(excerpt.first, 2);
+      assert_eq!(
+         excerpt.text,
+         "\"use strict\";\nconst a = 1;\nconst b = ;\nphoenix.log(a);\n"
+      );
+      assert_eq!(excerpt.caret, Some((4, 11)));
+      let top = super::Excerpt::of(CODE, super::At::Line {
+         line:   1,
+         column: 1,
+      })
+      .unwrap();
+      assert_eq!((top.first, top.text.lines().count()), (1, 3));
+   }
+
+   #[test]
+   fn an_excerpt_at_the_end_shows_the_last_code() {
+      let excerpt = super::Excerpt::of(CODE, super::At::End).unwrap();
+      assert_eq!(excerpt.first, 3);
+      assert_eq!(excerpt.text, "const a = 1;\nconst b = ;\nphoenix.log(a);");
+      assert_eq!(excerpt.caret, None);
+      assert_eq!(super::Excerpt::of(CODE, super::At::Nowhere), None);
+   }
+
+   #[test]
+   fn colored_lines_keep_a_comment_across_lines() {
+      let comment = super::SYNTAX_DARK.comment;
+      let lines = super::colored_lines("a /* x\ny */ b\r\n\tc", &super::SYNTAX_DARK, 1);
+      assert_eq!(lines, vec![
+         vec![(1, "a ".to_owned()), (comment, "/* x".to_owned())],
+         vec![(comment, "y */".to_owned()), (1, " b".to_owned())],
+         vec![(1, "    c".to_owned())],
+      ]);
+   }
+
+   #[test]
+   fn the_caret_counts_tabs_as_drawn() {
+      assert_eq!(super::caret_indent("\tconst b = ;", 12), 14);
+      assert_eq!(super::caret_indent("x", 1), 0);
    }
 }
