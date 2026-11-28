@@ -79,6 +79,10 @@ impl<'img> Index<'img> {
          .map(|segment| segment.addr)
          .min()
          .unwrap_or(0);
+      #[cfg_attr(
+         not(any(target_arch = "x86_64", target_os = "macos")),
+         allow(unused_mut, reason = "add_leaves only mutates on Win64 targets")
+      )]
       let mut index = Self {
          image,
          isa,
@@ -88,13 +92,17 @@ impl<'img> Index<'img> {
          strs: OnceLock::new(),
          registry: OnceLock::new(),
       };
-      index.add_leaves();
+      #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+      if matches!(isa, Isa::X86_64 { win64: true }) {
+         index.add_leaves();
+      }
       index
    }
 
    /// Win64 leaf functions need no unwind data, so `.pdata` leaves them out.
    /// A call target outside every listed function starts one, which ends at
    /// the next listed start.
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
    fn add_leaves(&mut self) {
       let mut tables = self.build_tables(&self.functions);
       let mut leaves = tables
@@ -192,6 +200,9 @@ impl<'img> Index<'img> {
    }
 
    fn build_tables(&self, functions: &[(usize, usize)]) -> Tables {
+      if self.isa == Isa::Aarch64 {
+         return self.build_tables_aarch64(functions);
+      }
       let pack = |site: usize, target: usize| -> Option<u64> {
          let site = u32::try_from(site.checked_sub(self.base)?).ok()?;
          let target = u32::try_from(target.checked_sub(self.base)?).ok()?;
@@ -221,6 +232,81 @@ impl<'img> Index<'img> {
       }
       calls.sort_unstable();
       addrs.sort_unstable();
+      Tables {
+         calls: Refs(calls),
+         addrs: Refs(addrs),
+      }
+   }
+
+   fn build_tables_aarch64(&self, functions: &[(usize, usize)]) -> Tables {
+      let max_end = self
+         .image
+         .segments
+         .iter()
+         .map(|seg| seg.addr.saturating_add(seg.bytes.len()))
+         .max()
+         .unwrap_or(self.base);
+      let max_rva = max_end.saturating_sub(self.base);
+      let shift = max_rva.bit_width().saturating_sub(4);
+      let seed_arm64 = functions.len() == self.functions.len() && u32::try_from(max_rva).is_ok();
+      let parts = across(functions, |part| {
+         let mut calls: [Vec<u64>; 16] = std::array::from_fn(|_| Vec::new());
+         let mut addrs: [Vec<u64>; 16] = std::array::from_fn(|_| Vec::new());
+         let mut arm64_refs: [Vec<u64>; 16] = std::array::from_fn(|_| Vec::new());
+         for &(start, end) in part {
+            let Some(code) = self.image.read(start, end.saturating_sub(start)) else {
+               continue;
+            };
+            aarch64_table_refs(
+               code,
+               start,
+               end,
+               self.base,
+               max_end,
+               shift,
+               seed_arm64,
+               &mut calls,
+               &mut addrs,
+               &mut arm64_refs,
+            );
+         }
+         (calls, addrs, arm64_refs)
+      });
+      let mut calls_buckets: [Vec<u64>; 16] = std::array::from_fn(|_| Vec::new());
+      let mut addrs_buckets: [Vec<u64>; 16] = std::array::from_fn(|_| Vec::new());
+      let mut arm64_buckets: [Vec<u64>; 16] = std::array::from_fn(|_| Vec::new());
+      for (c, a, r) in parts {
+         for b in 0..16 {
+            calls_buckets[b].extend_from_slice(&c[b]);
+            addrs_buckets[b].extend_from_slice(&a[b]);
+            if seed_arm64 {
+               arm64_buckets[b].extend_from_slice(&r[b]);
+            }
+         }
+      }
+      let threads = std::thread::available_parallelism().map_or(1, usize::from);
+      let (calls, addrs, arm64_refs) = if threads <= 1 {
+         (
+            sort_and_flatten(calls_buckets, threads),
+            sort_and_flatten(addrs_buckets, threads),
+            seed_arm64.then(|| sort_and_flatten(arm64_buckets, threads)),
+         )
+      } else {
+         std::thread::scope(|scope| {
+            let h_calls = scope.spawn(|| sort_and_flatten(calls_buckets, threads));
+            let h_addrs = scope.spawn(|| sort_and_flatten(addrs_buckets, threads));
+            let h_arm64 =
+               seed_arm64.then(|| scope.spawn(|| sort_and_flatten(arm64_buckets, threads)));
+            (
+               h_calls.join().unwrap_or_default(),
+               h_addrs.join().unwrap_or_default(),
+               h_arm64.map(|h| h.join().unwrap_or_default()),
+            )
+         })
+      };
+      if let Some(arm64_refs) = arm64_refs {
+         phoenix_hook::arm64::seed_ref_index(self.image, arm64_refs);
+      }
       Tables {
          calls: Refs(calls),
          addrs: Refs(addrs),
@@ -305,6 +391,39 @@ impl<'img> Index<'img> {
       self.funcs(starts)
    }
 
+   /// Like [`Self::heads`], but inspects up to `max_words` (capped at 64) raw
+   /// `AArch64` instruction words on the stack with zero heap allocations.
+   #[must_use]
+   pub fn heads_arm64_words(
+      &self,
+      max_words: usize,
+      keep: impl Fn(&[u32]) -> bool + Sync,
+   ) -> Funcs<'_> {
+      let count = max_words.min(64);
+      let starts = across(&self.functions, |part| {
+         let mut out = Vec::new();
+         for &(start, end) in part {
+            let bytes = end.saturating_sub(start).min(count * 4);
+            let Some(code) = self.image.read(start, bytes) else {
+               continue;
+            };
+            let chunks = code.as_chunks::<4>().0;
+            let mut words = [0u32; 64];
+            for (dst, &raw) in words.iter_mut().zip(chunks.iter()) {
+               *dst = u32::from_le_bytes(raw);
+            }
+            if keep(&words[..chunks.len()]) {
+               out.push(start);
+            }
+         }
+         out
+      })
+      .into_iter()
+      .flatten()
+      .collect::<Vec<usize>>();
+      self.funcs(starts)
+   }
+
    /// Where `needle` sits in any segment.
    #[must_use]
    pub fn text(&self, needle: &[u8]) -> Vec<usize> {
@@ -336,12 +455,7 @@ impl<'img> Index<'img> {
    pub fn strs(&self) -> &[StrSlot] {
       self.strs.get_or_init(|| {
          let width = self.image.pointer_width;
-         // A 64-bit image read on a 32-bit host has no pointers it could use.
-         let word = |bytes: &[u8]| -> usize {
-            let mut raw = [0u8; 8];
-            raw[..width].copy_from_slice(&bytes[..width]);
-            usize::try_from(u64::from_le_bytes(raw)).unwrap_or(usize::MAX)
-         };
+         let threads = std::thread::available_parallelism().map_or(1, usize::from);
          let mut found = Vec::new();
          for segment in self
             .image
@@ -350,22 +464,59 @@ impl<'img> Index<'img> {
             .filter(|segment| !segment.executable)
          {
             let words = segment.bytes.len() / width;
-            for index in 0..words.saturating_sub(1) {
-               let at = index * width;
-               let len = word(&segment.bytes[at + width..]);
-               if !(1..=MAX_STR).contains(&len) {
-                  continue;
+            let count = words.saturating_sub(1);
+            if count == 0 {
+               continue;
+            }
+            let scan_range = |from: usize, to: usize| {
+               let mut part = Vec::new();
+               for index in from..to {
+                  let at = index * width;
+                  let mut raw_len = [0u8; 8];
+                  raw_len[..width].copy_from_slice(&segment.bytes[at + width..at + 2 * width]);
+                  let len = usize::try_from(u64::from_le_bytes(raw_len)).unwrap_or(usize::MAX);
+                  if !(1..=MAX_STR).contains(&len) {
+                     continue;
+                  }
+                  let mut raw_ptr = [0u8; 8];
+                  raw_ptr[..width].copy_from_slice(&segment.bytes[at..at + width]);
+                  let ptr = usize::try_from(u64::from_le_bytes(raw_ptr)).unwrap_or(usize::MAX);
+                  if let Some(bytes) = self.image.read(ptr, len)
+                     && std::str::from_utf8(bytes).is_ok()
+                  {
+                     part.push(StrSlot {
+                        slot: segment.addr + at,
+                        ptr,
+                        len,
+                     });
+                  }
                }
-               let ptr = word(&segment.bytes[at..]);
-               if let Some(bytes) = self.image.read(ptr, len)
-                  && std::str::from_utf8(bytes).is_ok()
-               {
-                  found.push(StrSlot {
-                     slot: segment.addr + at,
-                     ptr,
-                     len,
-                  });
+               part
+            };
+            if threads > 1 && count >= 65_536 {
+               let chunk = count.div_ceil(threads).max(16_384);
+               let parts: Vec<Vec<StrSlot>> = std::thread::scope(|scope| {
+                  #[expect(
+                     clippy::needless_collect,
+                     reason = "spawn every chunk worker before joining"
+                  )]
+                  let handles: Vec<_> = (0..count)
+                     .step_by(chunk)
+                     .map(|from| {
+                        let to = (from + chunk).min(count);
+                        scope.spawn(move || scan_range(from, to))
+                     })
+                     .collect();
+                  handles
+                     .into_iter()
+                     .map(|handle| handle.join().unwrap_or_default())
+                     .collect()
+               });
+               for part in parts {
+                  found.extend(part);
                }
+            } else {
+               found.extend(scan_range(0, count));
             }
          }
          found.sort_unstable_by_key(|slot| (slot.ptr, slot.slot));
@@ -489,6 +640,117 @@ impl<'img> Index<'img> {
          }
       }
       self.funcs(sites)
+   }
+}
+
+/// Sorts 16 range-partitioned `u64` buckets (in parallel when `threads > 1`)
+/// and flattens them into one globally sorted `Vec<u64>`.
+fn sort_and_flatten(mut buckets: [Vec<u64>; 16], threads: usize) -> Vec<u64> {
+   if threads <= 1 {
+      for bucket in &mut buckets {
+         bucket.sort_unstable();
+      }
+   } else {
+      std::thread::scope(|scope| {
+         for bucket in &mut buckets {
+            if bucket.len() > 1 {
+               scope.spawn(move || bucket.sort_unstable());
+            }
+         }
+      });
+   }
+   let total: usize = buckets.iter().map(Vec::len).sum();
+   let mut out = Vec::with_capacity(total);
+   for bucket in buckets {
+      out.extend_from_slice(&bucket);
+   }
+   out
+}
+
+/// Zero-allocation `AArch64` call and address-load extractor for [`Index::build_tables`].
+/// Matches [`op::decode`] for `Op::Call`, out-of-function `Op::Jump`, `Op::Addr`
+/// (`adrp`, `adrp+add`), and `Op::Global` (`adrp+ldr`/`adrp+str`), and also populates
+/// `arm64_refs` (`adrp+add`, `adrp+ldr/str`, `bl`, `b`) so `phoenix_hook::arm64::code_refs`
+/// never has to scan `__text` a second time.
+#[expect(clippy::too_many_arguments, reason = "hot inner loop avoiding struct overhead")]
+fn aarch64_table_refs(
+   code: &[u8],
+   start: usize,
+   end: usize,
+   base: usize,
+   max_end: usize,
+   shift: u32,
+   seed_arm64: bool,
+   calls: &mut [Vec<u64>; 16],
+   addrs: &mut [Vec<u64>; 16],
+   arm64_refs: &mut [Vec<u64>; 16],
+) {
+   const fn sign_extend(value: u32, bits: u32) -> isize {
+      let shift = 32 - bits;
+      (((value << shift).cast_signed()) >> shift) as isize
+   }
+   const fn rel(pc: usize, imm: u32, bits: u32) -> usize {
+      pc.wrapping_add_signed(sign_extend(imm, bits) * 4)
+   }
+   let push = |buckets: &mut [Vec<u64>; 16], site: usize, target: usize| {
+      if let (Some(s), Some(t)) = (site.checked_sub(base), target.checked_sub(base))
+         && let (Ok(s32), Ok(t32)) = (u32::try_from(s), u32::try_from(t))
+      {
+         let b = (t >> shift).min(15);
+         buckets[b].push((u64::from(t32) << 32) | u64::from(s32));
+      }
+   };
+   let mut pages = [(usize::MAX, 0usize); 32];
+   for (index, &raw) in code.as_chunks::<4>().0.iter().enumerate() {
+      let pc = start + index * 4;
+      let word = u32::from_le_bytes(raw);
+      if word & 0x9F00_0000 == 0x9000_0000 {
+         let rd = (word & 0x1F) as usize;
+         let immlo = (word >> 29) & 3;
+         let immhi = (word >> 5) & 0x7_FFFF;
+         let imm = sign_extend((immhi << 2) | immlo, 21) << 12;
+         let page = (pc & !0xFFF).wrapping_add_signed(imm);
+         pages[rd] = (index, page);
+         push(addrs, pc, page);
+      } else if word & 0x7F80_0000 == 0x1100_0000 {
+         let rn = ((word >> 5) & 0x1F) as usize;
+         let (set, page) = pages[rn];
+         if set != usize::MAX && index - set <= op::PAIR_REACH {
+            let shift_bit = (word >> 22) & 1;
+            let imm = (((word >> 10) & 0xFFF) as usize) << (12 * shift_bit);
+            let target = page.wrapping_add(imm);
+            push(addrs, pc, target);
+            if seed_arm64 && target >= base && target < max_end {
+               push(arm64_refs, pc, target);
+            }
+         }
+      } else if word & 0x3F00_0000 == 0x3900_0000 && ((word >> 22) & 3) <= 1 {
+         let rn = ((word >> 5) & 0x1F) as usize;
+         let (set, page) = pages[rn];
+         if set != usize::MAX && index - set <= op::PAIR_REACH {
+            let size = 1usize << (word >> 30);
+            let offset = ((word >> 10) & 0xFFF) as usize * size;
+            let target = page.wrapping_add(offset);
+            push(addrs, pc, target);
+            if seed_arm64 && target >= base && target < max_end {
+               push(arm64_refs, pc, target);
+            }
+         }
+      } else if word & 0xFC00_0000 == 0x9400_0000 {
+         let target = rel(pc, word & 0x03FF_FFFF, 26);
+         push(calls, pc, target);
+         if seed_arm64 && target >= base && target < max_end {
+            push(arm64_refs, pc, target);
+         }
+      } else if word & 0xFC00_0000 == 0x1400_0000 {
+         let target = rel(pc, word & 0x03FF_FFFF, 26);
+         if !(start..end).contains(&target) {
+            push(calls, pc, target);
+         }
+         if seed_arm64 && target >= base && target < max_end {
+            push(arm64_refs, pc, target);
+         }
+      }
    }
 }
 

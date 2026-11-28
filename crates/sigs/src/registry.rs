@@ -110,6 +110,17 @@ impl GatewayRegistry {
       Ok(Self { entries, by_name })
    }
 
+   /// Reconstructs a registry from cached entries.
+   #[must_use]
+   pub fn from_entries(entries: Vec<GatewayEntry>) -> Self {
+      let by_name = entries
+         .iter()
+         .enumerate()
+         .map(|(index, entry)| (entry.name.clone(), EventId(index)))
+         .collect();
+      Self { entries, by_name }
+   }
+
    #[must_use]
    pub fn id(&self, name: &str) -> Option<EventId> {
       self.by_name.get(name).copied()
