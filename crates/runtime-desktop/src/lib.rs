@@ -242,7 +242,7 @@ pub fn prepare() -> Result<(), Error> {
    let modal = require(modal::hooked(), "Workspace::render_overlays is not hooked");
    health::record("notices", health::Kind::Feature, modal.clone());
    critical("modal", modal);
-   feature("context_menu", || context_menu::install(&image));
+   feature("context_menu", || context_menu::install(&image, &ix));
    // Before accessories hooks `MessageRow::render`, whose prologue the header
    // locators check.
    let header = X86_CODE.then(|| headers::locate(&image, &ix));

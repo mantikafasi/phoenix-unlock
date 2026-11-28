@@ -33,9 +33,15 @@ use phoenix_hook::image::Image;
 use phoenix_sigs::desktop::{
    self,
    MenuLayout,
-   SubmenuLayout,
    icon_names,
    layout,
+};
+use phoenix_sigs::{
+   index::Index,
+   locate::menu::{
+      self,
+      SubmenuLayout,
+   },
 };
 
 use crate::{
@@ -325,7 +331,7 @@ fn legacy_icon(icon: &str) -> Option<u16> {
 }
 
 /// Locates and hooks `MessageContextMenu` from `DllMain`.
-pub fn install(image: &Image<'static>) {
+pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    match icon_names(image) {
       Ok(names) => {
          let _ = ICON_NAMES.set(names);
@@ -373,7 +379,7 @@ pub fn install(image: &Image<'static>) {
          separator_tag:     Some(layout::MENU_ITEM_SEPARATOR_TAG),
          layout:            menu.layout,
          id_offset:         None,
-         submenu:           desktop::submenu_layout(image)
+         submenu:           menu::submenu(ix)
             .inspect_err(|err| log::warn!("desktop context menu: {err}, submenus show inline"))
             .ok(),
       }
@@ -543,23 +549,20 @@ fn append_plugin_actions(
          .iter()
          .filter(|child| child.parent == Some(action.id))
          .peekable();
-      let items: Vec<RawMenuItem> = match (children.peek().is_some(), syms.submenu) {
-         (true, Some(submenu)) => {
-            submenu_item(syms, &submenu, action, message_id, channel_id)
-               .into_iter()
-               .collect()
-         },
+      let items: Vec<RawMenuItem> = if children.peek().is_none() {
+         action_item(syms, action, message_id, channel_id)
+            .into_iter()
+            .collect()
+      } else if let Some(item) = syms
+         .submenu
+         .and_then(|submenu| submenu_item(syms, &submenu, action, message_id, channel_id))
+      {
+         vec![item]
+      } else {
          // Without one of Discord's submenus to copy, the children go flat.
-         (true, None) => {
-            children
-               .filter_map(|child| action_item(syms, child, message_id, channel_id))
-               .collect()
-         },
-         (false, _) => {
-            action_item(syms, action, message_id, channel_id)
-               .into_iter()
-               .collect()
-         },
+         children
+            .filter_map(|child| action_item(syms, child, message_id, channel_id))
+            .collect()
       };
       for mut item in items {
          // SAFETY: `vec_push` copies one `MenuItem`, which fits `item`.

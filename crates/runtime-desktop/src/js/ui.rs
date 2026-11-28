@@ -28,8 +28,10 @@ use phoenix_runtime::{
          in_background,
       },
       checked_icon,
+      granted,
       restart_budget,
    },
+   permissions::url_host,
    store::{
       self,
       Cell,
@@ -643,6 +645,26 @@ fn add_message_action<'js>(
       },
    };
    let id = NEXT_ACTION.fetch_add(1, Ordering::Relaxed);
+   // Read every child before registering anything, so a bad one leaves no
+   // half-built submenu behind.
+   let children = children
+      .into_iter()
+      .flatten()
+      .enumerate()
+      .map(|(order, child)| {
+         Ok(DesktopAction {
+            id:       NEXT_ACTION.fetch_add(1, Ordering::Relaxed),
+            plugin:   plugin.to_owned(),
+            label:    child.get("label")?,
+            icon:     checked_icon(ctx, plugin, child.get("icon")?)?,
+            danger:   child.get::<_, Option<bool>>("danger")?.unwrap_or(false),
+            priority: i32::try_from(order).unwrap_or(i32::MAX),
+            visible:  None,
+            on_press: child.get("onPress")?,
+            parent:   Some(id),
+         })
+      })
+      .collect::<rquickjs::Result<Vec<_>>>()?;
    register_action(ctx, DesktopAction {
       id,
       plugin: plugin.to_owned(),
@@ -654,18 +676,8 @@ fn add_message_action<'js>(
       on_press,
       parent: None,
    })?;
-   for (order, child) in children.into_iter().flatten().enumerate() {
-      register_action(ctx, DesktopAction {
-         id:       NEXT_ACTION.fetch_add(1, Ordering::Relaxed),
-         plugin:   plugin.to_owned(),
-         label:    child.get("label")?,
-         icon:     child.get("icon")?,
-         danger:   child.get::<_, Option<bool>>("danger")?.unwrap_or(false),
-         priority: i32::try_from(order).unwrap_or(i32::MAX),
-         visible:  None,
-         on_press: child.get("onPress")?,
-         parent:   Some(id),
-      })?;
+   for child in children {
+      register_action(ctx, child)?;
    }
    let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| remove_action(&ctx, id))?;
    remove.set("update", Function::new(ctx.clone(), || {})?)?;
@@ -1609,9 +1621,19 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
             .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
       })?,
    )?;
+   let link_owner = plugin.to_owned();
    ui.set(
       "openUrl",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, url: String| {
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, url: String| {
+         if !granted(&ctx, &link_owner).is_some_and(|permissions| permissions.link(&url)) {
+            return Err(Exception::throw_message(
+               &ctx,
+               &format!(
+                  "{}: links off Discord need http on the plugin's // @permissions line",
+                  url_host(&url).as_deref().unwrap_or("openUrl")
+               ),
+            ));
+         }
          phoenix_ui_desktop::open_url(&url)
             .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
       })?,

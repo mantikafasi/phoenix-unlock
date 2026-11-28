@@ -1620,7 +1620,7 @@ declare namespace Phoenix {
     /// Copies `text` to the device clipboard.
     copy(text: string): void;
     /// Opens an `https://`, `http://` or `discord://` link in the default browser, and throws for
-    /// anything else. Desktop only for now.
+    /// anything else. Links off Discord need `http`. Desktop only for now.
     openUrl?(url: string): void;
     /// A short message at the bottom of the screen, in a banner at the top on iOS, or in a banner
     /// in the bottom right corner on desktop.

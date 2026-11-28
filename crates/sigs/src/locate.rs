@@ -9,6 +9,7 @@ pub mod channel;
 pub mod counts;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod message;
+pub mod menu;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod ready;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
@@ -78,6 +79,11 @@ pub const LOCATORS: &[Locator] = &[
       name:     "gpui builders",
       families: DESKTOP,
       run:      |ix| gpui::gpui(ix).map(|found| format!("{found:x?}")),
+   },
+   Locator {
+      name:     "menu submenu",
+      families: DESKTOP,
+      run:      |ix| menu::submenu(ix).map(|layout| format!("{layout:x?}")),
    },
    Locator {
       name:     "staff flag",
