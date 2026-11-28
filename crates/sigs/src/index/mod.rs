@@ -71,6 +71,38 @@ pub struct Index<'img> {
 }
 
 impl<'img> Index<'img> {
+   /// The arm64 outlined stub at `target`: its steps before its tail `b T`
+   /// (with `T`) or `ret` (without). A stub is a few frameless instructions
+   /// with no calls, branches or stack moves. Mach-O builds keep them to 6
+   /// instructions; ELF builds outline up to 12 and put a one-instruction
+   /// linker veneer in front of stubs past the 128 MB `bl` reach.
+   pub(crate) fn outlined(&self, target: usize) -> Option<(Vec<Step>, Option<usize>)> {
+      self.outlined_from(target, true)
+   }
+
+   fn outlined_from(&self, target: usize, veneer: bool) -> Option<(Vec<Step>, Option<usize>)> {
+      if self.isa != Isa::Aarch64 {
+         return None;
+      }
+      let elf = self.image.function_starts.is_none();
+      let most = if elf { 12 } else { 6 };
+      let mut prefix = Vec::new();
+      for step in op::decode_head(self.image, self.isa, target, target + most * 4, most) {
+         match step.op {
+            Op::Jump(tail) if prefix.is_empty() && elf && veneer && tail != target => {
+               return self
+                  .outlined_from(tail, false)
+                  .or(Some((prefix, Some(tail))));
+            },
+            Op::Jump(tail) => return Some((prefix, Some(tail))),
+            Op::Ret => return Some((prefix, None)),
+            Op::Call(_) | Op::Branch(_) => return None,
+            _ if step.writeback.is_some() => return None,
+            _ => prefix.push(step),
+         }
+      }
+      None
+   }
    #[must_use]
    pub fn new(image: &'img Image<'img>, isa: Isa) -> Self {
       let base = image
@@ -287,7 +319,11 @@ impl<'img> Index<'img> {
       let bytes = steps
          * match self.isa {
             Isa::Aarch64 | Isa::Thumb2 => 4,
-            #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+            #[cfg(any(
+               target_arch = "x86_64",
+               target_os = "macos",
+               all(target_os = "linux", target_arch = "aarch64")
+            ))]
             Isa::X86_64 { .. } => 15,
          };
       let starts = across(&self.functions, |part| {
@@ -604,10 +640,70 @@ impl<'ix> Func<'ix> {
          .collect()
    }
 
+   /// [`Self::steps`] with each arm64 outlined stub it calls inlined: a call
+   /// to a stub becomes the stub's steps (carrying the call's address) and a
+   /// call to its tail, and on ELF builds a tail jump into a stub becomes its
+   /// steps and its own tail jump.
+   #[must_use]
+   pub fn flat_steps(&self) -> Vec<Step> {
+      let steps = self.steps();
+      if self.ix.isa != Isa::Aarch64 {
+         return steps;
+      }
+      let elf = self.ix.image.function_starts.is_none();
+      let mut out = Vec::with_capacity(steps.len());
+      for step in steps {
+         let (target, tail_op): (usize, fn(usize) -> Op) = match step.op {
+            Op::Call(target) => (target, Op::Call),
+            Op::Jump(target) if elf && !(self.start..self.end).contains(&target) => {
+               (target, Op::Jump)
+            },
+            _ => {
+               out.push(step);
+               continue;
+            },
+         };
+         let Some((prefix, tail)) = self.ix.outlined(target) else {
+            out.push(step);
+            continue;
+         };
+         out.extend(prefix.into_iter().map(|inner| {
+            Step {
+               at: step.at,
+               ..inner
+            }
+         }));
+         match tail {
+            Some(tail) => {
+               out.push(Step {
+                  op: tail_op(tail),
+                  ..step
+               });
+            },
+            None if matches!(step.op, Op::Jump(_)) => {
+               out.push(Step {
+                  op: Op::Ret,
+                  ..step
+               });
+            },
+            None => {},
+         }
+      }
+      out
+   }
+
    pub(crate) fn through_outlined(&self, target: usize) -> Option<usize> {
       const MOST: usize = 6;
       if self.ix.isa != Isa::Aarch64 {
          return Some(target);
+      }
+      // ELF builds reach their stubs through linker veneers and outline
+      // longer runs, which `Index::outlined` follows.
+      if self.ix.image.function_starts.is_none() {
+         return match self.ix.outlined(target) {
+            Some((_, tail)) => tail,
+            None => Some(target),
+         };
       }
       let Some(callee) = self.ix.function(target) else {
          return Some(target);

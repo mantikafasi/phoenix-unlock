@@ -137,7 +137,7 @@ pub fn hooked() -> bool {
 /// page 24 over where the entry can't be added.
 pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    if !crate::X86_CODE {
-      #[cfg(target_os = "macos")]
+      #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
       install_arm64(image, ix);
       return;
    }
@@ -160,7 +160,7 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
 /// Discord's own builders ([`gpui::locate`]) or opening Sunbird's settings
 /// window when they don't decode. Nothing is written unless the visibility
 /// guards and `host::section` both decode.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 fn install_arm64(image: &Image<'static>, ix: &Index<'_>) {
    use phoenix_sigs::macos;
 

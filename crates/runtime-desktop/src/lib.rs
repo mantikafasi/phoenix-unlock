@@ -2,11 +2,7 @@
 //! Sunbird pages in User Settings, message accessories, member list
 //! decorations and the tray.
 
-#![cfg(any(
-   windows,
-   target_os = "macos",
-   all(target_os = "linux", target_arch = "x86_64")
-))]
+#![cfg(any(windows, target_os = "macos", target_os = "linux"))]
 
 mod accessories;
 mod badges;
@@ -184,10 +180,10 @@ pub(crate) unsafe fn hook_sret<F: Copy>(
 ) -> Option<F> {
    const { assert!(size_of::<F>() == size_of::<usize>()) };
    // SAFETY: forwarded from the caller.
-   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
    let hooked = unsafe { image.hook_sret_entry(target, detour) };
    // SAFETY: forwarded from the caller.
-   #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+   #[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
    let hooked = unsafe { image.hook_entry(target, detour) };
    let orig = match hooked {
       Ok(orig) => orig,
@@ -259,7 +255,7 @@ pub fn prepare() -> Result<(), Error> {
       feature("headers", || headers::install(&image, header));
       feature("message", || message::install(&image));
    } else {
-      #[cfg(target_os = "macos")]
+      #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
       feature("headers", || headers::arm64::install(&image));
    }
    feature("counts", || counts::install(&image, &ix));
@@ -283,7 +279,10 @@ pub fn prepare() -> Result<(), Error> {
       registry.as_ref().map(|_| ()).map_err(ToString::to_string),
    );
    if registry.is_ok() {
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      // Before the direct-call hooks: READY is found from the handler's first
+      // call, which reads as the hook's jump once the handler is hooked.
+      feature("ready", || ready::install(&image, &ix));
+      #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
       feature("direct_calls", || route_direct_calls(&image));
       discord::install(&image);
       critical(
@@ -294,9 +293,8 @@ pub fn prepare() -> Result<(), Error> {
       feature("optimistic_delete", || {
          accessories::install_optimistic_delete(&image, &ix);
       });
-      feature("ready", || ready::install(&image, &ix));
    }
-   #[cfg(target_os = "macos")]
+   #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
    feature("message_writer", || message::writer::install(&image));
    health::log_summary();
    // The indexes are tens of MB and nothing reads them after startup.
@@ -385,6 +383,8 @@ fn open_gate_extras(image: &Image<'static>) {
       health::feature("notification_gate", || open_notification_gate(image));
    } else {
       health::feature("notification_gate", || close_enforced(image));
+      // Linux's webviews have no frame to order under.
+      #[cfg(target_os = "macos")]
       health::feature("webview_pages", || keep_pages_over_frame(image));
    }
 }
@@ -393,6 +393,10 @@ fn open_gate_extras(image: &Image<'static>) {
 /// without the access function and drops every message alert for a gated
 /// account, notifications and their sounds included.
 fn close_enforced(image: &Image<'static>) {
+   // Linux's access read doesn't call `enforced`, which is found by shape.
+   #[cfg(target_os = "linux")]
+   let enforced = phoenix_sigs::macos::elf_access_enforced(image);
+   #[cfg(not(target_os = "linux"))]
    let enforced = phoenix_sigs::macos::access_read(image)
       .and_then(|read| phoenix_sigs::macos::access_enforced(image, read));
    // SAFETY: as for the access function in `open_access_gate`.
@@ -406,6 +410,7 @@ fn close_enforced(image: &Image<'static>) {
 /// Keeps macOS embedded webviews above `GPUIView` so mouse clicks reach
 /// interactive modals like hCaptcha (release builds ignore
 /// `LIBDISCORD_MAC_PAGES_OVER_FRAME`).
+#[cfg(target_os = "macos")]
 fn keep_pages_over_frame(image: &Image<'static>) {
    let func = match phoenix_sigs::macos::pages_under_frame(image) {
       Ok(func) => func,
@@ -425,7 +430,7 @@ fn keep_pages_over_frame(image: &Image<'static>) {
 /// handler directly past the registry (macOS deletes your own message that
 /// way). Each stub passes its own trampoline in `x3` so events missing from the
 /// registry still fall back to Discord's original handler.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 fn route_direct_calls(image: &Image<'static>) {
    let detour = phoenix_runtime::gateway::entry_detour_with_fallback();
    let handlers = phoenix_runtime::gateway::handlers();

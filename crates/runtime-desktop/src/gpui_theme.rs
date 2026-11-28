@@ -310,7 +310,7 @@ mod radius {
 
    /// macOS `MetalRenderer::draw(&mut self, scene: &Scene)` takes `(x0, x1)`
    /// and returns `()`.
-   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
    mod abi {
       use std::sync::OnceLock;
 
@@ -337,7 +337,7 @@ mod radius {
 
    #[cfg(any(
       all(target_arch = "x86_64", any(windows, target_os = "linux")),
-      all(target_os = "macos", target_arch = "aarch64")
+      all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))
    ))]
    pub(super) fn install(image: &Image<'static>, ix: &Index<'_>) {
       let found = match mana_theme::scene_draw(ix) {
@@ -365,7 +365,7 @@ mod radius {
 
    #[cfg(not(any(
       all(target_arch = "x86_64", any(windows, target_os = "linux")),
-      all(target_os = "macos", target_arch = "aarch64")
+      all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))
    )))]
    pub(super) fn install(_image: &Image<'static>, _ix: &Index<'_>) {}
 }

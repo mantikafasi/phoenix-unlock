@@ -2,7 +2,7 @@
 //! call's argument registers, for the debug tools.
 
 use std::ops::Range;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(windows, target_os = "linux")))]
 use std::{
    ffi::c_void,
    sync::atomic::AtomicPtr,
@@ -20,7 +20,7 @@ use iced_x86::{
 
 use crate::image::Image;
 #[cfg(windows)] use crate::image::win32;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(windows, target_os = "linux")))]
 use crate::{
    Error,
    Hook as _,
@@ -1063,7 +1063,7 @@ pub fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
       iov_len:  len,
    };
    let remote = libc::iovec {
-      iov_base: addr as *mut c_void,
+      iov_base: addr as *mut std::ffi::c_void,
       iov_len:  len,
    };
    // SAFETY: `buffer` holds `len` writable bytes, and process_vm_readv checks
@@ -1135,7 +1135,7 @@ impl Regs {
 
 /// The registers at a hooked function's entry, as the stub saved them. `rax`
 /// carries the vector register count into variadic functions.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[repr(C)]
 pub struct Regs {
    pub r9:  u64,
@@ -1149,7 +1149,7 @@ pub struct Regs {
    pub ret: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 impl Regs {
    /// The first four integer arguments, `rdi`, `rsi`, `rdx` and `rcx`.
    #[must_use]
@@ -1160,17 +1160,17 @@ impl Regs {
 
 /// Called on every entry of an observed function, on the caller's thread,
 /// with the context passed to [`observe`]. It must not unwind.
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(windows, target_os = "linux")))]
 pub type Observer = extern "C" fn(ctx: usize, regs: &Regs);
 
 /// A function [`observe`] redirects through its stub.
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(windows, target_os = "linux")))]
 pub struct Observed {
    addr: usize,
    hook: crate::Inline,
 }
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(windows, target_os = "linux")))]
 impl Observed {
    #[must_use]
    pub const fn addr(&self) -> usize {
@@ -1195,7 +1195,7 @@ impl Observed {
 /// # Safety
 ///
 /// `addr` starts a function.
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(windows, target_os = "linux")))]
 pub unsafe fn observe(
    image: &Image<'static>,
    addr: usize,
@@ -1231,7 +1231,7 @@ pub unsafe fn observe(
 
 /// Saves the argument registers and `rax`, calls `observer(ctx, &regs)` on a
 /// 16-byte aligned stack and restores them.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn stub(observer: Observer, ctx: usize) -> Vec<u8> {
    // push rax, rdi, rsi, rdx, rcx, r8, r9; sub rsp, 0x80
    let mut code = vec![

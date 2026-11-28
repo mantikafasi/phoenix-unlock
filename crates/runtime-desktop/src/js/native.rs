@@ -309,7 +309,7 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
 
 /// `phoenix.native.hook`, on `phoenix_hook::x86::observe`, which saves the
 /// argument registers.
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(windows, target_os = "linux")))]
 mod observe {
    use std::{
       cell::Cell,
@@ -488,7 +488,7 @@ mod observe {
 }
 
 /// `phoenix.native.hook` where `phoenix_hook::x86::observe` has no stub.
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(all(target_arch = "x86_64", any(windows, target_os = "linux"))))]
 mod observe {
    use phoenix_hook::image::Image;
 
