@@ -30,13 +30,13 @@ use std::{
 };
 
 use phoenix_hook::image::Image;
-use phoenix_sigs::desktop::{
-   self,
-   MenuLayout,
-   icon_names,
-   layout,
-};
 use phoenix_sigs::{
+   desktop::{
+      self,
+      MenuLayout,
+      icon_names,
+      layout,
+   },
    index::Index,
    locate::menu::{
       self,
@@ -109,6 +109,18 @@ unsafe impl Sync for MenuSymbols {}
 
 static MENU_SYMS: OnceLock<MenuSymbols> = OnceLock::new();
 
+#[cfg(windows)]
+pub fn message_menu_ready() -> bool {
+   MENU_SYMS
+      .get()
+      .is_some_and(|syms| syms.orig_build.is_some())
+}
+
+#[cfg(windows)]
+pub fn menu_ids_available() -> bool {
+   MENU_SYMS.get().is_some_and(|syms| syms.id_offset.is_some())
+}
+
 /// Snapshot of one registered `phoenix.ui.addMessageAction` item, read on the
 /// GPUI thread when a message context menu opens.
 #[derive(Clone, Debug)]
@@ -121,7 +133,26 @@ pub struct ActionMeta {
    pub has_visible: bool,
    /// The action whose submenu this one sits in.
    pub parent:      Option<u64>,
+   #[cfg(windows)]
+   pub placement:   Option<MenuPlacement>,
 }
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct MenuPlacement {
+   pub anchor: String,
+   pub after:  bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct MenuEdit {
+   pub item:        String,
+   pub destination: Option<MenuPlacement>,
+}
+
+#[cfg(windows)]
+pub type DropMenuItem = unsafe extern "C" fn(*mut u8);
 
 static ACTIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ACTIONS: LazyLock<RwLock<Vec<ActionMeta>>> = LazyLock::new(|| RwLock::new(Vec::new()));
@@ -130,9 +161,21 @@ static ACTIONS: LazyLock<RwLock<Vec<ActionMeta>>> = LazyLock::new(|| RwLock::new
 /// `(action_id, message_id, channel_id)` to invoke when the user clicks it.
 #[derive(Clone, Copy)]
 struct PendingClick {
-   action:  u64,
-   message: u64,
-   channel: u64,
+   action: u64,
+   target: ClickTarget,
+}
+
+#[derive(Clone, Copy)]
+enum ClickTarget {
+   Message {
+      message: u64,
+      channel: u64,
+   },
+   #[cfg(windows)]
+   Navigation {
+      menu:   phoenix_sigs::locate::surfaces::Menu,
+      target: u64,
+   },
 }
 
 const MAX_PENDING_CLICKS: usize = 512;
@@ -217,12 +260,20 @@ fn ensure_worker() -> &'static mpsc::Sender<PendingClick> {
          .spawn(move || {
             while let Ok(click) = rx.recv() {
                if let Some(engine) = phoenix_runtime::engine() {
-                  crate::js::ui::invoke_message_action(
-                     &engine,
-                     click.action,
-                     click.message,
-                     click.channel,
-                  );
+                  match click.target {
+                     ClickTarget::Message { message, channel } => {
+                        crate::js::ui::invoke_message_action(
+                           &engine,
+                           click.action,
+                           message,
+                           channel,
+                        );
+                     },
+                     #[cfg(windows)]
+                     ClickTarget::Navigation { menu, target } => {
+                        crate::js::navigation_menus::press(&engine, click.action, menu, target);
+                     },
+                  }
                }
             }
          });
@@ -361,26 +412,39 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    // SAFETY: every address was validated by `desktop::message_context_menu`.
    let syms = unsafe {
       MenuSymbols {
-         orig_build:        Some(orig_build),
-         msg_ptr_offset:    menu.msg_ptr_offset,
-         msg_id_offset:     menu.msg_id_offset,
-         channel_id_offset: menu.channel_id_offset,
-         props_new:         std::mem::transmute::<usize, PropsNewFn>(menu.props_new),
-         with_id:           std::mem::transmute::<usize, WithIdFn>(menu.with_id),
-         with_icon:         std::mem::transmute::<usize, WithIconFn>(menu.with_icon),
-         with_color:        Some(std::mem::transmute::<usize, WithColorFn>(menu.with_color)),
-         vec_push:          std::mem::transmute::<usize, VecPushFn>(menu.vec_push),
-         separator_tag:     Some(layout::MENU_ITEM_SEPARATOR_TAG),
-         layout:            menu.layout,
-         id_offset:         None,
-         submenu:           submenu(ix),
+         orig_build:                     Some(orig_build),
+         msg_ptr_offset:                 menu.msg_ptr_offset,
+         msg_id_offset:                  menu.msg_id_offset,
+         channel_id_offset:              menu.channel_id_offset,
+         props_new:                      std::mem::transmute::<usize, PropsNewFn>(menu.props_new),
+         with_id:                        std::mem::transmute::<usize, WithIdFn>(menu.with_id),
+         with_icon:                      std::mem::transmute::<usize, WithIconFn>(menu.with_icon),
+         with_color:                     Some(std::mem::transmute::<usize, WithColorFn>(
+            menu.with_color,
+         )),
+         vec_push:                       std::mem::transmute::<usize, VecPushFn>(menu.vec_push),
+         separator_tag:                  Some(layout::MENU_ITEM_SEPARATOR_TAG),
+         layout:                         menu.layout,
+         #[cfg(windows)]
+         id_offset:                      phoenix_sigs::locate::surfaces::menu_id_field(
+            ix,
+            menu.with_id,
+            menu.layout.props_size,
+         )
+         .map(|relative| menu.layout.props + relative),
+         #[cfg(not(windows))]
+         id_offset:                      None,
+         submenu:                        submenu(ix),
       }
    };
+   #[cfg(not(windows))]
    let syms = MenuSymbols {
       id_offset: inline_id_offset(&syms),
       ..syms
    };
    let _ = MENU_SYMS.set(syms);
+   #[cfg(windows)]
+   crate::navigation_menus::install(image, ix, menu.layout.size);
    log::info!(
       "desktop context menu: hooked MessageContextMenu @ {:#x} (msg +{:#x}, id +{:#x}, ch +{:#x}) \
        {:x?}",
@@ -410,6 +474,9 @@ unsafe extern "C" fn build_context_menu_detour(
    // Read `message_id` and `channel_id` BEFORE calling `orig_build`, because
    // `MessageContextMenu` takes `input` by value and drops it before returning.
    let wanted = ACTIVE_COUNT.load(Ordering::Acquire) > 0 || double_click::pending();
+   #[cfg(windows)]
+   let wanted =
+      wanted || crate::navigation_menus::has_actions(phoenix_sigs::locate::surfaces::Menu::Message);
    let (message_id, channel_id) = if wanted && !input.is_null() {
       // SAFETY: `input` is a live `MessageContextMenuInput`; offsets were
       // decoded from `MessageContextMenu` and its permission check callee.
@@ -447,6 +514,18 @@ unsafe extern "C" fn build_context_menu_detour(
       let _ = std::panic::catch_unwind(|| {
          press_item(syms, sret, &item, a3 as *mut c_void, s2 as *mut c_void);
       });
+   }
+
+   #[cfg(windows)]
+   if !sret.is_null() {
+      // SAFETY: orig_build initialized the caller's native menu Vec above.
+      unsafe {
+         crate::navigation_menus::apply(
+            phoenix_sigs::locate::surfaces::Menu::Message,
+            sret,
+            message_id,
+         );
+      };
    }
 
    if message_id == 0 || sret.is_null() || ACTIVE_COUNT.load(Ordering::Acquire) == 0 {
@@ -614,10 +693,17 @@ fn action_item(
    message: u64,
    channel: u64,
 ) -> Option<RawMenuItem> {
+   make_action_item(syms, action, ClickTarget::Message { message, channel })
+}
+
+fn make_action_item(
+   syms: &MenuSymbols,
+   action: &ActionMeta,
+   target: ClickTarget,
+) -> Option<RawMenuItem> {
    let token = register_click(PendingClick {
       action: action.id,
-      message,
-      channel,
+      target,
    });
    let rc_ptr = gpui::alloc_rc_u64(token)
       .or_else(|| (!crate::X86_CODE).then(|| gpui::pinned_rc_u64(token)))?;
@@ -657,6 +743,166 @@ fn submenu(ix: &Index<'_>) -> Option<SubmenuLayout> {
       }
    });
    Some(layout)
+}
+
+#[cfg(windows)]
+pub unsafe fn append_navigation_actions(
+   vec: *mut RawMenuVec,
+   actions: &[ActionMeta],
+   menu: phoenix_sigs::locate::surfaces::Menu,
+   target: u64,
+) {
+   let Some(syms) = MENU_SYMS.get() else {
+      return;
+   };
+   if vec.is_null() || actions.is_empty() {
+      return;
+   }
+   let mut separated = false;
+   let mut after = std::collections::HashMap::new();
+   for action in actions {
+      if let Some(mut item) =
+         make_action_item(syms, action, ClickTarget::Navigation { menu, target })
+      {
+         // SAFETY: vec points to the initialized native menu Vec.
+         unsafe {
+            insert_action(
+               syms,
+               vec,
+               action.placement.as_ref(),
+               &mut item,
+               &mut separated,
+               &mut after,
+            );
+         };
+      }
+   }
+}
+
+#[cfg(windows)]
+unsafe fn find_native_item(syms: &MenuSymbols, vec: *const RawMenuVec, id: &str) -> Option<usize> {
+   let id_at = syms.id_offset?;
+   let expected = id.as_bytes();
+   if expected.is_empty() || expected.len() > 23 {
+      return None;
+   }
+   let width = syms.layout.size;
+   // SAFETY: vec is live. Only the discriminant and initialized id bytes of
+   // known variants are read.
+   unsafe {
+      (0..(*vec).len).position(|index| {
+         let entry = (*vec).ptr.cast::<u8>().add(index * width);
+         let tag = u64::from(entry.cast::<u32>().read_unaligned());
+         let field = if tag == syms.layout.action_tag {
+            id_at
+         } else if let Some(submenu) = syms.submenu.as_ref().filter(|layout| tag == layout.tag) {
+            id_at
+               .checked_sub(syms.layout.props)
+               .map_or(width, |relative| submenu.props + relative)
+         } else {
+            return false;
+         };
+         field + 1 + expected.len() <= width
+            && usize::from(entry.add(field).read()) == expected.len()
+            && std::slice::from_raw_parts(entry.add(field + 1), expected.len()) == expected
+      })
+   }
+}
+
+#[cfg(windows)]
+pub unsafe fn edit_navigation_menu(
+   vec: *mut RawMenuVec,
+   edits: &[MenuEdit],
+   drop_item: Option<DropMenuItem>,
+) {
+   let Some(syms) = MENU_SYMS.get().filter(|_| !vec.is_null()) else {
+      return;
+   };
+   let width = syms.layout.size;
+   for edit in edits {
+      // SAFETY: the caller passes the native Vec that the collector is about to
+      // consume.
+      unsafe {
+         let Some(source) = find_native_item(syms, vec, &edit.item) else {
+            continue;
+         };
+         if let Some(destination) = &edit.destination {
+            let Some(anchor) = find_native_item(syms, vec, &destination.anchor) else {
+               continue;
+            };
+            let insertion = anchor + usize::from(destination.after);
+            let entries = menu_entries(vec, width);
+            if source < insertion {
+               entries[source * width..insertion * width].rotate_left(width);
+            } else if source > insertion {
+               entries[insertion * width..(source + 1) * width].rotate_right(width);
+            }
+         } else if let Some(drop_item) = drop_item {
+            let entries = menu_entries(vec, width);
+            entries[source * width..].rotate_left(width);
+            (*vec).len -= 1;
+            drop_item((*vec).ptr.cast::<u8>().add((*vec).len * width));
+         }
+      }
+   }
+}
+
+#[cfg(windows)]
+unsafe fn menu_entries<'a>(
+   vec: *mut RawMenuVec,
+   width: usize,
+) -> &'a mut [std::mem::MaybeUninit<u8>] {
+   // SAFETY: caller owns the live Vec for the duration of the returned borrow.
+   unsafe {
+      std::slice::from_raw_parts_mut(
+         (*vec).ptr.cast::<std::mem::MaybeUninit<u8>>(),
+         (*vec).len * width,
+      )
+   }
+}
+
+#[cfg(windows)]
+unsafe fn insert_action(
+   syms: &MenuSymbols,
+   vec: *mut RawMenuVec,
+   placement: Option<&MenuPlacement>,
+   item: &mut RawMenuItem,
+   separated: &mut bool,
+   after: &mut std::collections::HashMap<String, usize>,
+) {
+   let width = syms.layout.size;
+   // SAFETY: vec is live and its initialized contents span len elements of
+   // width bytes.
+   let index = unsafe {
+      placement.and_then(|placement| {
+         let index = find_native_item(syms, vec, &placement.anchor)?;
+         if !placement.after {
+            return Some(index);
+         }
+         let count = after.entry(placement.anchor.clone()).or_default();
+         *count += 1;
+         Some(index + *count)
+      })
+   };
+   // SAFETY: vec_push consumes initialized items using the verified native
+   // layout.
+   unsafe {
+      if index.is_none()
+         && !*separated
+         && (*vec).len > 0
+         && let Some(tag) = syms.separator_tag
+      {
+         let mut separator = RawMenuItem::zeroed();
+         separator.put(0, tag);
+         (syms.vec_push)(vec, &raw mut separator);
+         *separated = true;
+      }
+      (syms.vec_push)(vec, item);
+      if let Some(index) = index {
+         let entries = menu_entries(vec, width);
+         entries[index * width..].rotate_right(width);
+      }
+   }
 }
 
 /// A native submenu whose builder lists `action`'s children when it opens.
@@ -895,7 +1141,13 @@ mod arm64 {
       if let (Some((message, channel)), Some(syms)) = (ids, MENU_SYMS.get()) {
          if let Some(item) = crate::double_click::take_press(message) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-               super::press_item(syms, &raw mut out, &item, a2 as *mut c_void, a5 as *mut c_void);
+               super::press_item(
+                  syms,
+                  &raw mut out,
+                  &item,
+                  a2 as *mut c_void,
+                  a5 as *mut c_void,
+               );
             }));
          }
          if active {
@@ -910,6 +1162,7 @@ mod arm64 {
 
 /// Finds where `with_id` stores a short id by giving one to a blank action
 /// item. The id moves with the item's variant.
+#[cfg(not(windows))]
 fn inline_id_offset(syms: &MenuSymbols) -> Option<usize> {
    const PROBE: &[u8] = b"zq";
    let mut blank = RawMenuItem::zeroed();

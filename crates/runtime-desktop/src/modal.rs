@@ -1723,6 +1723,8 @@ pub fn install(image: &Image<'static>) {
          return;
       },
    };
+   #[cfg(windows)]
+   crate::surfaces::set_div_id(found.div_id);
    WINDOW_VAL_OFFSET.store(found.window_validation_offset, Ordering::Release);
    set_dismiss(&found.dismiss, gpui_layout.div.interactivity);
 
