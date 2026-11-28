@@ -15,6 +15,7 @@ use phoenix_sigs::{
    locate::surfaces::{
       Surface,
       button_id_field,
+      composer_buttons,
       div_ids,
    },
 };
@@ -26,9 +27,11 @@ use crate::gpui::{
 };
 
 type DivId = unsafe extern "C" fn(*mut RawDiv, *mut RawDiv, *const u8, usize) -> *mut RawDiv;
+type ComposerChild = unsafe extern "C" fn(*mut RawDiv, *mut RawDiv, u8, *mut RawDiv) -> *mut RawDiv;
 static DIV_ID: OnceLock<usize> = OnceLock::new();
 static OWNED_ID: OnceLock<usize> = OnceLock::new();
 static ORIGINAL: OnceLock<DivId> = OnceLock::new();
+static COMPOSER: OnceLock<ComposerChild> = OnceLock::new();
 static SLOTS: OnceLock<Vec<(Surface, usize, usize)>> = OnceLock::new();
 static BUTTONS: RwLock<Vec<Button>> = RwLock::new(Vec::new());
 static WORKER: OnceLock<mpsc::SyncSender<[u64; 2]>> = OnceLock::new();
@@ -70,6 +73,21 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    let Some(&target) = DIV_ID.get().filter(|_| gpui::supports_push_any()) else {
       return;
    };
+   match composer_buttons(ix, target, layout.div.size) {
+      Ok((site, _)) => {
+         // SAFETY: the composer locator verifies the native optional Div child
+         // call. Startup installs the detour before it can be called.
+         match unsafe { image.hook_call(site, &[], with_composer as *const () as usize) } {
+            Ok(original) => {
+               // SAFETY: this is the optional Div child builder found above.
+               let _ =
+                  COMPOSER.set(unsafe { std::mem::transmute::<usize, ComposerChild>(original) });
+            },
+            Err(err) => log::warn!("plugin ui composer: {err}"),
+         }
+      },
+      Err(err) => log::warn!("plugin ui composer: {err}"),
+   }
    let slots = Surface::DIVS
       .into_iter()
       .flat_map(|surface| {
@@ -100,6 +118,9 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
 }
 
 pub fn ready(surface: Surface) -> bool {
+   if surface == Surface::Composer && COMPOSER.get().is_some() {
+      return true;
+   }
    if surface == Surface::MessageToolbar
       && OWNED_ID.get().is_some()
       && crate::accessories::message_rows_hooked()
@@ -162,17 +183,35 @@ unsafe extern "C" fn with_id(
          (id.addr() == address && len == size).then_some(surface)
       })
    });
-   if let Some(surface) = surface
-      && !result.is_null()
-   {
-      let _ = std::panic::catch_unwind(|| {
-         if let Some(row) = row(surface, 0) {
-            // SAFETY: result is the initialized native Div returned by Div::id.
-            unsafe { gpui::append_div(result.cast(), row) };
-         }
-      });
+   if let Some(surface) = surface {
+      // SAFETY: result is the initialized native Div returned by Div::id.
+      unsafe { append_buttons(surface, result) };
    }
    result
+}
+
+unsafe extern "C" fn with_composer(
+   out: *mut RawDiv,
+   parent: *mut RawDiv,
+   show_emoji: u8,
+   emoji: *mut RawDiv,
+) -> *mut RawDiv {
+   // SAFETY: the locator verifies parent is the live Div passed to the builder.
+   unsafe { append_buttons(Surface::Composer, parent) };
+   // SAFETY: forwards the builder's original inputs and output storage.
+   unsafe { (COMPOSER.wait())(out, parent, show_emoji, emoji) }
+}
+
+unsafe fn append_buttons(surface: Surface, parent: *mut RawDiv) {
+   if parent.is_null() {
+      return;
+   }
+   let _ = std::panic::catch_unwind(|| {
+      if let Some(row) = row(surface, 0) {
+         // SAFETY: caller provides the initialized Div we may append to.
+         unsafe { gpui::append_div(parent.cast(), row) };
+      }
+   });
 }
 
 pub fn row(surface: Surface, message: u64) -> Option<RawDiv> {

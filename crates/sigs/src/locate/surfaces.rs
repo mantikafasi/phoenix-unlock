@@ -3,6 +3,7 @@ use iced_x86::{
    DecoderOptions,
    FlowControl,
    InstructionInfoFactory,
+   Mnemonic,
    OpAccess,
    Register,
 };
@@ -12,7 +13,9 @@ use crate::{
    index::{
       Func,
       Index,
+      Native,
       Op,
+      Value,
       flow,
       op::Step,
    },
@@ -277,8 +280,7 @@ fn collector_arguments(ix: &Index<'_>, func: &Func<'_>, steps: &[Step]) -> bool 
 }
 
 impl Surface {
-   pub const DIVS: [Self; 5] = [
-      Self::Composer,
+   pub const DIVS: [Self; 4] = [
       Self::ServerList,
       Self::Account,
       Self::Profile,
@@ -309,18 +311,27 @@ impl Surface {
    #[must_use]
    pub const fn native_id(self) -> Option<&'static str> {
       match self {
-         Self::Composer => Some("composer-area"),
          Self::ServerList => Some("rail-nav"),
          Self::Account => Some("account-row"),
          Self::Profile => Some("profile-body"),
          Self::MediaViewer => Some("media-viewer-pill"),
-         Self::MessageToolbar => None,
+         Self::Composer | Self::MessageToolbar => None,
       }
    }
 }
 
 pub fn div_ids(ix: &Index<'_>, div_id: usize, surface: Surface) -> Found<Vec<usize>> {
    let id = surface.native_id().ok_or("surface has no native Div id")?;
+   let mut ids = div_id_calls(ix, div_id, id)?
+      .into_iter()
+      .map(|(address, _)| address)
+      .collect::<Vec<_>>();
+   ids.sort_unstable();
+   ids.dedup();
+   Ok(ids)
+}
+
+fn div_id_calls(ix: &Index<'_>, div_id: usize, id: &str) -> Found<Vec<(usize, usize)>> {
    let mut load_length = [0x41, 0xB9, 0, 0, 0, 0];
    let len = u32::try_from(id.len()).map_err(|err| err.to_string())?;
    load_length[2..].copy_from_slice(&len.to_le_bytes());
@@ -341,7 +352,7 @@ pub fn div_ids(ix: &Index<'_>, div_id: usize, surface: Surface) -> Found<Vec<usi
             match step.op {
                Op::Call(callee) => {
                   if callee == div_id && correct_length {
-                     found.push(addr);
+                     found.push((addr, step.at));
                   }
                   break;
                },
@@ -368,6 +379,96 @@ pub fn div_ids(ix: &Index<'_>, div_id: usize, surface: Surface) -> Found<Vec<usi
       return Err(format!("{id} has no validated Div::id call"));
    }
    Ok(found)
+}
+
+pub fn composer_buttons(ix: &Index<'_>, div_id: usize, div_size: usize) -> Found<(usize, usize)> {
+   let areas = div_id_calls(ix, div_id, "composer-area")?;
+   let (_, area) = one("composer area", &areas)?;
+   let composer = ix
+      .function(area)
+      .ok_or("composer render function missing")?;
+   let fields = div_id_calls(ix, div_id, "composer-field")?
+      .into_iter()
+      .filter_map(|(_, site)| (composer.start..area).contains(&site).then_some(site))
+      .collect::<Vec<_>>();
+   let field = one("composer field", &fields)?;
+   let emoji = b"emoji-tooltip";
+   if !composer
+      .loads()
+      .iter()
+      .any(|addr| ix.image.read(*addr, emoji.len()) == Some(emoji))
+   {
+      return Err("composer render function does not build the emoji tooltip".into());
+   }
+   let calls = composer.calls_at();
+   let candidates = calls
+      .iter()
+      .copied()
+      .filter(|&(site, target)| {
+         (field..area).contains(&site)
+            && optional_composer_child(ix, target, div_size, &calls, area..composer.end)
+      })
+      .collect::<Vec<_>>();
+   one("composer emoji insertion", &candidates)
+}
+
+fn optional_composer_child(
+   ix: &Index<'_>,
+   address: usize,
+   div_size: usize,
+   calls: &[(usize, usize)],
+   after_area: std::ops::Range<usize>,
+) -> bool {
+   let Ok(wrapper) = ix.func(address) else {
+      return false;
+   };
+   let steps = wrapper.head(24);
+   let Some(call) = steps.iter().position(|step| matches!(step.op, Op::Call(_))) else {
+      return false;
+   };
+   let Op::Call(branch) = steps[call].op else {
+      return false;
+   };
+   let head = &steps[..call];
+   let copies_div = head.windows(4).any(|steps| {
+      matches!(steps[0].op, Op::Imm { reg: 1, value } if usize::try_from(value) == Ok(div_size))
+         && matches!(steps[1].op, Op::Move { dst: 6, src: 9 })
+         && matches!(steps[2].native, Native::X86(Mnemonic::Movsb))
+         && ix.image.read(steps[2].at, 2) == Some(&[0xF3, 0xA4])
+         && matches!(steps[3].op, Op::Offset {
+            reg: 8,
+            base: 4,
+            ..
+         })
+   });
+   let captures_flag = head.iter().any(|step| {
+      matches!(step.op, Op::Store {
+         value: Value::Reg(8),
+         size: 1,
+         ..
+      })
+   });
+   if !copies_div || !captures_flag || head.iter().any(|step| step.writes & (1 << 2) != 0) {
+      return false;
+   }
+   let Ok(branch) = ix.func(branch) else {
+      return false;
+   };
+   let steps = branch.steps();
+   steps.iter().any(|step| {
+      matches!(step.op, Op::CmpMem {
+         size: 1,
+         value: 0,
+         ..
+      })
+   }) && steps.iter().any(|step| {
+      let Op::Call(child) = step.op else {
+         return false;
+      };
+      calls
+         .iter()
+         .any(|&(site, target)| target == child && after_area.contains(&site))
+   })
 }
 
 pub fn button_id_field(ix: &Index<'_>, constructor: usize, size: usize) -> Found<usize> {

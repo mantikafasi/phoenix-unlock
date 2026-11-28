@@ -456,6 +456,12 @@ fn check(
                }).map_err(Clone::clone),
          );
          if abi == x86::Abi::Win64 {
+            report("ui composer", native_modal.as_ref().map_err(Clone::clone)
+               .and_then(|modal| {
+                  let layout = layouts.as_ref().map_err(Clone::clone)?;
+                  locate::surfaces::composer_buttons(ix, modal.div_id, layout.div.size)
+               })
+               .map(|(site, target)| format!("{} -> {}", at(site), at(target))));
             for surface in locate::surfaces::Surface::DIVS {
                report(&format!("ui {}", surface.name()), native_modal.as_ref().map_err(Clone::clone)
                   .and_then(|modal| locate::surfaces::div_ids(ix, modal.div_id, surface))
