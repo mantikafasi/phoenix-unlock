@@ -147,6 +147,19 @@ impl SeenUrls {
 /// take, since grants are looked up by name.
 const CONSOLE: &str = "console";
 
+/// `phoenix.platform`, the client the runtime is built into.
+const PLATFORM: &str = if cfg!(target_os = "android") {
+   "android"
+} else if cfg!(target_os = "ios") {
+   "ios"
+} else if cfg!(windows) {
+   "windows"
+} else if cfg!(target_os = "macos") {
+   "macos"
+} else {
+   "linux"
+};
+
 pub struct Engine {
    runtime:  Runtime,
    context:  Context,
@@ -905,6 +918,7 @@ fn api<'js>(
    if permissions.allows(Permission::Messages) {
       api.set("messages", messages)?;
    }
+   api.set("platform", PLATFORM)?;
    api.set("log", log_object(ctx, plugin)?)?;
    api.set("storage", storage(ctx, plugin)?)?;
    api.set("settings", settings_object(ctx, plugin)?)?;

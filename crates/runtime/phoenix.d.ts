@@ -1026,6 +1026,7 @@ declare namespace Phoenix {
     /// The raw view tree methods are present with `hooks`. Icon URLs must point at Discord's CDN
     /// without `http`.
     readonly ui: Ui;
+    readonly platform: Platform;
     readonly commands: Commands;
     readonly log: Log;
     readonly storage: Storage;
@@ -1132,6 +1133,8 @@ declare namespace Phoenix {
   /// - `messages` `phoenix.messages`, which reads and rewrites message and composer text.
   /// - `hooks` `bridge`, the raw view tree and `gateway.onSend`, plus everything above.
   type Permission = "gateway" | "discord" | "http" | "messages" | "hooks";
+
+  type Platform = "android" | "ios" | "windows" | "linux" | "macos";
 
   interface Bridge {
     /// Invokes a native Phoenix host module method by its `hh.jb` numeric IDs (see
