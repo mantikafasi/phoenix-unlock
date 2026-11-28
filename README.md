@@ -178,6 +178,7 @@ Run `node web/tools/bundle-plugins.ts --out <dir> my-plugin` to bundle one plugi
 | `phoenix.fetch` | HTTP requests to other hosts. |
 | `phoenix.bridge` | Android host modules by number, for low-level work. |
 | `phoenix.themes` | `.theme.css` themes on Desktop Phoenix, when the current build supports them. |
+| `setTimeout`, `setInterval`, `TextEncoder`, `TextDecoder`, `crypto`, `console` | The web names code from other client mods expects, as each plugin's own. Timers go away with the plugin, `crypto` has `getRandomValues` and `randomUUID`, and `console` writes the plugin's log lines. |
 
 Good bundled plugins to read next are [`silent-typing`](plugins/silent-typing/src/index.ts) for a four-line request interceptor, [`message-latency`](plugins/message-latency/src/index.ts) for settings with a gateway hook, [`hide-composer-buttons`](plugins/hide-composer-buttons/src/index.ts) for settings that add and remove UI as they change, and [`view-raw`](plugins/view-raw/src/index.ts) for a message action that opens a page.
 
@@ -199,7 +200,8 @@ A few notes from the type file are worth knowing before you start:
 - Use a setting with `type: "secret"` for API keys and tokens. It is shown masked and kept out of the plugin's log lines.
 - A replacement gateway payload is turned back into JSON, so numbers above 2^53 lose precision. Discord IDs in the typed payloads are strings.
 - Hooks and settings are removed when a plugin is turned off, reloaded, or uninstalled. If a plugin starts anything else, undo it in `phoenix.onUnload(...)` or with the remover a registration returned.
-- QuickJS is not a browser. Do not assume DOM or web globals such as `URLSearchParams` exist.
+- QuickJS is not a browser. Apart from the web names above, do not assume DOM or web globals such as `URLSearchParams` exist.
+- `fetch` and `phoenix.discord` responses have `arrayBuffer()` and `bytes()` for images and files, and a request body that is an `ArrayBuffer` or a typed array is sent as its bytes.
 
 ## How it works
 

@@ -1661,8 +1661,8 @@ declare namespace Phoenix {
   interface FetchInit {
     method?: string;
     headers?: Record<string, string>;
-    /// Anything but a string is sent as JSON.
-    body?: string | object;
+    /// A string as it is, an `ArrayBuffer` or a view of one as its bytes, anything else as JSON.
+    body?: string | ArrayBuffer | ArrayBufferView | object;
   }
 
   interface FetchResponse {
@@ -1670,7 +1670,78 @@ declare namespace Phoenix {
     readonly ok: boolean;
     text(): string;
     json<T = unknown>(): T;
+    /// The raw body, for images and files.
+    arrayBuffer(): ArrayBuffer;
+    /// The raw body as bytes.
+    bytes(): Uint8Array;
+  }
+
+  /// `new TextEncoder()`, UTF-8 only.
+  interface TextEncoder {
+    readonly encoding: "utf-8";
+    encode(input?: string): Uint8Array;
+  }
+
+  /// `new TextDecoder(label?, options?)`, UTF-8 only. `fatal` throws on invalid input instead of
+  /// putting U+FFFD in, and `ignoreBOM` keeps a leading byte order mark.
+  interface TextDecoder {
+    readonly encoding: "utf-8";
+    readonly fatal: boolean;
+    readonly ignoreBOM: boolean;
+    decode(input?: ArrayBuffer | ArrayBufferView): string;
+  }
+
+  /// Integer typed arrays `crypto.getRandomValues` fills.
+  type IntegerArray =
+    | Int8Array
+    | Uint8Array
+    | Uint8ClampedArray
+    | Int16Array
+    | Uint16Array
+    | Int32Array
+    | Uint32Array
+    | BigInt64Array
+    | BigUint64Array;
+
+  /// Random values from the system's random source.
+  interface Crypto {
+    /// Fills `array` (at most 65536 bytes) and returns it.
+    getRandomValues<T extends IntegerArray>(array: T): T;
+    /// A random version 4 UUID.
+    randomUUID(): `${string}-${string}-${string}-${string}-${string}`;
+  }
+
+  /// `log`, `info`, `debug`, `trace`, `warn` and `error` write the plugin's `phoenix.log` lines.
+  interface Console {
+    log(...args: unknown[]): void;
+    info(...args: unknown[]): void;
+    debug(...args: unknown[]): void;
+    trace(...args: unknown[]): void;
+    warn(...args: unknown[]): void;
+    error(...args: unknown[]): void;
   }
 }
 
 declare const phoenix: Phoenix.Api;
+
+// Web names every plugin gets as its own, for code ported from other client mods. Timers run on
+// a timer thread, and the ones a plugin set go away when it is turned off, reloaded or removed.
+// An interval runs at most every 4 ms, and a plugin holds at most 10000 timers.
+declare function setTimeout<A extends unknown[]>(
+  callback: (...args: A) => void,
+  ms?: number,
+  ...args: A
+): number;
+declare function setInterval<A extends unknown[]>(
+  callback: (...args: A) => void,
+  ms?: number,
+  ...args: A
+): number;
+declare function clearTimeout(id?: number): void;
+declare function clearInterval(id?: number): void;
+declare const TextEncoder: { new (): Phoenix.TextEncoder };
+declare const TextDecoder: {
+  new (label?: string, options?: { fatal?: boolean; ignoreBOM?: boolean }): Phoenix.TextDecoder;
+};
+declare const crypto: Phoenix.Crypto;
+declare const console: Phoenix.Console;

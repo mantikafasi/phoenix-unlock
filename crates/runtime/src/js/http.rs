@@ -3,10 +3,12 @@
 use std::sync::Arc;
 
 use rquickjs::{
+   ArrayBuffer,
    Ctx,
    Exception,
    Function,
    Object,
+   TypedArray,
    Value,
    function::Opt,
 };
@@ -21,6 +23,7 @@ use crate::{
       },
       intercept::add_discord_hooks,
       state,
+      web::bytes_of,
    },
    permissions::{
       Permission,
@@ -29,7 +32,9 @@ use crate::{
    store,
 };
 
-/// `{status, ok, text(), json()}`, a subset of the web's `Response`.
+/// `{status, ok, text(), json(), arrayBuffer(), bytes()}`, a subset of the
+/// web's `Response`. The body is read on each call, as text or as the raw
+/// bytes images and files need.
 pub fn response_object<'js>(
    ctx: &Ctx<'js>,
    response: &fetch::Response,
@@ -37,20 +42,39 @@ pub fn response_object<'js>(
    let object = Object::new(ctx.clone())?;
    object.set("status", response.status)?;
    object.set("ok", (200..300).contains(&response.status))?;
-   let text = String::from_utf8_lossy(&response.body).into_owned();
-   let json_text = text.clone();
-   object.set("text", Function::new(ctx.clone(), move || text.clone())?)?;
+   let body: Arc<[u8]> = Arc::from(response.body.as_slice());
+   let text = Arc::clone(&body);
+   object.set(
+      "text",
+      Function::new(ctx.clone(), move || {
+         String::from_utf8_lossy(&text).into_owned()
+      })?,
+   )?;
+   let json = Arc::clone(&body);
    object.set(
       "json",
       Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
-         ctx.json_parse(json_text.clone())
+         ctx.json_parse(String::from_utf8_lossy(&json).into_owned())
+      })?,
+   )?;
+   let buffer = Arc::clone(&body);
+   object.set(
+      "arrayBuffer",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+         ArrayBuffer::new_copy(ctx, &*buffer)
+      })?,
+   )?;
+   object.set(
+      "bytes",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+         TypedArray::<u8>::new_copy(ctx, &*body)
       })?,
    )?;
    Ok(object)
 }
 
-/// A fetch-style `{method, headers, body}`. A body that is not a string is
-/// sent as JSON.
+/// A fetch-style `{method, headers, body}`. A string body is sent as it is, an
+/// `ArrayBuffer` or a view of one as its bytes, and anything else as JSON.
 struct Init {
    method:  String,
    headers: Vec<(String, String)>,
@@ -85,6 +109,10 @@ impl Init {
       }
       if let Some(text) = body.as_string() {
          self.body = Some(text.to_string()?.into_bytes());
+         return Ok(());
+      }
+      if let Some(bytes) = bytes_of(&body)? {
+         self.body = Some(bytes);
          return Ok(());
       }
       if !self
@@ -258,4 +286,42 @@ pub fn discord_object<'js>(
       )?;
    }
    Ok(object)
+}
+
+#[cfg(test)]
+mod tests {
+   use rquickjs::{
+      Context,
+      Runtime,
+   };
+
+   use super::*;
+
+   fn body_of(code: &str) -> (Option<Vec<u8>>, Vec<(String, String)>) {
+      let runtime = Runtime::new().unwrap();
+      let context = Context::full(&runtime).unwrap();
+      context.with(|ctx| {
+         let init: Object<'_> = ctx.eval(code).unwrap();
+         let init = Init::read(&ctx, Some(init)).unwrap();
+         (init.body, init.headers)
+      })
+   }
+
+   #[test]
+   fn binary_bodies_are_sent_as_their_bytes() {
+      let (body, headers) = body_of("({ method: 'PUT', body: new Uint8Array([0, 255, 7]) })");
+      assert_eq!(body.as_deref(), Some(&[0, 255, 7][..]));
+      assert_eq!(headers, Vec::<(String, String)>::new());
+      let (body, _) = body_of("({ body: new Uint16Array([1, 2]).buffer })");
+      assert_eq!(body.map(|body| body.len()), Some(4));
+      let (body, _) =
+         body_of("({ body: new DataView(new Uint8Array([9, 8, 7, 6]).buffer, 1, 2) })");
+      assert_eq!(body.as_deref(), Some(&[8, 7][..]));
+      let (body, headers) = body_of("({ body: { a: 1 } })");
+      assert_eq!(body.as_deref(), Some(&br#"{"a":1}"#[..]));
+      assert_eq!(headers, [(
+         "Content-Type".to_owned(),
+         "application/json".to_owned()
+      )]);
+   }
 }
