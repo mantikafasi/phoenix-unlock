@@ -37,10 +37,11 @@ pub enum Menu {
    Server,
    Channel,
    User,
+   Message,
 }
 
 impl Menu {
-   pub const ALL: [Self; 3] = [Self::Server, Self::Channel, Self::User];
+   pub const ALL: [Self; 4] = [Self::Server, Self::Channel, Self::User, Self::Message];
 
    #[must_use]
    pub const fn name(self) -> &'static str {
@@ -48,14 +49,16 @@ impl Menu {
          Self::Server => "server",
          Self::Channel => "channel",
          Self::User => "user",
+         Self::Message => "message",
       }
    }
 }
 
 #[derive(Debug)]
 pub struct Menus {
-   pub finish: usize,
-   pub calls:  Vec<MenuCall>,
+   pub finish:    usize,
+   pub drop_item: Option<usize>,
+   pub calls:     Vec<MenuCall>,
 }
 
 #[derive(Debug)]
@@ -113,7 +116,109 @@ pub fn menus(ix: &Index<'_>, item_size: usize) -> Found<Menus> {
          prefix: target_prefix(ix, function, site),
       });
    }
-   Ok(Menus { finish, calls })
+   Ok(Menus {
+      finish,
+      drop_item: menu_item_drop(ix, finish, item_size),
+      calls,
+   })
+}
+
+fn menu_item_drop(ix: &Index<'_>, collector: usize, item_size: usize) -> Option<usize> {
+   let steps = ix.func(collector).ok()?.steps();
+   let candidates = steps
+      .windows(5)
+      .filter_map(|steps| {
+         let [
+            Op::Imm { reg: 1, value },
+            Op::Move { dst: 7, src: 0 },
+            _,
+            Op::Move { dst: 1, src: 0 },
+            Op::Call(drop),
+         ] = [
+            steps[0].op,
+            steps[1].op,
+            steps[2].op,
+            steps[3].op,
+            steps[4].op,
+         ]
+         else {
+            return None;
+         };
+         if usize::try_from(value) != Ok(item_size)
+            || !matches!(steps[2].native, Native::X86(Mnemonic::Movsb))
+         {
+            return None;
+         }
+         let head = crate::index::op::decode_head(ix.image, ix.isa, drop, drop + 12, 3);
+         matches!(head.as_slice(), [
+         Step { op: Op::CmpMem { base: 1, offset: 0, size: 4, value }, .. },
+         Step { op: Op::Branch(_), .. },
+         Step { op: Op::Ret, .. },
+      ] if (*value & u64::from(u32::MAX)) == u64::from(u32::MAX))
+         .then_some(drop)
+      })
+      .collect::<Vec<_>>();
+   one("native menu item destructor", &candidates).ok()
+}
+
+pub fn menu_id_field(ix: &Index<'_>, with_id: usize, props_size: usize) -> Option<usize> {
+   let mut offsets = ix
+      .func(with_id)
+      .ok()?
+      .calls()
+      .into_iter()
+      .filter_map(|call| ix.func(call).ok())
+      .filter_map(|func| ix.image.read(func.start, func.size()))
+      .flat_map(|code| code.windows(36))
+      .filter_map(|code| {
+         let [
+            0x48,
+            0x8D,
+            0x88,
+            a,
+            b,
+            c,
+            d,
+            0x48,
+            0x89,
+            0x4D,
+            saved,
+            0xE8,
+            _,
+            _,
+            _,
+            _,
+            0x90,
+            0x48,
+            0x8B,
+            0x45,
+            _,
+            0x48,
+            0x8B,
+            0x4D,
+            reload,
+            0x48,
+            0x89,
+            0x41,
+            0x10,
+            0x0F,
+            0x28,
+            0x45,
+            _,
+            0x0F,
+            0x11,
+            0x01,
+         ] = code
+         else {
+            return None;
+         };
+         let offset = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
+         (saved == reload && offset.checked_add(24)? <= props_size).then_some(offset)
+      })
+      .collect::<Vec<_>>();
+   offsets.sort_unstable();
+   offsets.dedup();
+   one("native menu id field", &offsets).ok()
 }
 
 fn target_prefix(ix: &Index<'_>, function: &Func<'_>, site: usize) -> Vec<u8> {

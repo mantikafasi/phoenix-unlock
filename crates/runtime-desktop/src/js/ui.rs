@@ -130,13 +130,15 @@ pub struct DesktopAction<'js> {
 impl DesktopAction<'_> {
    pub fn meta(&self) -> ActionMeta {
       ActionMeta {
-         id:          self.id,
-         label:       self.label.clone(),
-         icon:        self.icon.clone(),
-         danger:      self.danger,
-         priority:    self.priority,
-         has_visible: self.visible.is_some(),
-         parent:      self.parent,
+         id:                        self.id,
+         label:                     self.label.clone(),
+         icon:                      self.icon.clone(),
+         danger:                    self.danger,
+         priority:                  self.priority,
+         has_visible:               self.visible.is_some(),
+         parent:                    self.parent,
+         #[cfg(windows)]
+         placement:                 None,
       }
    }
 }
@@ -148,7 +150,7 @@ pub(super) fn noop_handle<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Function<'js>
    Ok(remove)
 }
 
-fn parse_rendered(value: &Value<'_>, priority: i32) -> Option<RenderedAccessory> {
+pub(super) fn parse_rendered(value: &Value<'_>, priority: i32) -> Option<RenderedAccessory> {
    if value.is_null() || value.is_undefined() || value.as_bool() == Some(false) {
       return None;
    }

@@ -9,6 +9,7 @@ use phoenix_runtime::js::{
 };
 use phoenix_sigs::locate::surfaces::Menu;
 use rquickjs::{
+   Array,
    CatchResultExt,
    Ctx,
    Exception,
@@ -19,15 +20,21 @@ use rquickjs::{
 
 use super::Desktop;
 use crate::{
-   context_menu::ActionMeta,
+   context_menu::{
+      ActionMeta,
+      MenuEdit,
+      MenuPlacement,
+   },
    navigation_menus,
 };
 
 pub struct Handler<'js> {
    id:       u64,
    plugin:   String,
-   callback: Function<'js>,
+   callback: Option<Function<'js>>,
 }
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn find_menu(name: &str) -> Option<Menu> {
    Menu::ALL.into_iter().find(|menu| menu.name() == name)
@@ -40,19 +47,88 @@ pub fn bind<'js>(ctx: &Ctx<'js>, ui: &Object<'js>, plugin: &str) -> rquickjs::Re
          find_menu(&name).is_some_and(navigation_menus::ready)
       })?,
    )?;
+   let editor = plugin.to_owned();
+   ui.set(
+      "patchContextMenu",
+      Function::new(
+         ctx.clone(),
+         move |ctx: Ctx<'js>, name: String, items: Array<'js>| {
+            let menu = available_menu(&ctx, &name)?;
+            if !cfg!(test) && !crate::context_menu::menu_ids_available() {
+               return Err(Exception::throw_message(
+                  &ctx,
+                  "native menu ids are unavailable",
+               ));
+            }
+            let edits = items
+               .iter::<Object<'_>>()
+               .map(|item| {
+                  let item = item?;
+                  let id: String = item.get("id")?;
+                  let destination = placement(&ctx, &item)?;
+                  if destination.is_none() && !navigation_menus::can_hide() {
+                     return Err(Exception::throw_message(
+                        &ctx,
+                        "hiding native menu items is unavailable",
+                     ));
+                  }
+                  Ok(MenuEdit {
+                     item: id,
+                     destination,
+                  })
+               })
+               .collect::<rquickjs::Result<Vec<_>>>()?;
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let remove = register_handler(&ctx, &editor, id, None)?;
+            navigation_menus::add_edits(id, menu, edits);
+            Ok::<_, rquickjs::Error>(remove)
+         },
+      )?,
+   )?;
    let owner = plugin.to_owned();
    ui.set(
       "addContextMenuAction",
       Function::new(
          ctx.clone(),
          move |ctx: Ctx<'js>, name: String, options: Object<'js>| {
-            let menu = find_menu(&name).ok_or_else(|| {
-               Exception::throw_type(&ctx, &format!("unknown context menu: {name}"))
-            })?;
+            let menu = available_menu(&ctx, &name)?;
             register(&ctx, &owner, menu, &options)
          },
       )?,
    )
+}
+
+fn available_menu(ctx: &Ctx<'_>, name: &str) -> rquickjs::Result<Menu> {
+   let menu = find_menu(name)
+      .ok_or_else(|| Exception::throw_type(ctx, &format!("unknown context menu: {name}")))?;
+   if !navigation_menus::ready(menu) {
+      return Err(Exception::throw_message(
+         ctx,
+         &format!("{name} context menu is unavailable"),
+      ));
+   }
+   Ok(menu)
+}
+
+fn placement(ctx: &Ctx<'_>, item: &Object<'_>) -> rquickjs::Result<Option<MenuPlacement>> {
+   let before = item.get::<_, Option<String>>("beforeId")?;
+   let after = item.get::<_, Option<String>>("afterId")?;
+   match (before, after) {
+      (Some(_), Some(_)) => Err(Exception::throw_type(ctx, "choose beforeId or afterId")),
+      (Some(anchor), None) => {
+         Ok(Some(MenuPlacement {
+            anchor,
+            after: false,
+         }))
+      },
+      (None, Some(anchor)) => {
+         Ok(Some(MenuPlacement {
+            anchor,
+            after: true,
+         }))
+      },
+      (None, None) => Ok(None),
+   }
 }
 
 fn register<'js>(
@@ -61,16 +137,6 @@ fn register<'js>(
    menu: Menu,
    options: &Object<'js>,
 ) -> rquickjs::Result<Function<'js>> {
-   static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-   if !navigation_menus::ready(menu) {
-      return Err(Exception::throw_message(
-         ctx,
-         &format!("{} context menu is unavailable", menu.name()),
-      ));
-   }
-   let registry = ctx
-      .userdata::<Desktop<'js>>()
-      .ok_or_else(|| Exception::throw_internal(ctx, "no desktop registry"))?;
    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
    let callback = options.get::<_, Function<'js>>("onPress")?;
    let action = ActionMeta {
@@ -85,7 +151,22 @@ fn register<'js>(
          .unwrap_or_default(),
       has_visible: false,
       parent: None,
+      placement: placement(ctx, options)?,
    };
+   let remove = register_handler(ctx, plugin, id, Some(callback))?;
+   navigation_menus::add(menu, action);
+   Ok(remove)
+}
+
+fn register_handler<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   id: u64,
+   callback: Option<Function<'js>>,
+) -> rquickjs::Result<Function<'js>> {
+   let registry = ctx
+      .userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no desktop registry"))?;
    let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
       if let Some(registry) = ctx.userdata::<Desktop<'_>>() {
          registry
@@ -100,7 +181,6 @@ fn register<'js>(
       plugin: plugin.to_owned(),
       callback,
    });
-   navigation_menus::add(menu, action);
    Ok(remove)
 }
 
@@ -120,7 +200,7 @@ pub fn press(engine: &Engine, id: u64, menu: Menu, target: u64) {
       let entry = ctx.userdata::<Desktop<'_>>().and_then(|registry| {
          let handlers = registry.navigation_actions.borrow();
          let entry = handlers.iter().find(|entry| entry.id == id)?;
-         Some((entry.plugin.clone(), entry.callback.clone()))
+         Some((entry.plugin.clone(), entry.callback.clone()?))
       });
       let Some((plugin, callback)) = entry else {
          return;
@@ -163,8 +243,12 @@ mod tests {
             if (!phoenix.hasContextMenu("user")) throw new Error("missing user context menu");
             phoenix.addContextMenuAction("user", {
                label: "probe",
+               beforeId: "copy-id",
                onPress(ctx) { phoenix.result.target = ctx.targetId; },
             });
+            const remove = phoenix.patchContextMenu("user", [{ id: "copy-id", afterId: "profile" }]);
+            remove();
+            phoenix.patchContextMenu("user", [{ id: "profile", beforeId: "copy-id" }]);
          "#;
          compile(&ctx, code).unwrap().call::<_, ()>((api,)).unwrap();
          Persistent::save(&ctx, result)
@@ -184,6 +268,7 @@ mod tests {
             "9007199254740993"
          );
          let registry = ctx.userdata::<Desktop<'_>>().unwrap();
+         assert_eq!(registry.navigation_actions.borrow().len(), 2);
          unload(&registry, "test");
          assert!(registry.navigation_actions.borrow().is_empty());
       });

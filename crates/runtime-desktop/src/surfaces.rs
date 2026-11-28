@@ -34,6 +34,7 @@ static ORIGINAL: OnceLock<DivId> = OnceLock::new();
 static COMPOSER: OnceLock<ComposerChild> = OnceLock::new();
 static SLOTS: OnceLock<Vec<(Surface, usize, usize)>> = OnceLock::new();
 static BUTTONS: RwLock<Vec<Button>> = RwLock::new(Vec::new());
+static SECTIONS: RwLock<Vec<Section>> = RwLock::new(Vec::new());
 static WORKER: OnceLock<mpsc::SyncSender<[u64; 2]>> = OnceLock::new();
 
 static CLICK: RcFnVtbl = RcFnVtbl {
@@ -52,6 +53,39 @@ pub struct Button {
    pub surface:  Surface,
    pub label:    String,
    pub priority: i32,
+}
+
+#[derive(Clone)]
+pub struct Section {
+   pub id:       u64,
+   pub plugin:   String,
+   pub surface:  Surface,
+   pub priority: i32,
+   pub pieces:   Vec<gpui::Piece>,
+}
+
+pub fn set_section(section: Section, replace: bool) {
+   let mut sections = SECTIONS.write().unwrap_or_else(PoisonError::into_inner);
+   if let Some(existing) = sections.iter_mut().find(|known| known.id == section.id) {
+      *existing = section;
+   } else if !replace {
+      sections.push(section);
+   } else {
+      return;
+   }
+   sections.sort_by_key(|section| (section.priority, section.id));
+   drop(sections);
+   crate::modal::force_redraw();
+}
+
+pub fn remove_sections(id: Option<u64>, plugin: &str) {
+   let mut sections = SECTIONS.write().unwrap_or_else(PoisonError::into_inner);
+   let previous = sections.len();
+   sections.retain(|section| section.plugin != plugin || id.is_some_and(|id| section.id != id));
+   if sections.len() != previous {
+      drop(sections);
+      crate::modal::force_redraw();
+   }
 }
 
 pub fn set_div_id(address: usize) {
@@ -137,7 +171,19 @@ pub fn test_slot() {
    let _ = SLOTS.set(vec![
       (Surface::Composer, 0, 0),
       (Surface::MessageToolbar, 0, 0),
+      (Surface::ServerList, 0, 0),
    ]);
+}
+
+#[cfg(test)]
+pub fn sections_for(plugin: &str) -> Vec<Section> {
+   SECTIONS
+      .read()
+      .unwrap_or_else(PoisonError::into_inner)
+      .iter()
+      .filter(|section| section.plugin == plugin)
+      .cloned()
+      .collect()
 }
 
 pub fn set(button: Button) {
@@ -185,9 +231,51 @@ unsafe extern "C" fn with_id(
    });
    if let Some(surface) = surface {
       // SAFETY: result is the initialized native Div returned by Div::id.
-      unsafe { append_buttons(surface, result) };
+      unsafe { append_surface(surface, result) };
    }
    result
+}
+
+unsafe fn append_surface(surface: Surface, parent: *mut RawDiv) {
+   if parent.is_null() {
+      return;
+   }
+   let _ = std::panic::catch_unwind(|| {
+      for child in [row(surface, 0), section_stack(surface)]
+         .into_iter()
+         .flatten()
+      {
+         // SAFETY: parent is the live Div receiving the constructed child.
+         unsafe { gpui::append_div(parent.cast(), child) };
+      }
+   });
+}
+
+fn section_stack(surface: Surface) -> Option<RawDiv> {
+   if !matches!(surface, Surface::Profile | Surface::ServerList) {
+      return None;
+   }
+   let sections = SECTIONS
+      .read()
+      .unwrap_or_else(PoisonError::into_inner)
+      .iter()
+      .filter(|section| section.surface == surface && !section.pieces.is_empty())
+      .cloned()
+      .collect::<Vec<_>>();
+   if sections.is_empty() {
+      return None;
+   }
+   let mut stack = gpui::v_stack(4.0)?;
+   for section in sections {
+      let Some(mut body) = gpui::v_stack(2.0) else {
+         break;
+      };
+      for piece in &section.pieces {
+         gpui::append_pieces(body.as_mut_ptr().cast(), std::slice::from_ref(piece), 0.0);
+      }
+      stack = gpui::push_div(stack, body);
+   }
+   Some(stack)
 }
 
 unsafe extern "C" fn with_composer(
@@ -197,21 +285,9 @@ unsafe extern "C" fn with_composer(
    emoji: *mut RawDiv,
 ) -> *mut RawDiv {
    // SAFETY: the locator verifies parent is the live Div passed to the builder.
-   unsafe { append_buttons(Surface::Composer, parent) };
+   unsafe { append_surface(Surface::Composer, parent) };
    // SAFETY: forwards the builder's original inputs and output storage.
    unsafe { (COMPOSER.wait())(out, parent, show_emoji, emoji) }
-}
-
-unsafe fn append_buttons(surface: Surface, parent: *mut RawDiv) {
-   if parent.is_null() {
-      return;
-   }
-   let _ = std::panic::catch_unwind(|| {
-      if let Some(row) = row(surface, 0) {
-         // SAFETY: caller provides the initialized Div we may append to.
-         unsafe { gpui::append_div(parent.cast(), row) };
-      }
-   });
 }
 
 pub fn row(surface: Surface, message: u64) -> Option<RawDiv> {

@@ -475,6 +475,12 @@ fn check(
             report("ui context menus", message_menu.as_ref().map_err(Clone::clone)
                .and_then(|menu| locate::surfaces::menus(ix, menu.layout.size))
                .map(|menus| format!("{menus:x?}")));
+            report("ui context menu ids", message_menu.as_ref().map_err(Clone::clone)
+               .and_then(|menu| {
+                  locate::surfaces::menu_id_field(ix, menu.with_id, menu.layout.props_size)
+                     .ok_or_else(|| "native menu id field not found".to_owned())
+               })
+               .map(|offset| format!("props +{offset:#x}")));
          }
          report(
             "native text fields",
