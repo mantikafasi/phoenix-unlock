@@ -1641,6 +1641,7 @@ fn piece_div(b: &Builder, piece: &Piece, font_px: f32, wrap: bool) -> Option<Raw
    Some(div)
 }
 
+#[cfg(windows)]
 pub fn wrapped_piece(piece: &Piece) -> Option<RawDiv> {
    let sym = SYMBOLS.get()?;
    piece_div(&Builder { sym }, piece, 13.0, true)
