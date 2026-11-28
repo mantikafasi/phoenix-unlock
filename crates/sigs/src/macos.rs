@@ -1023,7 +1023,7 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
    let message = head
       .windows(3)
       .find_map(pick!(
-         &[Insn::AddImm { rd: 0, rn, imm }, Insn::Other(_), Insn::Bl { .. }]
+         &[Insn::AddImm { rd: 0, rn, imm }, Insn::Other(_) | Insn::Store { .. }, Insn::Bl { .. }]
             if (rn == 0 || rn == input) && (0x20..0x400).contains(&imm) => imm
       ))
       .ok_or("MessageContextMenu message field not found")?;
@@ -1690,9 +1690,20 @@ pub fn gateway_send(image: &Image<'_>) -> Found<crate::gateway_send::DesktopGate
       return Err("not a 64-bit image".to_owned());
    }
    let anchor = one("gateway adopt anchor", &image.find_bytes(ADOPT_ANCHOR))?;
-   let (site, _) = one("gateway adopt anchor load", &refs_to(image, &[anchor]))?;
-   let (_, open_code) =
-      arm64::function(image, site).ok_or("gateway connect_adopting has no unwind entry")?;
+   // Linux arm64 loads the anchor twice (the connect and its error path), so
+   // every loading function is read and only one SocketSink vtable may match.
+   let sites = refs_to(image, &[anchor]);
+   if sites.is_empty() {
+      return Err("gateway adopt anchor load matched 0 times".to_owned());
+   }
+   let mut open_code = Vec::new();
+   for (site, _) in sites {
+      let (start, body) =
+         arm64::function(image, site).ok_or("gateway connect_adopting has no unwind entry")?;
+      if open_code.iter().all(|&(at, _)| at != start) {
+         open_code.push((start, body));
+      }
+   }
 
    let panic_addrs = image.find_bytes(START_SEND_PANIC);
    if panic_addrs.is_empty() {
@@ -1700,7 +1711,12 @@ pub fn gateway_send(image: &Image<'_>) -> Found<crate::gateway_send::DesktopGate
    }
 
    let mut matches = Vec::new();
-   for (_, vtable) in loaded(&open_code).into_iter().flatten() {
+   let vtables = open_code
+      .iter()
+      .flat_map(|(_, code)| loaded(code))
+      .flatten()
+      .collect::<Vec<_>>();
+   for (_, vtable) in vtables {
       let Some(start_send) = sink_vtable_start_send(image, vtable) else {
          continue;
       };
@@ -2811,19 +2827,29 @@ fn arm64_into_any(image: &Image<'_>, type_name: &[u8]) -> Found<(usize, usize)> 
       if code.len() > 64 {
          continue;
       }
-      let size = code.windows(2).find_map(|pair| {
-         match (pair[0].1, pair[1].1) {
-            (
-               Insn::MovZ {
-                  rd: 2,
-                  imm,
-                  wide: false,
-               },
-               Insn::Bl { .. },
-            ) => usize::try_from(imm).ok().filter(|&s| (0x40..0x2000).contains(&s)),
-            _ => None,
-         }
-      });
+      // The size can sit one store away from its call, which can't touch `x2`.
+      let copy_size = |code: &[(usize, Insn)]| {
+         code.iter().enumerate().find_map(|(at, &(_, insn))| {
+            let Insn::MovZ {
+               rd: 2,
+               imm,
+               wide: false,
+            } = insn
+            else {
+               return None;
+            };
+            let call = match code.get(at + 1..at + 3)? {
+               [(_, Insn::Bl { .. } | Insn::B { .. }), _] => true,
+               [(_, Insn::Store { .. }), (_, Insn::Bl { .. } | Insn::B { .. })] => true,
+               _ => false,
+            };
+            call.then(|| usize::try_from(imm).ok())
+               .flatten()
+               .filter(|&s| (0x40..0x2000).contains(&s))
+         })
+      };
+      // Linux arm64 keeps the `mov w2, #size; b memcpy` in an outlined stub.
+      let size = copy_size(&code).or_else(|| copy_size(&flattened_at(image, func)));
       if let Some(size) = size {
          found.push((func, size));
       }
@@ -2950,62 +2976,84 @@ pub fn modal(
          push_entries.push(s);
       }
    }
-   let mut childs = Vec::new();
+   // Linux arm64 pushes the child through an outlined stub (`add x0, x19,
+   // #children; add x1, sp, #0; b push`), so the stub's callers count too.
+   let mut child_bounds = Vec::new();
    for &entry in &push_entries {
       for (site, _) in refs_to(image, &[entry]) {
          let Some((start, end)) = image.function_bounds(site) else {
             continue;
          };
-         if start == modal_footer_button
-            || end - start > 0x180
-            || !copies_size(image, start, modal_size)
-         {
-            continue;
+         child_bounds.push((start, end));
+         if end - start <= 12 * 4 && stub(image, start).is_some() {
+            child_bounds.extend(
+               refs_to(image, &[start])
+                  .into_iter()
+                  .filter_map(|(caller, _)| image.function_bounds(caller)),
+            );
          }
-         let flat = flattened_at(image, start);
-         let calls_div_any = flat.iter().any(|&(_, insn)| {
-            matches!(insn, Insn::Bl { target } if div_any_targets.contains(&target))
-         });
-         if !calls_div_any {
-            continue;
-         }
-         if let Some((vec_off, push_fn)) = modal_vec_push(&flat)
-            && push_fn == vec_push_any
-            && vec_off != footer
-         {
-            childs.push((start, vec_off));
-         }
+      }
+   }
+   let mut child_bounds = sorted(child_bounds);
+   child_bounds.dedup();
+   let mut childs = Vec::new();
+   for (start, end) in child_bounds {
+      if start == modal_footer_button
+         || end - start > 0x180
+         || !copies_size(image, start, modal_size)
+      {
+         continue;
+      }
+      let flat = flattened_at(image, start);
+      // Read the call off the raw body too: on ELF builds `div_into_any` is
+      // short enough that flattening inlines it like a stub.
+      let raw = arm64::function(image, start).map(|(_, body)| body).unwrap_or_default();
+      let calls_div_any = flat.iter().chain(&raw).any(|&(_, insn)| {
+         matches!(insn, Insn::Bl { target } if div_any_targets.contains(&target))
+      });
+      if !calls_div_any {
+         continue;
+      }
+      if let Some((vec_off, push_fn)) = modal_vec_push(&flat)
+         && push_fn == vec_push_any
+         && vec_off != footer
+      {
+         childs.push((start, vec_off));
       }
    }
    let (modal_child_div, children) = one("Modal::child<Div>", &sorted(childs))?;
 
    let carousel_bytes = b"game-server-shop-carousel";
    let carousel = one("game-server-shop-carousel", &image.find_bytes(carousel_bytes))?;
-   let (carousel_site, _) = one("game-server-shop-carousel load", &refs_to(image, &[carousel]))?;
-   let (carousel_fn, _) = image
-      .function_bounds(carousel_site)
-      .ok_or("game-server-shop-carousel caller has no bounds")?;
-   let carousel_flat = flattened_at(image, carousel_fn);
-   let at = carousel_flat
-      .iter()
-      .position(|&(pc, _)| pc == carousel_site)
-      .ok_or("carousel load not in function")?;
-   let div_id = carousel_flat[at + 1..(at + 20).min(carousel_flat.len())]
-      .windows(2)
-      .find_map(|pair| {
-         match (pair[0].1, pair[1].1) {
-            (
-               Insn::MovZ {
-                  rd: 2,
-                  imm,
-                  wide: false,
-               },
-               Insn::Bl { target },
-            ) if imm == u64::try_from(carousel_bytes.len()).unwrap_or(0) => Some(target),
-            _ => None,
-         }
-      })
-      .ok_or("Div::id call after carousel anchor not found")?;
+   // Linux arm64 also loads the anchor for an unrelated string match, so
+   // every load is tried and only one may lead to a `Div::id` call.
+   let div_id_after = |carousel_site: usize| -> Option<usize> {
+      let (carousel_fn, _) = image.function_bounds(carousel_site)?;
+      let carousel_flat = flattened_at(image, carousel_fn);
+      let at = carousel_flat.iter().position(|&(pc, _)| pc == carousel_site)?;
+      carousel_flat[at + 1..(at + 20).min(carousel_flat.len())]
+         .windows(2)
+         .find_map(|pair| {
+            match (pair[0].1, pair[1].1) {
+               (
+                  Insn::MovZ {
+                     rd: 2,
+                     imm,
+                     wide: false,
+                  },
+                  Insn::Bl { target },
+               ) if imm == u64::try_from(carousel_bytes.len()).unwrap_or(0) => Some(target),
+               _ => None,
+            }
+         })
+   };
+   let mut div_ids = refs_to(image, &[carousel])
+      .into_iter()
+      .filter_map(|(site, _)| div_id_after(site))
+      .collect::<Vec<_>>();
+   div_ids.sort_unstable();
+   div_ids.dedup();
+   let div_id = one("Div::id call after carousel anchor", &div_ids)?;
    let (_, div_id_code) = arm64::function(image, div_id).ok_or("Div::id unreadable")?;
    if !div_id_code
       .iter()
@@ -3107,22 +3155,38 @@ fn arm64_modal_subtitle(image: &Image<'_>, modal_new: usize, size: usize) -> Fou
       return Err("Modal size overflows".to_owned());
    };
    let mov_w2_size = (0x5280_0002u32 | ((size_u32 & 0xFFFF) << 5)).to_le_bytes();
-   let funcs = sorted(
-      image
-         .find_bytes(&mov_w2_size)
-         .into_iter()
-         .filter(|&at| image.is_code(at))
-         .filter_map(|at| image.function_bounds(at))
+   let holders = image
+      .find_bytes(&mov_w2_size)
+      .into_iter()
+      .filter(|&at| image.is_code(at))
+      .filter_map(|at| image.function_bounds(at))
+      .collect::<Vec<_>>();
+   // Linux arm64 shares the `mov w2, #size` in outlined stubs, so their
+   // callers are the candidates there.
+   let callers = holders
+      .iter()
+      .filter(|&&(s, e)| e - s <= 12 * 4 && stub(image, s).is_some())
+      .flat_map(|&(s, _)| refs_to(image, &[s]))
+      .filter_map(|(site, _)| image.function_bounds(site));
+   let mut funcs = sorted(
+      holders
+         .iter()
+         .copied()
+         .chain(callers)
          .filter(|&(s, e)| e - s <= 0x180 && s != modal_new)
          .map(|(s, _)| s)
          .collect(),
    );
+   funcs.dedup();
 
    let mut setters = Vec::new();
    for func in funcs {
-      let Some((_, code)) = arm64::function(image, func) else {
+      let Some((_, mut code)) = arm64::function(image, func) else {
          continue;
       };
+      if image.function_starts.is_none() {
+         code = flattened_at(image, func);
+      }
       let field = code.windows(2).find_map(|pair| {
          match (pair[0].1, pair[1].1) {
             (
