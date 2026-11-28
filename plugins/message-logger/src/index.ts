@@ -62,7 +62,7 @@ interface Seen {
   message?: Phoenix.GatewayMessage;
 }
 
-const isDesktop = typeof (phoenix as { bridge?: unknown }).bridge === "undefined";
+const isDesktop = phoenix.platform !== "android" && phoenix.platform !== "ios";
 
 const EPHEMERAL = 64;
 const RED = 0xfff23f43;
