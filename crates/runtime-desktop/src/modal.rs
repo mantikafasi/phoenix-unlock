@@ -2775,9 +2775,6 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                   )
                }
             {
-               if let Some(init) = &ed.pending_init {
-                  unsafe { set_field_text(app, window, &ent, init) };
-               }
                // SAFETY: constructs hosted `TextArea` from
                // `&Entity<FieldState>` in a buffer that fits it and converts to
                // `AnyElement`.
@@ -2860,9 +2857,6 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                   })
                }
             {
-               if let Some(init) = &inst.pending_init {
-                  unsafe { set_field_text(app, window, &ent, init) };
-               }
                // SAFETY: constructs hosted `TextInput` from `&Entity<FieldState>`
                // in a buffer that fits it and converts to `AnyElement`.
                let mut ti_any = unsafe {
