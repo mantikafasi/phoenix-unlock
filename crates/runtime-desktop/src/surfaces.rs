@@ -266,12 +266,29 @@ fn section_stack(surface: Surface) -> Option<RawDiv> {
       return None;
    }
    let mut stack = gpui::v_stack(4.0)?;
+   let narrow = surface == Surface::ServerList;
+   let fit_width = |div: &mut RawDiv| {
+      gpui::style_div(div, |s| {
+         s.length(s.at.size[0], gpui::W_FULL);
+         s.length(s.at.min_size[0], gpui::gpui_px(0.0));
+      });
+   };
+   if narrow {
+      fit_width(&mut stack);
+   }
    for section in sections {
       let Some(mut body) = gpui::v_stack(2.0) else {
          break;
       };
-      for piece in &section.pieces {
-         gpui::append_pieces(body.as_mut_ptr().cast(), std::slice::from_ref(piece), 0.0);
+      if narrow {
+         fit_width(&mut body);
+         for piece in section.pieces.iter().filter_map(gpui::wrapped_piece) {
+            body = gpui::push_div(body, piece);
+         }
+      } else {
+         for piece in &section.pieces {
+            gpui::append_pieces(body.as_mut_ptr().cast(), std::slice::from_ref(piece), 0.0);
+         }
       }
       stack = gpui::push_div(stack, body);
    }

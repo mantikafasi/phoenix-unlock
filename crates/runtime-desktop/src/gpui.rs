@@ -1614,32 +1614,36 @@ fn svg_icon(
    }
 }
 
-/// `pieces` side by side in a row: each piece's icons when it has any and
-/// they can be drawn, else its text.
-fn inline_row(b: &Builder, pieces: &[Piece], font_px: f32) -> RawDiv {
-   let mut row = b.h_row(4.0, false);
-   for piece in pieces {
-      let hsla = piece.color.map_or_else(accessory_muted, argb_to_hsla);
-      if let Some(svg) = SVG.get().filter(|_| !piece.icons.is_empty()) {
-         let mut icons = b.h_row(2.0, false);
-         for &(path, color) in &piece.icons {
-            let mut icon = svg_icon(
-               b,
-               svg,
-               path,
-               font_px + 3.0,
-               color.map_or(hsla, argb_to_hsla),
-            );
-            b.push_any(&mut icons, &mut icon);
-         }
-         row = b.push_div(row, icons);
-      } else if !piece.text.is_empty()
-         && let Some(line) = b.text_line(&piece.text, hsla, font_px)
-      {
-         row = b.push_div(row, line);
+fn piece_div(b: &Builder, piece: &Piece, font_px: f32, wrap: bool) -> Option<RawDiv> {
+   const FLEX_WRAP: u8 = 1;
+   const WHITE_SPACE_NORMAL: u8 = 0;
+   let hsla = piece.color.map_or_else(accessory_muted, argb_to_hsla);
+   let mut div = if let Some(svg) = SVG.get().filter(|_| !piece.icons.is_empty()) {
+      let mut icons = b.h_row(2.0, false);
+      for &(path, color) in &piece.icons {
+         let mut icon = svg_icon(b, svg, path, font_px + 3.0, color.map_or(hsla, argb_to_hsla));
+         b.push_any(&mut icons, &mut icon);
       }
+      icons
+   } else if piece.text.is_empty() {
+      return None;
+   } else {
+      b.text_line(&piece.text, hsla, font_px)?
+   };
+   if wrap {
+      b.style_div(&mut div, |s| {
+         s.length(s.at.size[0], W_FULL);
+         s.length(s.at.min_size[0], gpui_px(0.0));
+         s.set(s.at.white_space, WHITE_SPACE_NORMAL);
+         s.set(s.at.flex_wrap, FLEX_WRAP);
+      });
    }
-   row
+   Some(div)
+}
+
+pub fn wrapped_piece(piece: &Piece) -> Option<RawDiv> {
+   let sym = SYMBOLS.get()?;
+   piece_div(&Builder { sym }, piece, 13.0, true)
 }
 
 /// Adds `pieces` as one more child of a `Div` Discord built by value, like the
@@ -1656,7 +1660,12 @@ pub fn append_pieces(div: *mut c_void, pieces: &[Piece], lead: f32) -> bool {
       return false;
    }
    let b = Builder { sym };
-   let mut row = inline_row(&b, pieces, 13.0);
+   let mut row = b.h_row(4.0, false);
+   for piece in pieces {
+      if let Some(child) = piece_div(&b, piece, 13.0, false) {
+         row = b.push_div(row, child);
+      }
+   }
    if lead > 0.0 {
       b.style_div(&mut row, |s| s.length(s.at.padding[3], gpui_px(lead)));
    }
