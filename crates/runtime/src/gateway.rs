@@ -54,6 +54,72 @@ struct Gateway {
 
 static GATEWAY: OnceLock<Gateway> = OnceLock::new();
 
+/// Results Phoenix's handlers return, voted on for the word that means success.
+struct Vote {
+   leader:  u64,
+   lead:    u32,
+   settled: Option<u64>,
+}
+
+impl Vote {
+   /// How far ahead the leading word must get to be taken as success.
+   const SETTLED: u32 = 4;
+
+   const fn new() -> Self {
+      Self {
+         leader:  0,
+         lead:    0,
+         settled: None,
+      }
+   }
+
+   /// A majority vote, since nearly every result is a success.
+   const fn hear(&mut self, word: u64) {
+      if self.lead == 0 {
+         self.leader = word;
+      }
+      if self.leader == word {
+         self.lead = self.lead.saturating_add(1);
+      } else {
+         self.lead -= 1;
+      }
+      if self.lead >= Self::SETTLED {
+         self.settled = Some(self.leader);
+      }
+   }
+}
+
+// The success word moves between builds (`u64::MAX - 1` on 357205 Android
+// arm64, not sigs' `u64::MAX`), and a wrong one for a dropped event crashes
+// Phoenix.
+static VOTE: Mutex<Vote> = Mutex::new(Vote::new());
+
+fn heard(result: &HandlerResult) {
+   VOTE
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .hear(result.0[0]);
+}
+
+fn ok_word() -> u64 {
+   VOTE
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .settled
+      .unwrap_or(HandlerResult::OK.0[0])
+}
+
+fn succeeded(result: &HandlerResult) -> bool {
+   result.0[0] == ok_word()
+}
+
+/// A success for Phoenix, for an event no handler ran.
+fn ok() -> HandlerResult {
+   let mut result = HandlerResult::OK;
+   result.0[0] = ok_word();
+   result
+}
+
 impl Gateway {
    fn original(&self, id: EventId) -> GatewayHandler {
       let addr = self.originals[id.index()].load(Ordering::Acquire);
@@ -292,7 +358,8 @@ pub fn dispatch(event: EventId, data: &str) -> Option<bool> {
    // thread's stack, and the event borrows strings that outlive the call.
    let original = gateway.original(event);
    let result = unsafe { original(handling.store, &raw const synthetic, handling.ctx) };
-   Some(result.is_ok())
+   heard(&result);
+   Some(succeeded(&result))
 }
 
 /// The live registry entry named `name`, like `MESSAGE_CREATE`.
@@ -388,7 +455,9 @@ fn flush(gateway: &Gateway, store: *mut c_void, ctx: *mut c_void, rest: [u64; RE
       // SAFETY: `store` and `ctx` are the arguments of the handler call this
       // runs inside, and the event borrows strings that outlive the call.
       let original = gateway.original(event);
-      if unsafe { original(store, &raw const synthetic, ctx) }.is_ok() {
+      let result = unsafe { original(store, &raw const synthetic, ctx) };
+      heard(&result);
+      if succeeded(&result) {
          continue;
       }
       log::warn!("Phoenix rejected a queued {name}");
@@ -464,7 +533,7 @@ unsafe fn run_detour(
          return unsafe { fallback(store, event, ctx) };
       }
       log::error!("gateway event without a registry entry, dropped");
-      return HandlerResult::OK;
+      return ok();
    };
    crate::remote::record(&crate::remote::Trace::Gateway {
       event: name,
@@ -472,7 +541,11 @@ unsafe fn run_detour(
    });
    let original = fallback.unwrap_or_else(|| gateway.original(id));
    // SAFETY: forwarded to the hooked handler unchanged or with replaced data.
-   let call = |event: &GatewayEvent| unsafe { original(store, event, ctx) };
+   let call = |event: &GatewayEvent| {
+      let result = unsafe { original(store, event, ctx) };
+      heard(&result);
+      result
+   };
 
    let listened = gateway.hooked[id.index()].load(Ordering::Acquire);
    let (true, Some(state), Some(data), false) = (listened, STATE.get(), data, IN_JS.get()) else {
@@ -488,7 +561,7 @@ unsafe fn run_detour(
    let (result, data) = match &before {
       Before::Drop => {
          HANDLING.set(None);
-         return HandlerResult::OK;
+         return ok();
       },
       Before::Keep => (call(event), data),
       Before::Replace(json) => {
@@ -505,7 +578,9 @@ unsafe fn run_detour(
    if let (Before::Replace(json), "MESSAGE_CREATE" | "MESSAGE_UPDATE") = (&before, name) {
       remember_original(original_data, json);
    }
-   run_js(state, |engine| engine.after(id, name, data, result.is_ok()));
+   run_js(state, |engine| {
+      engine.after(id, name, data, succeeded(&result))
+   });
    HANDLING.set(None);
    result
 }
@@ -573,5 +648,35 @@ fn run_js<T>(
          log::error!("a gateway hook panicked, the event went through unmodified");
          None
       },
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use super::Vote;
+
+   const OK: u64 = u64::MAX - 1;
+   const ERR: u64 = u64::MAX;
+
+   #[test]
+   fn settles_on_the_word_most_results_carry() {
+      let mut vote = Vote::new();
+      for word in [OK, OK, ERR, OK, OK, OK] {
+         vote.hear(word);
+      }
+      assert_eq!(vote.settled, Some(OK));
+      for _ in 0..3 {
+         vote.hear(ERR);
+      }
+      assert_eq!(vote.settled, Some(OK));
+   }
+
+   #[test]
+   fn stays_unsettled_on_a_few_results() {
+      let mut vote = Vote::new();
+      for word in [OK, ERR, OK, OK] {
+         vote.hear(word);
+      }
+      assert_eq!(vote.settled, None);
    }
 }
