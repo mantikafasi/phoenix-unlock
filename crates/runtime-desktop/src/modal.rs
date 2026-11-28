@@ -468,6 +468,9 @@ static ORIG_SETTINGS_LAYER: OnceLock<SettingsLayerFn> = OnceLock::new();
 /// last frame otherwise), so deciding this per frame made the modal flash
 /// between the two.
 static IN_SETTINGS: AtomicBool = AtomicBool::new(false);
+/// The Settings layer the open modal was drawn in, by address, or 0. Settings
+/// is a new layer each time it opens.
+static SETTINGS_LAYER: AtomicUsize = AtomicUsize::new(0);
 /// When Settings last rendered, in ms since [`epoch_ms`]'s start.
 static SETTINGS_AT: AtomicU64 = AtomicU64::new(0);
 /// Settings this recently rendered may still be open: the press that opens a
@@ -1635,6 +1638,42 @@ fn close_active() {
    }
 }
 
+/// Drops every open modal at once, with no closing animation, answering
+/// what waits on them as a close would.
+fn drop_modals() {
+   let mut guard = active_modal();
+   let page = match guard.active.take() {
+      Some(ActiveModal::Page { id, .. }) => Some(id),
+      Some(ActiveModal::Choice { choice, under, .. }) => {
+         choice.pick(-1);
+         under.map(|(id, _)| id)
+      },
+      Some(
+         ActiveModal::CodeEditor(CodeEditorModal { under, .. })
+         | ActiveModal::InstallUrl(InstallUrlModal { under, .. }),
+      ) => under.map(|(id, _)| id),
+      None => None,
+   };
+   guard.closing = None;
+   guard.transition = None;
+   drop(guard);
+   if let Some(on_close) = page.and_then(take_on_close) {
+      std::thread::spawn(move || on_close());
+   }
+}
+
+/// Drops the open modals when another Settings drew them: Escape closes
+/// Settings under them, and the next Settings would bring them back.
+// ponytail: a new Settings allocated where the closed one was keeps them.
+fn left_in_closed_settings(layer: *mut c_void) -> bool {
+   let held = SETTINGS_LAYER.swap(layer.addr(), Ordering::AcqRel);
+   if held == 0 || held == layer.addr() {
+      return false;
+   }
+   drop_modals();
+   true
+}
+
 fn set_editor_status(status: FieldStatus) {
    let mut guard = active_modal();
    if let Some(ActiveModal::CodeEditor(ed)) = guard.active.as_mut() {
@@ -2179,11 +2218,13 @@ fn settings_drawn_recently() -> bool {
 fn push_modal(sret: *mut RawVecAny, window: *mut c_void, cx: *mut c_void) {
    if !MODAL_OPEN.load(Ordering::Acquire) {
       IN_SETTINGS.store(false, Ordering::Release);
+      SETTINGS_LAYER.store(0, Ordering::Release);
       return;
    }
    // ponytail: closing Settings under an open modal hides the modal until
-   // Settings opens again or the modal is replaced; nothing tells this render
-   // apart from one where Settings only replays its last frame.
+   // Settings opens again, which drops it, or the modal is replaced; nothing
+   // tells this render apart from one where Settings only replays its last
+   // frame.
    if IN_SETTINGS.load(Ordering::Acquire) || sret.is_null() || cx.is_null() {
       return;
    }
@@ -2218,9 +2259,10 @@ unsafe extern "C" fn settings_layer_detour(
    // SAFETY: Discord's own render first, with its own arguments.
    let out = unsafe { orig(sret, layer, window, cx) };
    SETTINGS_AT.store(epoch_ms().max(1), Ordering::Release);
-   let modal = MODAL_OPEN.load(Ordering::Acquire);
+   let modal = MODAL_OPEN.load(Ordering::Acquire) && !left_in_closed_settings(layer);
    if !modal {
       IN_SETTINGS.store(false, Ordering::Release);
+      SETTINGS_LAYER.store(0, Ordering::Release);
    }
    if sret.is_null() || cx.is_null() {
       return out;
