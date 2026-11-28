@@ -5,6 +5,7 @@ mod intercept;
 mod lockdown;
 pub mod messages;
 mod settings;
+mod source_error;
 mod storage;
 
 use std::{
@@ -60,6 +61,10 @@ use rquickjs::{
    },
 };
 
+pub use crate::js::source_error::{
+   At,
+   SourceError,
+};
 use crate::{
    Chosen,
    Error,
@@ -484,11 +489,10 @@ impl Engine {
       })
    }
 
-   /// Evaluates `name` with a fresh `phoenix` object, recording any error.
-   fn eval(&mut self, name: &str) {
-      let Some(loaded) = self.plugins.get(name) else {
-         return;
-      };
+   /// Evaluates `name` with a fresh `phoenix` object, recording any error,
+   /// which it also returns.
+   fn eval(&mut self, name: &str) -> Option<SourceError> {
+      let loaded = self.plugins.get(name)?;
       let source = loaded.source.as_str();
       let outcome = (name != CONSOLE)
          .then_some(source)
@@ -503,6 +507,7 @@ impl Engine {
                .parse::<Permissions>()
                .map_err(|err| Error::Js(err.to_string()))
          })
+         .map_err(|err| SourceError::nowhere(err.to_string()))
          .and_then(|permissions| {
             let permissions = Arc::new(permissions);
             self.with(|ctx| {
@@ -510,20 +515,22 @@ impl Engine {
                   let phoenix = api(&ctx, name, &permissions)?;
                   compile(&ctx, source)?.call((phoenix,))
                };
-               run().catch(&ctx).map_err(js_error)
+               run()
+                  .catch(&ctx)
+                  .map_err(|err| SourceError::caught(&err, source))
             })
          });
-      let Some(loaded) = self.plugins.get_mut(name) else {
-         return;
-      };
+      let loaded = self.plugins.get_mut(name)?;
       match outcome {
          Ok(()) => {
             log::info!("loaded plugin {name}");
             loaded.state = PluginState::On;
+            None
          },
          Err(err) => {
             log::error!("plugin {name} failed to load: {err}");
             loaded.state = PluginState::Failed(err.to_string());
+            Some(err)
          },
       }
    }
@@ -606,7 +613,7 @@ impl Engine {
    /// New code that throws while starting is dropped and its error returned.
    /// The version that ran before runs again, and a new plugin is not added.
    /// Over a version that already failed, the new code stays.
-   pub fn install(&mut self, name: &str, source: String) -> Result<(), String> {
+   pub fn install(&mut self, name: &str, source: String) -> Result<(), SourceError> {
       let previous = self.plugins.get(name).cloned();
       let enabled = if let Some(loaded) = self.plugins.get_mut(name) {
          loaded.install(source);
@@ -621,13 +628,7 @@ impl Engine {
          return Ok(());
       }
       self.unload(name);
-      self.eval(name);
-      let Some(error) = self
-         .plugins
-         .get(name)
-         .and_then(|loaded| loaded.state.error())
-         .map(str::to_owned)
-      else {
+      let Some(error) = self.eval(name) else {
          return Ok(());
       };
       match previous {
