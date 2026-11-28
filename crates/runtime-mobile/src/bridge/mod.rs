@@ -33,6 +33,7 @@ use std::{
 #[cfg(target_os = "android")] use jni as backend;
 
 use crate::discord;
+#[cfg(target_os = "android")] pub mod font;
 
 /// What to do with an observed frame.
 pub enum Action {
@@ -158,7 +159,10 @@ fn ops(batch: &[u8]) -> (Action, MutexGuard<'static, ()>) {
    if !watching() {
       return (Action::Pass, guard);
    }
-   (consult(batch, |sink, batch| sink.ops(batch)), guard)
+   let action = consult(batch, |sink, batch| sink.ops(batch));
+   #[cfg(target_os = "android")]
+   let action = font::project(batch, action);
+   (action, guard)
 }
 
 /// A host-to-guest dispatch frame, through Discord's replies, host events and
@@ -201,9 +205,17 @@ pub fn ready() -> bool {
 /// the main thread, the guest may hold the UI lock while it waits on that
 /// thread.
 pub fn apply_ops(batch: &[u8]) -> bool {
+   let _guard = UI_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+   #[cfg(target_os = "android")]
+   if let Action::Replace(bytes) = font::project(batch, Action::Pass) {
+      return send_ops(&bytes);
+   }
+   send_ops(batch)
+}
+
+fn send_ops(batch: &[u8]) -> bool {
    let mut frame = vec![0; 4];
    frame.extend_from_slice(batch);
-   let _guard = UI_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
    invoke(&frame)
 }
 

@@ -138,6 +138,11 @@ pub enum Job {
    },
    /// Reconcile `hidden: true` across live nodes matching `self.hidden`.
    RefreshHidden,
+   #[cfg(target_os = "android")]
+   SystemFont {
+      plugin:  String,
+      enabled: bool,
+   },
    /// A press on custom emoji `id` in the picker, held for the `onEmojiPick`
    /// handlers.
    Emoji {
@@ -261,6 +266,11 @@ pub fn run(job: Job) -> Vec<Op> {
       } => patches().open_page(id, &title, sections),
       Job::ClosePage(id) => pages::close(id),
       Job::PagePress { page, index } => callback(|engine| page_press(engine, page, index)),
+      #[cfg(target_os = "android")]
+      Job::SystemFont { plugin, enabled } => {
+         bridge::font::set_owner(&plugin, enabled);
+         Vec::new()
+      },
       Job::RefreshHidden => patches().reconcile_hidden(),
       Job::Block {
          contribution,
@@ -273,12 +283,7 @@ pub fn run(job: Job) -> Vec<Op> {
       Job::Evaluated(contribution, place, outcome) => {
          patches().evaluated(contribution, place, outcome)
       },
-      Job::Press(contribution, place) => {
-         let context = press_context(&place);
-         callback(|engine| {
-            ui_press(engine, contribution, &context);
-         })
-      },
+      Job::Press(contribution, place) => press(contribution, &place),
       Job::Suggest => patches().suggested(),
       Job::Pick { input, name } => patches().pick(input, &name),
       Job::Submit { input, text, frame } => commands::submit(input, &text, &frame),
@@ -336,6 +341,11 @@ fn callback(call: impl FnOnce(&Engine)) -> Vec<Op> {
       call(&engine);
    }
    Vec::new()
+}
+
+fn press(contribution: ContributionId, place: &Place) -> Vec<Op> {
+   let context = press_context(place);
+   callback(|engine| ui_press(engine, contribution, &context))
 }
 
 fn evaluate(contribution: ContributionId, place: Place) -> Vec<Op> {

@@ -1624,6 +1624,8 @@ declare namespace Phoenix {
     /// mobile; no-op on desktop). Absent on runtimes from before it. Call the returned function
     /// to re-enable haptics.
     disableHaptics?(): Remover;
+    /// Uses Android's system sans-serif for text, inputs and rich-text runs until plugin unload.
+    useSystemFont?(): void;
     /// Copies `text` to the device clipboard.
     copy(text: string): void;
     /// Opens an `https://`, `http://` or `discord://` link in the default browser, and throws for
