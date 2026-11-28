@@ -1637,6 +1637,7 @@ const DESKTOP_FULL: &[&str] = &[
    "collapse-channels",
    "desktop-themes",
    "fakenitro",
+   "screen-share",
 ];
 
 const DESKTOP_PARTIAL: &[&str] = &["hide-composer-buttons", "reviewdb"];

@@ -39,6 +39,8 @@ mod os;
 mod ready;
 mod recovery;
 #[cfg(windows)]
+mod region;
+#[cfg(windows)]
 mod restart;
 mod settings;
 mod shortcuts;
@@ -225,6 +227,10 @@ pub fn prepare() -> Result<(), Error> {
    let ix = Index::new(&image, Isa::HOST);
    critical("access_gate", open_access_gate(&image, &ix));
    open_gate_extras(&image);
+   #[cfg(windows)]
+   if std::panic::catch_unwind(std::panic::AssertUnwindSafe(region::start)).is_err() {
+      log::error!("screen share: startup panicked");
+   }
    settings::install(&image, &ix);
    critical(
       "gpui",
@@ -301,6 +307,8 @@ pub fn prepare() -> Result<(), Error> {
    drop(ix);
    phoenix_sigs::desktop::release_call_index();
    phoenix_hook::arm64::release_ref_index();
+   #[cfg(windows)]
+   region::arm();
    *PREPARED.lock().unwrap_or_else(PoisonError::into_inner) = Some((image, registry?));
    Ok(())
 }
