@@ -279,6 +279,9 @@ pub fn prepare() -> Result<(), Error> {
       registry.as_ref().map(|_| ()).map_err(ToString::to_string),
    );
    if registry.is_ok() {
+      // Before the direct-call hooks: READY is found from the handler's first
+      // call, which reads as the hook's jump once the handler is hooked.
+      feature("ready", || ready::install(&image, &ix));
       #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
       feature("direct_calls", || route_direct_calls(&image));
       discord::install(&image);
@@ -290,7 +293,6 @@ pub fn prepare() -> Result<(), Error> {
       feature("optimistic_delete", || {
          accessories::install_optimistic_delete(&image, &ix);
       });
-      feature("ready", || ready::install(&image, &ix));
    }
    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
    feature("message_writer", || message::writer::install(&image));
