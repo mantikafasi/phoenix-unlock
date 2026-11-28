@@ -48,6 +48,7 @@ use crate::modal::{
 
 /// `gpui::SharedString` (24 bytes): tag `0x18` is `Static(&'static str)` and
 /// `0x19` is `Arc<str>`, the `ArcInner` at `ptr` with the bytes at `+0x10`.
+/// A smaller tag is the length of up to 23 bytes stored inline after it.
 /// Not `Copy`: a heap one must reach Discord exactly once, which drops it.
 #[repr(C)]
 pub struct SharedString {

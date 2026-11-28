@@ -1048,6 +1048,8 @@ declare namespace Phoenix {
     readonly themes?: Themes;
     /// Spotify behaviors to turn off, on Desktop Phoenix.
     readonly spotify?: Spotify;
+    /// Discord's fonts swapped for installed ones on Desktop Phoenix.
+    readonly fonts?: Fonts;
   }
 
   /// Each method is absent when this build's code for it was not found. The change applies while
@@ -1058,6 +1060,19 @@ declare namespace Phoenix {
     /// The Spotify activity stays in your presence while you are idle. Discord's setting for
     /// showing Spotify still applies.
     keepActivityWhenIdle?(): Remover;
+  }
+
+  /// Installed font family names, like `"Pretendard"`. An empty or missing one keeps Discord's.
+  /// A family the system doesn't have falls back to its UI font. Unloading the plugin that set
+  /// them brings back Discord's.
+  interface Fonts {
+    /// Whether this Discord build's text system could be hooked.
+    supported(): boolean;
+    /// Installed families by their English name, sorted. Windows only.
+    list?(): string[];
+    /// `main` replaces gg sans and ABC Ginto, `mono` replaces gg sans mono (code blocks).
+    set(fonts: { main?: string; mono?: string }): void;
+    clear(): void;
   }
 
   interface InstalledTheme {

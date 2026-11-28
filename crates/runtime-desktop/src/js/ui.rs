@@ -1554,6 +1554,7 @@ pub fn desktop_patch_api<'js>(
       Function::new(ctx.clone(), |ctx: Ctx<'js>| rquickjs::Array::new(ctx))?,
    )?;
    api.set("commands", commands)?;
+   api.set("fonts", crate::js::fonts::object(ctx, plugin)?)?;
    api.set("themes", crate::js::themes::object(ctx, plugin)?)?;
    api.set("spotify", spotify_object(ctx, plugin)?)?;
    api.set("ui", desktop_ui_object(ctx, plugin)?)

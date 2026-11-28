@@ -2407,6 +2407,27 @@ pub fn svg_builders(image: &Image<'_>) -> Found<SvgBuilders> {
    })
 }
 
+/// GPUI's `TextSystem::resolve_font(&self, font: &Font) -> FontId`, the one
+/// caller of the cold path that panics with `"failed to resolve font"`. Every
+/// font passes through it before GPUI's caches.
+pub fn resolve_font(image: &Image<'_>) -> Found<usize> {
+   // The message starts with a length byte, so the load can point before it.
+   let mut panics = image
+      .find_bytes(b"failed to resolve font")
+      .into_iter()
+      .flat_map(|text| [text - 1, text])
+      .flat_map(|at| lea_refs(image, at))
+      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
+      .collect::<Vec<_>>();
+   panics.sort_unstable();
+   panics.dedup();
+   let panic = one("resolve_font panic", &panics)?;
+   one(
+      "resolve_font",
+      &callers(image, panic).into_iter().collect::<Vec<_>>(),
+   )
+}
+
 /// Discord's asset loader, `(sret, path ptr, path len) -> Option<Vec<u8>>`.
 ///
 /// It ends at the bundle holding [`BUNDLED_SVG`]. The bundle sorts records

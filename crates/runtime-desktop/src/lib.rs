@@ -24,6 +24,7 @@ mod emoji;
 mod fetch;
 mod gateway_send;
 mod gpui;
+mod gpui_font;
 mod gpui_theme;
 mod headers;
 mod health;
@@ -276,6 +277,7 @@ pub fn prepare() -> Result<(), Error> {
    {
       feature("call_idle_dm", || call_idle::install_dm(&image, &ix));
       feature("call_idle_afk", || call_idle::install_guild_afk(&image, &ix));
+      feature("gpui_font", || gpui_font::install(&image));
    }
    #[cfg(windows)]
    feature("gpui_theme", || gpui_theme::install(&image));

@@ -1,6 +1,7 @@
 //! The desktop share of the `phoenix` object: `phoenix.ui` and message
 //! accessories, and `phoenix.native` for the console.
 
+pub mod fonts;
 pub mod native;
 pub mod themes;
 pub mod ui;
@@ -218,5 +219,6 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
    }
 
+   fonts::unload(name);
    themes::unload(name);
 }
