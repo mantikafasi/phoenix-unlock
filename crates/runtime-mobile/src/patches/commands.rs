@@ -76,7 +76,6 @@ const ROWS_PATH: [usize; 7] = [0, 0, 1, 0, 0, 0, 0];
 const SEQ: Key = Prop::named("seq").key();
 const START: Key = Prop::named("start").key();
 const END: Key = Prop::named("end").key();
-const ICON_TINT: i64 = 4_289_440_946;
 
 /// The `/` suggestions popup and the plugin rows in it.
 #[derive(Default)]
@@ -252,7 +251,10 @@ impl Patches {
       );
       if let [image, middle, right] = row.kids.as_mut_slice() {
          image.set(Prop::URI, Some(Value::Str(icon.to_owned())));
-         image.set(Prop::TINT, Some(Value::I64(ICON_TINT)));
+         image.set(
+            Prop::TINT,
+            Some(Value::I64(crate::settings::theme::Color::Muted.argb())),
+         );
          image.set(prop!("pool"), None);
          if let [title, subtitle] = middle.kids.as_mut_slice() {
             title.set(Prop::TEXT, Some(Value::Str(format!("/ {name}"))));

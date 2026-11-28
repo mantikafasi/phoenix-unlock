@@ -19,8 +19,8 @@ static THEME: AtomicU8 = AtomicU8::new(DARK);
 
 /// Whether Phoenix's own settings text is light on dark or dark on light.
 pub fn observe(ops: &[Op]) -> bool {
-   let mut light_text = 0;
-   let mut dark_text = 0;
+   let mut light_theme = 0;
+   let mut dark_theme = 0;
    for op in ops {
       let props = match op {
          Op::Create { kind, props, .. } if *kind == ViewKind::Text => props,
@@ -35,15 +35,15 @@ pub fn observe(ops: &[Op]) -> bool {
       };
       let luminance = luminance(color);
       if luminance < 0.35 {
-         light_text += 1;
+         light_theme += 1;
       } else if luminance > 0.65 {
-         dark_text += 1;
+         dark_theme += 1;
       }
    }
    let current = THEME.load(Ordering::Relaxed);
-   let next = if light_text >= 3 && light_text >= dark_text + 2 {
+   let next = if light_theme >= 3 && light_theme >= dark_theme + 2 {
       LIGHT
-   } else if dark_text >= 3 && dark_text >= light_text + 2 {
+   } else if dark_theme >= 3 && dark_theme >= light_theme + 2 {
       DARK
    } else {
       current
@@ -80,8 +80,34 @@ fn luminance(color: i64) -> f64 {
    0.0722f64.mul_add(blue, 0.7152f64.mul_add(green, 0.2126 * red)) / 255.0
 }
 
-fn light() -> bool {
+pub fn light() -> bool {
    THEME.load(Ordering::Relaxed) == LIGHT
+}
+
+/// Opaque surface for code and inset content.
+pub fn surface() -> i64 {
+   if light() { 0xFFF2_F3F5 } else { 0xFF14_1518 }
+}
+
+/// Raised card surface.
+pub fn raised() -> i64 {
+   if light() { 0xFFFF_FFFF } else { 0xFF23_2428 }
+}
+
+/// Pressed/hover surface on raised content.
+pub fn active() -> i64 {
+   if light() { 0xFFE3_E5E8 } else { 0xFF2B_2D31 }
+}
+
+/// Hairline around raised content.
+pub fn border() -> i64 {
+   if light() { 0x1F00_0000 } else { 0x26FF_FFFF }
+}
+
+/// Translucent press wash with the theme's contrast color at `alpha`.
+pub fn overlay(alpha: i64) -> i64 {
+   let rgb = if light() { 0x0000_0000 } else { 0x00FF_FFFF };
+   (alpha << 24) | rgb
 }
 
 /// The text colors Sunbird draws its pages with.

@@ -169,6 +169,10 @@ impl Sink for PatchSink {
             return Action::Pass;
          }
          if let Ok(ops) = decode(batch) {
+            if crate::settings::theme::observe(&ops) {
+               crate::settings::notify_theme_changed();
+               crate::patches::theme_changed();
+            }
             if debug {
                crate::debug::record_ops(&ops);
             }
@@ -177,7 +181,13 @@ impl Sink for PatchSink {
          return Action::Pass;
       }
       let mut ops = match decode(batch) {
-         Ok(ops) => ops,
+         Ok(ops) => {
+            if crate::settings::theme::observe(&ops) {
+               crate::settings::notify_theme_changed();
+               crate::patches::theme_changed();
+            }
+            ops
+         },
          Err(err) => {
             log::warn!("patches: undecodable batch: {err}");
             return Action::Pass;

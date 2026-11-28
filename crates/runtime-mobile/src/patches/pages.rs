@@ -28,6 +28,10 @@ use crate::{
          queue,
       },
    },
+   settings::theme::{
+      self,
+      Color,
+   },
 };
 
 /// A button row on a plugin full-screen page.
@@ -189,7 +193,7 @@ impl Patches {
                kind:  ViewKind::Text,
                props: vec![
                   (Prop::TEXT, Value::Str(text)),
-                  (Prop::COLOR, Value::I64(0xFFF6_F6F7)),
+                  (Prop::COLOR, Value::I64(Color::Text.argb())),
                   (Prop::FONT_SIZE, Value::F64(14.0)),
                   (Prop::LINE_HEIGHT, Value::F64(20.0)),
                   (Prop::SELECTABLE, Value::Bool(true)),
@@ -240,13 +244,13 @@ impl Patches {
          if let Some(img) = row.kids.first_mut() {
             img.set(Prop::URI, Some(Value::Str(icon)));
             if btn.danger {
-               img.set(Prop::TINT, Some(Value::I64(0xFFF2_3F42)));
+               img.set(Prop::TINT, Some(Value::I64(Color::Error.argb())));
             }
          }
          if let Some(label) = row.kids.get_mut(1) {
             label.set(Prop::TEXT, Some(Value::Str(btn.label)));
             if btn.danger {
-               label.set(Prop::COLOR, Some(Value::I64(0xFFF2_3F42)));
+               label.set(Prop::COLOR, Some(Value::I64(Color::Error.argb())));
             }
          }
          row.kids.truncate(2);
@@ -287,7 +291,7 @@ fn code(text: &str, monospace: bool, highlight: bool) -> Draft {
       kind:  ViewKind::Text,
       props: vec![
          (Prop::TEXT, Value::Str(text.to_owned())),
-         (Prop::COLOR, Value::I64(0xFFF6_F6F7)),
+         (Prop::COLOR, Value::I64(Color::Text.argb())),
          (Prop::FONT_SIZE, Value::F64(12.0)),
          (Prop::LINE_HEIGHT, Value::F64(17.0)),
          (prop!("fontWeight"), Value::I32(400)),
@@ -305,11 +309,11 @@ fn code(text: &str, monospace: bool, highlight: bool) -> Draft {
          .into_iter()
          .map(|(kind, run)| {
             let color = match kind {
-               crate::highlight::Kind::Plain => 0xFFF6_F6F7,
-               crate::highlight::Kind::Comment => 0xFF8B_949E,
-               crate::highlight::Kind::String => 0xFF7E_E787,
-               crate::highlight::Kind::Keyword => 0xFFFF_7B72,
-               crate::highlight::Kind::Number => 0xFF79_C0FF,
+               crate::highlight::Kind::Plain => Color::Text.argb(),
+               crate::highlight::Kind::Comment => Color::Comment.argb(),
+               crate::highlight::Kind::String => Color::String.argb(),
+               crate::highlight::Kind::Keyword => Color::Keyword.argb(),
+               crate::highlight::Kind::Number => Color::Number.argb(),
             };
             Value::Obj(vec![
                (Prop::TEXT.key(), Value::Str(run.to_owned())),
@@ -327,7 +331,7 @@ fn boxed(content: Draft) -> Draft {
       kind:  ViewKind::View,
       props: vec![
          (prop!("width"), Value::Str("fill".to_owned())),
-         (prop!("background"), Value::I64(0xFF14_1518)),
+         (prop!("background"), Value::I64(theme::surface())),
          (Prop::PADDING, Value::Rect([14.0, 12.0, 14.0, 12.0])),
       ],
       kids:  vec![content],

@@ -66,11 +66,9 @@ pub fn rewrite_ops(batch: &[u8]) -> Action {
       },
    };
    let theme_changed = theme::observe(&ops);
-   if theme_changed
-      && settings().screen.is_some()
-      && let Some(worker) = WORKER.get()
-   {
-      let _ = worker.send(Job::ThemeChanged);
+   if theme_changed {
+      super::notify_theme_changed();
+      crate::patches::theme_changed();
    }
    settings()
       .rewrite(ops)

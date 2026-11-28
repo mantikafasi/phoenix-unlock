@@ -21,8 +21,7 @@ mod settings;
 mod socket;
 #[cfg(target_os = "android")] mod staff;
 #[cfg(target_os = "android")] mod store;
-
-pub(crate) use phoenix_runtime::highlight;
+mod theme;
 
 #[cfg(target_os = "android")]
 use std::sync::{
@@ -39,6 +38,7 @@ use std::{
 };
 
 use phoenix_hook::image::Image;
+pub(crate) use phoenix_runtime::highlight;
 #[cfg(target_os = "android")]
 use phoenix_runtime::update::{
    Slot,

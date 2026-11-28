@@ -13,24 +13,28 @@ use phoenix_ui_mobile::{
 };
 use phoenix_wire::Value;
 
-use crate::patches::{
-   Contribution,
-   Draft,
-   Handler,
-   Outcome,
-   Place,
-   Rendered,
-   aids::{
-      self,
-      MessagePart,
-      message_part,
+use crate::{
+   patches::{
+      Contribution,
+      Draft,
+      Handler,
+      Outcome,
+      Place,
+      Rendered,
+      aids::{
+         self,
+         MessagePart,
+         message_part,
+      },
+      menu::SheetBody,
+      tabs,
    },
-   menu::SheetBody,
-   tabs,
+   settings::theme::{
+      self,
+      Color,
+   },
 };
 
-const DANGER: i64 = 4_294_475_386;
-const MUTED: i64 = 4_288_059_294;
 const DEFAULT_ICON: &str = "res://ic_mana_puzzle_piece_plus";
 
 /// Where a contribution goes, next to one of Phoenix's own nodes.
@@ -351,7 +355,7 @@ impl Templates {
             kind:  ViewKind::Text,
             props: vec![
                (Prop::TEXT, Value::Str(body.text.clone())),
-               (Prop::COLOR, Value::I64(0xFFF6_F6F7)),
+               (Prop::COLOR, Value::I64(Color::Text.argb())),
                (Prop::FONT_SIZE, Value::F64(12.0)),
                (Prop::LINE_HEIGHT, Value::F64(16.0)),
                (prop!("fontWeight"), Value::I32(400)),
@@ -369,11 +373,11 @@ impl Templates {
                .into_iter()
                .map(|(kind, run)| {
                   let color = match kind {
-                     crate::highlight::Kind::Plain => 0xFFF6_F6F7,
-                     crate::highlight::Kind::Comment => 0xFF8B_949E,
-                     crate::highlight::Kind::String => 0xFF7E_E787,
-                     crate::highlight::Kind::Keyword => 0xFFFF_7B72,
-                     crate::highlight::Kind::Number => 0xFF79_C0FF,
+                     crate::highlight::Kind::Plain => Color::Text.argb(),
+                     crate::highlight::Kind::Comment => Color::Comment.argb(),
+                     crate::highlight::Kind::String => Color::String.argb(),
+                     crate::highlight::Kind::Keyword => Color::Keyword.argb(),
+                     crate::highlight::Kind::Number => Color::Number.argb(),
                   };
                   Value::Obj(vec![
                      (Prop::TEXT.key(), Value::Str(run.to_owned())),
@@ -396,7 +400,7 @@ impl Templates {
          let box_view = Draft {
             kind:  ViewKind::View,
             props: vec![
-               (prop!("background"), Value::I64(0xFF14_1518)),
+               (prop!("background"), Value::I64(theme::surface())),
                (Prop::RADIUS, Value::F64(12.0)),
                (Prop::PADDING, Value::Rect([12.0, 10.0, 12.0, 10.0])),
                (Prop::MARGIN, Value::Rect([0.0, 0.0, 0.0, 12.0])),
@@ -706,8 +710,8 @@ impl Templates {
          inner.kids[0].set(Prop::URI, Some(Value::Str(icon.to_owned())));
          inner.kids[1].set(Prop::TEXT, Some(Value::Str(entry.label.clone())));
          if entry.danger {
-            inner.kids[1].set(Prop::COLOR, Some(Value::I64(DANGER)));
-            inner.kids[0].set(Prop::TINT, Some(Value::I64(DANGER)));
+            inner.kids[1].set(Prop::COLOR, Some(Value::I64(Color::Error.argb())));
+            inner.kids[0].set(Prop::TINT, Some(Value::I64(Color::Error.argb())));
          }
          draft.press = Some(entry.press);
          if index > 0 {
@@ -738,7 +742,7 @@ impl Templates {
    /// The colors of Phoenix's first profile page.
    pub fn palette(&self) -> tabs::Palette {
       tabs::Palette {
-         text:  self.page_text.unwrap_or(tabs::TEXT),
+         text:  self.page_text.unwrap_or(tabs::text()),
          muted: self.tab_colors().1,
       }
    }
@@ -756,8 +760,8 @@ impl Templates {
                _ => None,
             }
          })
-         .unwrap_or(tabs::MUTED);
-      (self.tab_color.unwrap_or(tabs::ACCENT), unselected)
+         .unwrap_or(tabs::muted());
+      (self.tab_color.unwrap_or(tabs::accent()), unselected)
    }
 
    /// The timestamp's text style without its placement, or a fallback.
@@ -774,7 +778,7 @@ impl Templates {
       self.timestamp.as_ref().map_or_else(
          || {
             vec![
-               (Prop::COLOR, Value::I64(MUTED)),
+               (Prop::COLOR, Value::I64(Color::Muted.argb())),
                (Prop::FONT_SIZE, Value::F64(12.0)),
                (prop!("fontWeight"), Value::I32(500)),
             ]

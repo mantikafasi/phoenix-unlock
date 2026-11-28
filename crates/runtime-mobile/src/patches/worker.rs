@@ -171,6 +171,8 @@ pub enum Job {
    ShowBanner(BannerSpec),
    /// Show any banners queued while waiting for the root UI to settle.
    FlushBanners,
+   /// Rebuild visible banners after the inferred theme flips.
+   ThemeChanged,
    /// Dismiss in-app notification banner `id` if still visible.
    DismissBanner(u32),
    /// User tapped in-app notification banner `id`.
@@ -308,6 +310,7 @@ pub fn run(job: Job) -> Vec<Op> {
       },
       Job::ShowBanner(spec) => patches().show_banner(spec),
       Job::FlushBanners => patches().flush_banners(),
+      Job::ThemeChanged => patches().refresh_banner_theme(),
       Job::DismissBanner(id) => banners::dismiss(id),
       Job::BannerPressed(id) => banners::pressed(id),
       Job::Mount {

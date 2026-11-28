@@ -42,9 +42,14 @@ use crate::{
          queue,
       },
    },
+   settings::theme::{
+      self,
+      Color,
+   },
 };
 
 /// What happens when the user taps an in-app notification banner.
+#[derive(Clone, Copy)]
 pub enum BannerAction {
    None,
    ApplyUpdate,
@@ -54,6 +59,7 @@ pub enum BannerAction {
 }
 
 /// Specification for a native Discord in-app notification banner.
+#[derive(Clone)]
 pub struct BannerSpec {
    pub id:          u32,
    pub title:       String,
@@ -203,6 +209,7 @@ impl Patches {
          out.extend(close_ops);
       }
 
+      let visible = spec.clone();
       let id = spec.id;
       let announce = match spec.body.as_deref().filter(|text| !text.is_empty()) {
          Some(body) => format!("{}. {body}", spec.title),
@@ -227,6 +234,7 @@ impl Patches {
          all,
       });
       self.banner_actions.insert(id, spec.action);
+      self.banner_specs.insert(id, visible);
       out.push(Op::Children {
          id:  root,
          ids: self.merged(root),
@@ -237,6 +245,19 @@ impl Patches {
             thread::sleep(dur);
             queue(Job::DismissBanner(id));
          });
+      }
+      out
+   }
+
+   /// Rebuild visible banners after the inferred theme flips.
+   pub fn refresh_banner_theme(&mut self) -> Vec<Op> {
+      let specs = self.banner_specs.values().cloned().collect::<Vec<_>>();
+      let mut out = Vec::new();
+      for spec in specs {
+         let id = spec.id;
+         let (close_ops, _) = self.close_banner(id);
+         out.extend(close_ops);
+         out.extend(self.open_banner(spec));
       }
       out
    }
@@ -259,6 +280,7 @@ impl Patches {
       ) {
          had_js = true;
       }
+      self.banner_specs.remove(&id);
       let Some(at) = self
          .slots
          .iter()
@@ -309,7 +331,7 @@ fn banner_view(
          (prop!("align"), Value::Str("center".to_owned())),
          (Prop::GAP, Value::F64(12.0)),
          (Prop::PADDING, Value::Rect([12.0, 12.0, 6.0, 12.0])),
-         (prop!("activeBackground"), Value::I64(0xFF2B_2D31)),
+         (prop!("activeBackground"), Value::I64(theme::active())),
          (Prop::ROLE, Value::Str("button".to_owned())),
          (Prop::ACCESSIBILITY_LABEL, Value::Str(announce.clone())),
          (
@@ -330,11 +352,11 @@ fn banner_view(
          (prop!("width"), Value::Str("fill".to_owned())),
          (prop!("align"), Value::Str("center".to_owned())),
          (Prop::MARGIN, Value::Rect([12.0, 8.0, 12.0, 0.0])),
-         (BACKGROUND, Value::I64(0xFF23_2428)),
+         (BACKGROUND, Value::I64(theme::raised())),
          (Prop::RADIUS, Value::F64(16.0)),
          (prop!("clip"), Value::Bool(true)),
          (prop!("borderWidth"), Value::F64(1.0)),
-         (prop!("borderColor"), Value::I64(0x26FF_FFFF)),
+         (prop!("borderColor"), Value::I64(theme::border())),
          (
             Prop::ACCESSIBILITY_ID,
             Value::Str("phoenix.in-app-notification".to_owned()),
@@ -394,7 +416,7 @@ fn banner_text(title: String, body: Option<String>) -> Draft {
       kind:  ViewKind::Text,
       props: vec![
          (Prop::TEXT, Value::Str(title)),
-         (Prop::COLOR, Value::I64(0xFFF2_F3F5)),
+         (Prop::COLOR, Value::I64(Color::Text.argb())),
          (Prop::FONT_SIZE, Value::F64(15.0)),
          (prop!("fontWeight"), Value::I32(700)),
          (Prop::LINE_HEIGHT, Value::F64(19.0)),
@@ -410,7 +432,7 @@ fn banner_text(title: String, body: Option<String>) -> Draft {
          kind:  ViewKind::Text,
          props: vec![
             (Prop::TEXT, Value::Str(body)),
-            (Prop::COLOR, Value::I64(0xFFB5_BAC1)),
+            (Prop::COLOR, Value::I64(Color::Muted.argb())),
             (Prop::FONT_SIZE, Value::F64(13.0)),
             (prop!("fontWeight"), Value::I32(400)),
             (Prop::LINE_HEIGHT, Value::F64(17.0)),
@@ -442,7 +464,7 @@ fn banner_dismiss(id: u32) -> Draft {
          (Prop::URI, Value::Str("res://ic_mana_x_small".to_owned())),
          (prop!("width"), Value::F64(16.0)),
          (Prop::HEIGHT, Value::F64(16.0)),
-         (Prop::TINT, Value::I64(0xFF94_9BA4)),
+         (Prop::TINT, Value::I64(Color::Muted.argb())),
          (prop!("scale"), Value::Str("fit".to_owned())),
       ],
       kids:  Vec::new(),
@@ -458,7 +480,7 @@ fn banner_dismiss(id: u32) -> Draft {
          (Prop::RADIUS, Value::F64(18.0)),
          (prop!("align"), Value::Str("center".to_owned())),
          (prop!("justify"), Value::Str("center".to_owned())),
-         (prop!("activeBackground"), Value::I64(0x1AFF_FFFF)),
+         (prop!("activeBackground"), Value::I64(theme::overlay(0x1A))),
          (Prop::ROLE, Value::Str("button".to_owned())),
          (Prop::ACCESSIBILITY_LABEL, Value::Str("Dismiss".to_owned())),
          (

@@ -22,20 +22,38 @@ use phoenix_ui_mobile::{
 };
 use phoenix_wire::Value;
 
-use crate::patches::{
-   Block,
-   BlockAction,
-   Contribution,
-   ContributionId,
-   Draft,
-   Handler,
-   Outcome,
+use crate::{
+   patches::{
+      Block,
+      BlockAction,
+      Contribution,
+      ContributionId,
+      Draft,
+      Handler,
+      Outcome,
+   },
+   settings::theme::Color,
 };
 
-const DANGER: i64 = 4_294_475_386;
-pub const ACCENT: i64 = 4_286_156_281;
-pub const MUTED: i64 = 4_289_440_946;
-pub const TEXT: i64 = 4_294_704_123;
+pub fn accent() -> i64 {
+   if crate::settings::theme::light() {
+      0xFF58_65F2
+   } else {
+      0xFF79_8DF9
+   }
+}
+
+pub fn muted() -> i64 {
+   Color::Muted.argb()
+}
+
+pub fn text() -> i64 {
+   Color::Text.argb()
+}
+
+fn danger_color() -> i64 {
+   Color::Error.argb()
+}
 
 /// Colors from the profile's own tabs, so pages follow its theme.
 #[derive(Clone, Copy)]
@@ -428,7 +446,7 @@ fn action_label(
 ) -> Draft {
    let color = action
       .color
-      .unwrap_or(if action.danger { DANGER } else { muted });
+      .unwrap_or(if action.danger { danger_color() } else { muted });
    let mut piece = label(&action.label, size, weight, color);
    piece.set(Prop::PADDING, Some(Value::Rect(padding)));
    match action.handler {
@@ -542,7 +560,7 @@ fn button(text: &str, danger: bool, colors: Palette) -> Draft {
          text,
          14.0,
          600,
-         if danger { DANGER } else { colors.text },
+         if danger { danger_color() } else { colors.text },
       )],
    )
 }

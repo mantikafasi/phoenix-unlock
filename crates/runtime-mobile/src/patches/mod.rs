@@ -75,6 +75,7 @@ use crate::{
       banners::{
          BannerAction,
          BannerQueue,
+         BannerSpec,
       },
       commands::Command,
       nodes::NodeMatch,
@@ -446,6 +447,8 @@ struct Patches {
    banner_queue:   BannerQueue,
    /// Tap actions for currently visible in-app notification banners, by id.
    banner_actions: HashMap<u32, BannerAction>,
+   /// Specs for currently visible in-app notification banners, by id.
+   banner_specs:   HashMap<u32, BannerSpec>,
 }
 
 static ROOT_ID: AtomicI32 = AtomicI32::new(0);
@@ -480,6 +483,11 @@ pub fn remember_original(shown: String, original: String) {
 
 fn patches() -> MutexGuard<'static, Patches> {
    PATCHES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Queues a rebuild of theme-sensitive plugin surfaces.
+pub fn theme_changed() {
+   queue(Job::ThemeChanged);
 }
 
 /// Hooks the UI bridge and starts the worker that runs plugin callbacks.
