@@ -29,6 +29,17 @@ pub fn is_supported() -> bool {
    hook::installed()
 }
 
+/// Draws Japanese text with the first installed of `families`, or with the
+/// system's choice for `[]`. Only DirectWrite needs one, since its system
+/// fallback picks Yu Gothic UI whatever the language.
+#[cfg(windows)]
+pub fn set_japanese(families: &[String]) {
+   crate::dwrite_fallback::set(families);
+}
+
+#[cfg(not(windows))]
+pub const fn set_japanese(_families: &[String]) {}
+
 pub fn install(image: &phoenix_hook::image::Image<'static>, ix: &phoenix_sigs::index::Index<'_>) {
    hook::install(image, ix);
 }
@@ -52,11 +63,11 @@ pub fn families() -> Vec<String> {
 /// The system font collection's family names, the ones GPUI's DirectWrite
 /// text system finds by name, through raw COM vtables.
 #[cfg(windows)]
-mod dwrite {
-   type Com = *mut *const usize;
+pub mod dwrite {
+   pub type Com = *mut *const usize;
 
    #[repr(C)]
-   struct Guid(u32, u16, u16, [u8; 8]);
+   pub struct Guid(pub u32, pub u16, pub u16, pub [u8; 8]);
 
    static IID_IDWRITE_FACTORY: Guid = Guid(0xB859_EE5A, 0xD838, 0x4B5B, [
       0xA2, 0xE8, 0x1A, 0xDC, 0x7D, 0x93, 0xDB, 0x48,
@@ -64,7 +75,7 @@ mod dwrite {
 
    #[link(name = "dwrite")]
    unsafe extern "system" {
-      fn DWriteCreateFactory(kind: u32, iid: *const Guid, factory: *mut Com) -> i32;
+      pub fn DWriteCreateFactory(kind: u32, iid: *const Guid, factory: *mut Com) -> i32;
    }
 
    /// Method `index` of `this`'s vtable, as `F`.
@@ -73,7 +84,7 @@ mod dwrite {
    ///
    /// `this` is a live COM object whose method at `index` has the signature
    /// `F`.
-   unsafe fn method<F: Copy>(this: Com, index: usize) -> F {
+   pub unsafe fn method<F: Copy>(this: Com, index: usize) -> F {
       // SAFETY: forwarded from the caller; a vtable slot is a function pointer.
       unsafe { std::mem::transmute_copy(&*(*this).add(index)) }
    }
@@ -81,7 +92,7 @@ mod dwrite {
    /// # Safety
    ///
    /// `this` is a live COM object the caller owns a reference to.
-   unsafe fn release(this: Com) {
+   pub unsafe fn release(this: Com) {
       // SAFETY: `IUnknown::Release` is slot 2 of every COM vtable.
       unsafe { method::<unsafe extern "system" fn(Com) -> u32>(this, 2)(this) };
    }

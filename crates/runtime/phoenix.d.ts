@@ -1071,7 +1071,13 @@ declare namespace Phoenix {
     /// Installed families by their English name, sorted.
     list(): string[];
     /// `main` replaces gg sans and ABC Ginto, `mono` replaces gg sans mono (code blocks).
-    set(fonts: { main?: string; mono?: string }): void;
+    /// `japanese` draws the kana, kanji and CJK punctuation gg sans lacks with the first installed
+    /// family of the list (like `["Meiryo", "MS PGothic"]`), and `[]` brings back the system's
+    /// choice. Only Windows uses it, where the system fallback draws Yu Gothic UI, since Linux and
+    /// macOS already pick a Japanese font. A call naming only `japanese` keeps `main` and `mono`.
+    set(fonts: { main?: string; mono?: string; japanese?: string[] }): void;
+    /// Brings back what this plugin set: Discord's main and code fonts, and the system's Japanese
+    /// fallback.
     clear(): void;
   }
 
