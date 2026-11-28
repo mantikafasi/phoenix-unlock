@@ -1,6 +1,6 @@
-// finds libdiscord_gateway's SocketSink vtable and start_send slot (slot 4)
+// finds libdiscord_gateway's SocketSink vtable and start_send slot (slot 4),
+// and the WsMessage streams split from the same socket
 
-use memchr::memchr_iter;
 use phoenix_hook::{
    image::Image,
    x86,
@@ -11,6 +11,7 @@ use crate::Found;
 pub(crate) const ADOPT_ANCHOR: &[u8] = b"gateway connect adopted the early socket";
 pub(crate) const START_SEND_PANIC: &[u8] = b"assertion failed: this.state.is_none()";
 pub(crate) const START_SEND_SLOT_OFFSET: usize = 32;
+pub(crate) const POLL_NEXT_SLOT_OFFSET: usize = 24;
 
 // WsMessage::Text(String) tag and payload offset in libdiscord_gateway::transport
 pub const WS_MESSAGE_TEXT_TAG: u64 = 2;
@@ -24,46 +25,7 @@ pub struct DesktopGatewaySend {
 
 impl DesktopGatewaySend {
    pub fn locate(image: &Image<'_>) -> Found<Self> {
-      if image.pointer_width != 8 {
-         return Err("not a 64-bit image".to_owned());
-      }
-
-      let anchor = crate::one("gateway adopt anchor", &image.find_bytes(ADOPT_ANCHOR))?;
-      let loads = crate::desktop::lea_refs(image, anchor);
-      if loads.is_empty() {
-         return Err("gateway adopt anchor is never loaded".to_owned());
-      }
-      let mut opens = loads
-         .into_iter()
-         .filter_map(|lea| image.function_bounds(lea))
-         .collect::<Vec<_>>();
-
-      opens.sort_unstable();
-      opens.dedup();
-      let (open_fn, open_end) = crate::one("gateway connect_adopting", &opens)?;
-
-      let panic_addrs = image.find_bytes(START_SEND_PANIC);
-      if panic_addrs.is_empty() {
-         return Err("start_send panic string not found".to_owned());
-      }
-
-      let mut matches = Vec::new();
-      for vtable in rip_leas(image, open_fn, open_end) {
-         let Some(start_send) = sink_vtable_start_send(image, vtable) else {
-            continue;
-         };
-         if !loads_any(image, start_send, &panic_addrs) {
-            continue;
-         }
-         let Some(ok_tag) = read_ok_tag(image, start_send) else {
-            continue;
-         };
-         matches.push((vtable, start_send, ok_tag));
-      }
-      matches.sort_unstable();
-      matches.dedup_by_key(|&mut (_, start_send, _)| start_send);
-      let (vtable, start_send_fn, ok_tag) = crate::one("SocketSink vtable", &matches)?;
-
+      let (vtable, start_send_fn, ok_tag) = sink_vtable(image)?;
       let mut start_send_slots = find_sink_slots(image, start_send_fn);
       let direct = vtable + START_SEND_SLOT_OFFSET;
       if !start_send_slots.contains(&direct) {
@@ -79,29 +41,112 @@ impl DesktopGatewaySend {
    }
 }
 
-fn rip_leas(image: &Image<'_>, start: usize, end: usize) -> Vec<usize> {
-   let Some(code) = image.read(start, end - start) else {
-      return Vec::new();
-   };
-   let mut out = Vec::new();
-   for pos in memchr_iter(0x8D, code) {
-      if pos == 0 || pos + 6 > code.len() {
-         continue;
+/// A `dyn Stream` of `WsMessage`s the gateway reads, with every vtable slot
+/// holding its `poll_next`.
+#[derive(Debug, Clone)]
+pub struct GatewayStream {
+   pub poll_next: usize,
+   pub slots:     Vec<usize>,
+}
+
+/// The read halves Discord splits from a gateway socket, one per connect path.
+#[derive(Debug, Clone)]
+pub struct DesktopGatewayRecv {
+   pub streams: Vec<GatewayStream>,
+}
+
+impl DesktopGatewayRecv {
+   /// Each function boxing the `SocketSink` loads the stream's vtable as the
+   /// next vtable after it.
+   pub fn locate(image: &Image<'_>) -> Found<Self> {
+      let (sink, ..) = sink_vtable(image)?;
+      let mut polls = Vec::new();
+      for site in crate::desktop::lea_refs(image, sink) {
+         let Some((start, end)) = image.function_bounds(site) else {
+            continue;
+         };
+         let Some(code) = image.read(start, end - start) else {
+            continue;
+         };
+         let next = crate::desktop::rip_leas(code, start)
+            .find(|&(at, target)| at > site && target != sink)
+            .and_then(|(_, target)| stream_vtable_poll_next(image, target));
+         polls.extend(next);
       }
-      let rex = code[pos - 1];
-      let modrm = code[pos + 1];
-      if (rex != 0x48 && rex != 0x4C) || (modrm & 0xC7) != 0x05 {
-         continue;
-      }
-      let Ok(bytes) = code[pos + 2..pos + 6].try_into() else {
+      streams(image, polls)
+   }
+}
+
+pub(crate) fn streams(image: &Image<'_>, mut polls: Vec<usize>) -> Found<DesktopGatewayRecv> {
+   polls.sort_unstable();
+   polls.dedup();
+   if polls.is_empty() {
+      return Err("no gateway stream vtable follows the SocketSink".to_owned());
+   }
+   let streams = polls
+      .into_iter()
+      .map(|poll_next| {
+         let slots = image
+            .pointers_to(poll_next)
+            .into_iter()
+            .filter(|&slot| {
+               slot
+                  .checked_sub(POLL_NEXT_SLOT_OFFSET)
+                  .and_then(|vtable| stream_vtable_poll_next(image, vtable))
+                  == Some(poll_next)
+            })
+            .collect();
+         GatewayStream { poll_next, slots }
+      })
+      .collect();
+   Ok(DesktopGatewayRecv { streams })
+}
+
+/// `(vtable, start_send, ok_tag)` of the `SocketSink` the gateway connect
+/// function boxes.
+fn sink_vtable(image: &Image<'_>) -> Found<(usize, usize, u64)> {
+   if image.pointer_width != 8 {
+      return Err("not a 64-bit image".to_owned());
+   }
+
+   let anchor = crate::one("gateway adopt anchor", &image.find_bytes(ADOPT_ANCHOR))?;
+   let loads = crate::desktop::lea_refs(image, anchor);
+   if loads.is_empty() {
+      return Err("gateway adopt anchor is never loaded".to_owned());
+   }
+   let mut opens = loads
+      .into_iter()
+      .filter_map(|lea| image.function_bounds(lea))
+      .collect::<Vec<_>>();
+
+   opens.sort_unstable();
+   opens.dedup();
+   let (open_fn, open_end) = crate::one("gateway connect_adopting", &opens)?;
+
+   let panic_addrs = image.find_bytes(START_SEND_PANIC);
+   if panic_addrs.is_empty() {
+      return Err("start_send panic string not found".to_owned());
+   }
+
+   let open_code = image
+      .read(open_fn, open_end - open_fn)
+      .ok_or("gateway connect_adopting is unreadable")?;
+   let mut matches = Vec::new();
+   for (_, vtable) in crate::desktop::rip_leas(open_code, open_fn) {
+      let Some(start_send) = sink_vtable_start_send(image, vtable) else {
          continue;
       };
-      let disp = i32::from_le_bytes(bytes);
-      if let Some(target) = (start + pos + 6).checked_add_signed(disp as isize) {
-         out.push(target);
+      if !loads_any(image, start_send, &panic_addrs) {
+         continue;
       }
+      let Some(ok_tag) = read_ok_tag(image, start_send) else {
+         continue;
+      };
+      matches.push((vtable, start_send, ok_tag));
    }
-   out
+   matches.sort_unstable();
+   matches.dedup_by_key(|&mut (_, start_send, _)| start_send);
+   crate::one("SocketSink vtable", &matches)
 }
 
 pub(crate) fn sink_vtable_start_send(image: &Image<'_>, vtable: usize) -> Option<usize> {
@@ -124,13 +169,32 @@ pub(crate) fn sink_vtable_start_send(image: &Image<'_>, vtable: usize) -> Option
    valid.then_some(start_send)
 }
 
+/// `poll_next` of a `dyn Stream` vtable: drop, size, align, `poll_next`,
+/// `size_hint`. Windows' default `size_hint` is a leaf with no `.pdata` entry.
+pub(crate) fn stream_vtable_poll_next(image: &Image<'_>, vtable: usize) -> Option<usize> {
+   if !vtable.is_multiple_of(8) {
+      return None;
+   }
+   let drop_fn = image.read_usize(vtable)?;
+   let size = image.read_usize(vtable + 8)?;
+   let align = image.read_usize(vtable + 16)?;
+   let poll_next = image.read_usize(vtable + POLL_NEXT_SLOT_OFFSET)?;
+   let size_hint = image.read_usize(vtable + 32)?;
+   let valid = (0x20..=0x2000).contains(&size)
+      && align.is_power_of_two()
+      && align <= 64
+      && image.is_function(drop_fn)
+      && image.is_function(poll_next)
+      && image.is_code(size_hint);
+   valid.then_some(poll_next)
+}
+
 fn loads_any(image: &Image<'_>, func: usize, needles: &[usize]) -> bool {
-   let Some((start, end)) = image.function_bounds(func) else {
-      return false;
-   };
-   rip_leas(image, start, end)
-      .into_iter()
-      .any(|target| needles.contains(&target))
+   image.function_bounds(func).is_some_and(|(start, end)| {
+      image.read(start, end - start).is_some_and(|code| {
+         crate::desktop::rip_leas(code, start).any(|(_, target)| needles.contains(&target))
+      })
+   })
 }
 
 // reads the Ok(()) niche discriminant start_send writes to *sret before returning

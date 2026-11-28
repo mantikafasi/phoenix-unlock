@@ -24,7 +24,6 @@ use std::{
 
 use phoenix_hook::image::Image;
 use phoenix_sigs::{
-   desktop,
    index::Index,
    locate,
 };
@@ -61,25 +60,19 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
          return;
       },
    };
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).media_fetch;
    // SAFETY: runs from `prepare` before Discord threads execute;
    // `media_fetch_detour` matches `libdiscord_media::fetch`'s exact Rust ABI
    // (`this, url.ptr, url.len, max_bytes -> Pin<Box<dyn Future>>`).
-   let trampoline = match unsafe {
-      image.hook_entry(
-         func,
-         pro.pattern,
-         pro.len,
-         media_fetch_detour as *const () as usize,
-      )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("desktop badges: media_fetch hook failed: {err}");
-         return;
-      },
-   };
-   // SAFETY: `trampoline` replays the 15-byte prologue and jumps to `func + 15`.
+   let trampoline =
+      match unsafe { image.hook_entry(func, media_fetch_detour as *const () as usize) } {
+         Ok(trampoline) => trampoline,
+         Err(err) => {
+            log::warn!("desktop badges: media_fetch hook failed: {err}");
+            return;
+         },
+      };
+   // SAFETY: `trampoline` replays the 15-byte prologue and jumps to `func +
+   // 15`.
    let orig = unsafe { std::mem::transmute::<usize, MediaFetchFn>(trampoline) };
    let _ = ORIG_MEDIA_FETCH.set(orig);
    log::info!("desktop badges: hooked libdiscord_media::fetch @ {func:#x}");

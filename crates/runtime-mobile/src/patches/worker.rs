@@ -146,6 +146,12 @@ pub enum Job {
       text:  String,
       frame: Vec<u8>,
    },
+   /// A press on sticker `id` in the picker, held for the `onStickerPick`
+   /// handlers.
+   Sticker {
+      id:    String,
+      frame: Vec<u8>,
+   },
    /// Re-apply declarative `PatchTarget::List` prop patches to live lists.
    RefreshPropPatches,
    /// Send a raw `Op::Update` requested by `phoenix.ui.update`.
@@ -282,6 +288,7 @@ pub fn run(job: Job) -> Vec<Op> {
          text,
          frame,
       } => emoji::pick(input, &id, text, &frame),
+      Job::Sticker { id, frame } => emoji::pick_sticker_press(&id, &frame),
       Job::RefreshPropPatches => patches().refresh_list_patches(),
       Job::UpdateNode { node, props } => vec![Op::Update { id: node, props }],
       Job::ViewEvent {
@@ -375,7 +382,7 @@ fn decorate(contribution: ContributionId, place: Place) -> Vec<Op> {
          Place::User(user) => user.clone(),
          Place::Message(message) => message_author(message),
          Place::Channel(channel) => dm_recipient(channel),
-         Place::Screen => None,
+         Place::MessageNear { .. } | Place::Screen => None,
       };
       let mut state = patches();
       if state.users.len() >= RESULTS_CAP {
@@ -412,15 +419,33 @@ fn cached<T: for<'de> Deserialize<'de>>(table: &str, key: String) -> Option<T> {
 /// The author of `message` in Phoenix's cache.
 fn message_author(message: &str) -> Option<String> {
    #[derive(Deserialize)]
-   struct Author {
-      id: Snowflake,
-   }
-   #[derive(Deserialize)]
    struct Message {
       author: Author,
    }
    cached::<Message>("messages", format!("%:{message:0>20}"))
       .map(|message| message.author.id.into())
+}
+
+#[derive(Deserialize)]
+struct Author {
+   id: Snowflake,
+}
+
+/// Whether cached `message` has no text and follows `previous` by the same
+/// author, which is when Phoenix's row for it shows no message id. A row count
+/// that disagrees with the cache then finds no message instead of a wrong one.
+fn grouped_without_text(message: &str, previous: &str) -> bool {
+   #[derive(Deserialize)]
+   struct Message {
+      author:  Author,
+      #[serde(default)]
+      content: String,
+   }
+   let parse = |json| serde_json::from_str::<Message>(json).ok();
+   let (Some(message), Some(previous)) = (parse(message), parse(previous)) else {
+      return false;
+   };
+   message.content.is_empty() && String::from(message.author.id) == String::from(previous.author.id)
 }
 
 /// The one recipient of DM `channel` in Phoenix's cache, kept under the empty
@@ -518,7 +543,43 @@ pub fn press_context(place: &Place) -> UiContext {
       (channel, text("v").map(str::to_owned))
    };
 
+   // The list keeps no id on some rows; keys sort like ids, all padded to 20.
+   let near = |anchor: &str, offset: i32| {
+      let found = rows("SELECT k FROM messages WHERE k LIKE ? LIMIT 1", &[format!(
+         "%:{anchor:0>20}"
+      )])?;
+      let anchor = found.first("k")?.text()?;
+      let channel = anchor.split(':').next()?;
+      let (compare, order) = if offset > 0 {
+         (">", "ASC")
+      } else {
+         ("<", "DESC")
+      };
+      let skip = offset.unsigned_abs().checked_sub(1)?;
+      let sql = format!(
+         "SELECT k, CAST(v AS TEXT) AS v FROM messages WHERE k {compare} ? AND k LIKE ? ORDER BY \
+          k {order} LIMIT 1 OFFSET {skip}"
+      );
+      let target = rows(&sql, &[anchor.to_owned(), format!("{channel}:%")])?;
+      let key = target.first("k")?.text()?;
+      let previous = rows(
+         "SELECT CAST(v AS TEXT) AS v FROM messages WHERE k < ? AND k LIKE ? ORDER BY k DESC \
+          LIMIT 1",
+         &[key.to_owned(), format!("{channel}:%")],
+      )?;
+      if !grouped_without_text(target.first("v")?.text()?, previous.first("v")?.text()?) {
+         return None;
+      }
+      Some(key.rsplit(':').next()?.trim_start_matches('0').to_owned())
+   };
+
    let mut context = UiContext::default();
+   if let Place::MessageNear { anchor, offset } = place
+      && let Some(id) = near(anchor, *offset)
+   {
+      (context.channel_id, context.message) = message(&id);
+      context.message_id = Some(id);
+   }
    if let Place::Message(id) = place {
       (context.channel_id, context.message) = message(id);
       context.message_id = Some(id.clone());

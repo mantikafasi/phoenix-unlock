@@ -1,7 +1,7 @@
 //! Function hooks and signature scanning for phoenix.
 //!
 //! - [`Hook`] is the inline-hook interface, and [`Inline`] is `ShadowHook` on
-//!   Android ARM, the one target that hooks code.
+//!   Android ARM, Linux and Windows x86-64, and macOS arm64.
 //! - [`Image`](image::Image) views a loaded ELF module, scans it for
 //!   [`Pattern`](pattern::Pattern)s, and swaps pointers in its read-only data.
 
@@ -18,19 +18,59 @@ pub mod image;
 pub mod pattern;
 // macOS builds it on arm64 too, so sigscan reads x86 Desktop builds there and
 // the desktop runtime compiles; its locators are not run on arm64 code.
-#[cfg(all(
-   target_os = "android",
-   any(target_arch = "aarch64", target_arch = "arm")
+#[cfg(any(
+   all(
+      target_os = "android",
+      any(target_arch = "aarch64", target_arch = "arm")
+   ),
+   all(target_arch = "x86_64", any(target_os = "linux", windows)),
+   all(target_os = "macos", target_arch = "aarch64"),
 ))]
 pub mod shadowhook;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod x86;
 
-#[cfg(all(
-   target_os = "android",
-   any(target_arch = "aarch64", target_arch = "arm")
+#[cfg(any(
+   all(
+      target_os = "android",
+      any(target_arch = "aarch64", target_arch = "arm")
+   ),
+   all(target_arch = "x86_64", any(target_os = "linux", windows)),
+   all(target_os = "macos", target_arch = "aarch64"),
 ))]
 pub type Inline = shadowhook::ShadowHook;
+
+/// A function `observe` redirects through its stub, on x86-64 or arm64.
+#[cfg(any(
+   all(target_arch = "x86_64", any(target_os = "linux", windows)),
+   all(target_os = "macos", target_arch = "aarch64"),
+))]
+pub struct Observed {
+   addr: usize,
+   hook: Inline,
+}
+
+#[cfg(any(
+   all(target_arch = "x86_64", any(target_os = "linux", windows)),
+   all(target_os = "macos", target_arch = "aarch64"),
+))]
+impl Observed {
+   #[must_use]
+   pub const fn addr(&self) -> usize {
+      self.addr
+   }
+
+   /// Puts the function's first bytes back. The stub stays allocated, since a
+   /// thread may still run it.
+   ///
+   /// # Safety
+   ///
+   /// As for [`Hook::detach`].
+   pub unsafe fn remove(self) -> Result<(), Error> {
+      // SAFETY: forwarded from the caller.
+      unsafe { self.hook.detach() }
+   }
+}
 
 #[derive(Debug, flub::Error)]
 pub enum Error {

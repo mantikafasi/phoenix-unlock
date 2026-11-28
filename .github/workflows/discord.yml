@@ -7,8 +7,9 @@ name: discord
 # request the bot opens and auto-merge lands; phones read that file from main.
 #
 # The bot is a GitHub App: its client ID is the BOT_CLIENT_ID repository
-# variable and its key the BOT_PRIVATE_KEY secret. Auto-merge only takes its
-# pull requests while the app is sunbird-bot.
+# variable and its key the BOT_PRIVATE_KEY secret. It turns on auto-merge
+# itself because the merge queue never picks up an auto-merge that
+# GITHUB_TOKEN turned on.
 on:
   schedule:
     - cron: '41 */6 * * *'
@@ -111,3 +112,4 @@ jobs:
             gh pr create --head "$branch" --base main --title "web: offer discord $VERSION" \
               --body "Discord $VERSION is signed by Discord, passes \`sigscan check\`, keeps the props.in indices and has every host name the runtime uses."
           fi
+          gh pr merge --auto "$branch"

@@ -105,12 +105,12 @@ pub struct GatewayEvent {
    pub rest: [u64; REST_WORDS],
 }
 
-/// The Rust `Result` a handler returns through a hidden pointer:
-/// - 96 bytes (12 words) on Desktop Phoenix (`Discord.exe`, Linux
-///   `discord-phoenix`, macOS `Discord`), with `Ok` niche `u64::MAX - 1`
-///   (`0xffff_ffff_ffff_fffe`)
-/// - 32 bytes (4 words) on mobile 64-bit, with `Ok` niche `u64::MAX`
-/// - 16 bytes (2 words) on armeabi-v7a, with `Ok` niche `u64::MAX`
+/// The Rust `Result` a handler returns through a hidden pointer.
+///
+/// It is 96 bytes on Desktop Phoenix (`Discord.exe`, Linux `discord-phoenix`,
+/// macOS `Discord`), 32 on mobile 64-bit and 16 on armeabi-v7a. Its first word
+/// is the `Ok` niche [`GatewayRegistry::ok_word`](registry::GatewayRegistry::ok_word)
+/// reads, which moves between builds.
 #[cfg(any(
    target_os = "windows",
    target_os = "macos",
@@ -120,40 +120,26 @@ pub const RESULT_WORDS: usize = 12;
 #[cfg(not(any(
    target_os = "windows",
    target_os = "macos",
-   all(target_os = "linux", target_arch = "x86_64"),
-   target_arch = "arm"
+   all(target_os = "linux", target_arch = "x86_64")
 )))]
 pub const RESULT_WORDS: usize = 4;
-#[cfg(target_arch = "arm")]
-pub const RESULT_WORDS: usize = 2;
-
-#[cfg(any(
-   target_os = "windows",
-   target_os = "macos",
-   all(target_os = "linux", target_arch = "x86_64")
-))]
-const OK_TAG: u64 = u64::MAX - 1;
-#[cfg(not(any(
-   target_os = "windows",
-   target_os = "macos",
-   all(target_os = "linux", target_arch = "x86_64")
-)))]
-const OK_TAG: u64 = u64::MAX;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct HandlerResult(pub [u64; RESULT_WORDS]);
+pub struct HandlerResult(pub [usize; RESULT_WORDS]);
 
 impl HandlerResult {
-   pub const OK: Self = {
+   /// A success whose first word is `ok`.
+   #[must_use]
+   pub const fn ok(ok: usize) -> Self {
       let mut words = [0; RESULT_WORDS];
-      words[0] = OK_TAG;
+      words[0] = ok;
       Self(words)
-   };
+   }
 
    #[must_use]
-   pub const fn is_ok(&self) -> bool {
-      self.0[0] == OK_TAG
+   pub const fn is(&self, ok: usize) -> bool {
+      self.0[0] == ok
    }
 }
 
@@ -167,28 +153,22 @@ mod tests {
 
    #[test]
    fn handler_result_abi_matches_target() {
-      assert!(HandlerResult::OK.is_ok());
-      let mut err = HandlerResult::OK;
-      err.0[0] = 0;
-      assert!(!err.is_ok());
       #[cfg(any(
          target_os = "windows",
          target_os = "macos",
          all(target_os = "linux", target_arch = "x86_64")
       ))]
-      {
-         assert_eq!(size_of::<HandlerResult>(), 96);
-         assert_eq!(HandlerResult::OK.0[0], 0xFFFF_FFFF_FFFF_FFFE);
-      }
-      #[cfg(not(any(
-         target_os = "windows",
-         target_os = "macos",
-         all(target_os = "linux", target_arch = "x86_64"),
-         target_arch = "arm"
-      )))]
-      {
-         assert_eq!(size_of::<HandlerResult>(), 32);
-         assert_eq!(HandlerResult::OK.0[0], u64::MAX);
-      }
+      assert_eq!(size_of::<HandlerResult>(), 96);
+      #[cfg(all(
+         target_pointer_width = "64",
+         not(any(
+            target_os = "windows",
+            target_os = "macos",
+            all(target_os = "linux", target_arch = "x86_64")
+         ))
+      ))]
+      assert_eq!(size_of::<HandlerResult>(), 32);
+      #[cfg(target_arch = "arm")]
+      assert_eq!(size_of::<HandlerResult>(), 16);
    }
 }

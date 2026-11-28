@@ -297,8 +297,7 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
    native.set(
       "unhook",
       Function::new(ctx.clone(), |ctx: Ctx<'js>, id: usize| {
-         let image = image().ok_or_else(|| Exception::throw_internal(&ctx, "not started"))?;
-         observe::unhook(image, id).map_err(|err| Exception::throw_message(&ctx, &err))
+         observe::unhook(id).map_err(|err| Exception::throw_message(&ctx, &err))
       })?,
    )?;
    native.set(
@@ -308,9 +307,9 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
    Ok(native)
 }
 
-/// `phoenix.native.hook`, on `phoenix_hook::x86::observe`, which saves the
+/// `phoenix.native.hook`, on `phoenix_hook`'s `observe` stubs, which save the
 /// argument registers.
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 mod observe {
    use std::{
       cell::Cell,
@@ -329,12 +328,19 @@ mod observe {
       },
    };
 
+   #[cfg(target_os = "macos")]
+   use phoenix_hook::arm64::{
+      Regs,
+      observe,
+   };
    use phoenix_hook::{
+      Observed,
       image::Image,
-      x86::{
-         Observed,
-         Regs,
-      },
+   };
+   #[cfg(any(windows, target_os = "linux"))]
+   use phoenix_hook::x86::{
+      Regs,
+      observe,
    };
    use serde::Serialize;
 
@@ -412,9 +418,8 @@ mod observe {
       slot.hits.store(0, Ordering::Relaxed);
       slot.limit.store(limit, Ordering::Relaxed);
       // SAFETY: the debug console's user picks a function start. A wrong pick
-      // or a thread paused in its first 14 bytes can crash Discord, which a
-      // reversing tool accepts.
-      let hook = unsafe { phoenix_hook::x86::observe(image, addr, on_hit, id) }
+      // can crash Discord, which a reversing tool accepts.
+      let hook = unsafe { observe(image, addr, on_hit, id) }
          .map_err(|err| err.to_string())?;
       observed[id] = Some(hook);
       drop(observed);
@@ -422,7 +427,7 @@ mod observe {
       Ok(id)
    }
 
-   pub fn unhook(image: &Image<'static>, id: usize) -> Result<bool, String> {
+   pub fn unhook(id: usize) -> Result<bool, String> {
       let mut observed = OBSERVED.lock().unwrap_or_else(PoisonError::into_inner);
       let Some(hook) = observed.get_mut(id).and_then(Option::take) else {
          return Ok(false);
@@ -430,7 +435,7 @@ mod observe {
       drop(observed);
       SLOTS[id].limit.store(0, Ordering::Relaxed);
       // SAFETY: as for `hook`.
-      unsafe { hook.remove(image) }.map_err(|err| err.to_string())?;
+      unsafe { hook.remove() }.map_err(|err| err.to_string())?;
       Ok(true)
    }
 
@@ -489,8 +494,8 @@ mod observe {
    }
 }
 
-/// `phoenix.native.hook` where `phoenix_hook::x86::observe` has no stub.
-#[cfg(not(any(windows, target_os = "linux")))]
+/// `phoenix.native.hook` where `phoenix_hook` has no `observe` stub.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod observe {
    use phoenix_hook::image::Image;
 
@@ -499,7 +504,7 @@ mod observe {
    }
 
    #[expect(clippy::unnecessary_wraps, reason = "matches the Windows signature")]
-   pub const fn unhook(_image: &Image<'static>, _id: usize) -> Result<bool, String> {
+   pub const fn unhook(_id: usize) -> Result<bool, String> {
       Ok(false)
    }
 

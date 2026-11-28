@@ -69,6 +69,8 @@ pub enum Error {
    Js(String),
    #[error(transparent)]
    Registry(#[from] registry::Error),
+   #[error("gateway handlers' success word: {0}")]
+   OkWord(String),
    #[error("{event}: the registry slot held {found:#x}, the walk read {expected:#x}")]
    SwapConflict {
       event:    String,
@@ -95,6 +97,8 @@ pub enum Error {
    PluginTypeScript { name: String },
    #[error("{name}: {message}")]
    PluginSyntax { name: String, message: String },
+   #[error("{name}: the new code failed to start and was not saved: {message}")]
+   PluginStart { name: String, message: String },
    #[error("{url}: the download is not UTF-8 text")]
    NotUtf8 { url: String },
    #[error(transparent)]
@@ -461,20 +465,31 @@ fn add(name: String, source: String) -> Result<installer::Installed, Error> {
    Ok(installer::Installed { name, replaced })
 }
 
-/// Writes `source` to `home/plugins/<name>.js` and loads it, replacing the
-/// plugin's code, bundled or not.
+/// Loads `source` as the plugin's code, bundled or not, and writes it to
+/// `home/plugins/<name>.js` once it started. Code that throws while starting
+/// is not saved, and the version that ran before runs on.
 pub fn save_source(name: &str, source: String) -> Result<(), Error> {
    let state = STATE.get().ok_or(Error::NotStarted)?;
-   let file = state.plugins_dir().join(format!("{name}.js"));
+   let dir = state.plugins_dir();
+   let file = dir.join(format!("{name}.js"));
+   // Written beside the plugin first, so a crash leaves its file whole.
+   let pending = dir.join(format!(".{name}.pending"));
    let write = || {
-      std::fs::create_dir_all(state.plugins_dir())?;
-      std::fs::write(&file, &source)
+      std::fs::create_dir_all(&dir)?;
+      let mut handle = std::fs::File::create(&pending)?;
+      std::io::Write::write_all(&mut handle, source.as_bytes())?;
+      handle.sync_all()
    };
-   write().map_err(io_error(&file))?;
-   if let Some(mut engine) = engine() {
-      engine.install(name, source);
+   write().map_err(io_error(&pending))?;
+   let started = engine().map_or(Ok(()), |mut engine| engine.install(name, source));
+   if let Err(message) = started {
+      let _ = std::fs::remove_file(&pending);
+      return Err(Error::PluginStart {
+         name: name.to_owned(),
+         message,
+      });
    }
-   Ok(())
+   std::fs::rename(&pending, &file).map_err(io_error(&file))
 }
 
 /// A plugin's current code.
@@ -483,7 +498,7 @@ pub fn source(name: &str) -> Option<String> {
    engine()?.source(name)
 }
 
-/// The bundled copy an installed plugin replaced.
+/// The bundled copy, whether it runs or an installed plugin replaced it.
 #[must_use]
 pub fn bundled_source(name: &str) -> Option<String> {
    engine()?.bundled(name)

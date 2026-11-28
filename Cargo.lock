@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "patcher"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "patcher-web"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "getrandom 0.2.17",
  "js-sys",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-hook"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "flub",
  "iced-x86",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-inject"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "crc32fast",
  "misstep",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-loader"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "android_logger",
  "libc",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-runtime"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "crc32fast",
  "flub",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-runtime-desktop"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "crc32fast",
  "flub",
@@ -676,6 +676,7 @@ dependencies = [
  "phoenix-hook",
  "phoenix-runtime",
  "phoenix-sigs",
+ "phoenix-themes",
  "phoenix-ui-desktop",
  "rquickjs",
  "serde",
@@ -684,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-runtime-mobile"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "flub",
  "jni-sys",
@@ -705,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-sigs"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "flub",
  "iced-x86",
@@ -715,8 +716,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-themes"
+version = "0.4.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "phoenix-ui-desktop"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "flub",
  "log",
@@ -724,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-ui-mobile"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "flub",
  "phoenix-wire",
@@ -734,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-wire"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "flub",
 ]
@@ -1061,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "sigscan"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "misstep",
  "phoenix-hook",
@@ -1098,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "stand-in"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "phoenix-sigs",
  "serde",
@@ -1107,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "stand-in-demo"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "misstep",
@@ -1122,7 +1131,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sunhook-sys"
 version = "0.1.0"
-source = "git+https://github.com/sunbird-tools/sunhook#001f748b751b8a05845f609b8d5dfbe505fe73ea"
+source = "git+https://github.com/sunbird-tools/sunhook#21aacda5e0937dc01a8055198ceb037ec11fa052"
 dependencies = [
  "cc",
  "libc",

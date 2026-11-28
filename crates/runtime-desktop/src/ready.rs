@@ -9,14 +9,14 @@ use std::sync::{
    PoisonError,
 };
 
-use phoenix_hook::{
-   image::Image,
-   x86::Abi,
-};
+use phoenix_hook::image::Image;
 use phoenix_runtime::gateway;
-use phoenix_sigs::desktop::{
-   self,
-   ReadySession,
+use phoenix_sigs::{
+   index::Index,
+   locate::ready::{
+      self,
+      ReadySession,
+   },
 };
 
 /// The session's READY handler, `fn(out, payload) -> out`, owning the payload.
@@ -31,10 +31,10 @@ static REWRITTEN: Mutex<Option<String>> = Mutex::new(None);
 
 /// Hooks both of the session's ways into READY from [`crate::prepare`], once
 /// the registry is read and before Discord's threads run.
-pub fn install(image: &Image<'static>) {
+pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    let parse = match gateway::original_handler("READY")
       .ok_or_else(|| "no READY handler".to_owned())
-      .and_then(|handler| desktop::ready_parse(image, handler))
+      .and_then(|handler| ready::ready_parse(ix, handler))
    {
       Ok(parse) => parse,
       Err(err) => {
@@ -42,73 +42,36 @@ pub fn install(image: &Image<'static>) {
          return;
       },
    };
-   install_text(image, parse);
-   install_session(image, parse);
-}
-
-fn install_text(image: &Image<'static>, parse: usize) {
-   let func = match desktop::ready_text(image, parse) {
-      Ok(func) => func,
-      Err(err) => {
-         log::warn!("ready: {err}, READYs under 2 MB pass unhooked");
-         return;
+   match ready::ready_text(ix, &parse) {
+      Ok(func) => {
+         // SAFETY: runs before Discord's threads, and the detour has the
+         // parse's ABI with its return slot first.
+         if let Some(original) = unsafe {
+            crate::hook_sret::<TextFn>(image, func, text_ready as *const () as usize, "ready")
+         } {
+            let _ = TEXT.set(original);
+            log::info!("ready: hooked the text parse @ {func:#x}");
+         }
       },
-   };
-   let Some(prologue) = desktop::Prologues::of(Abi::of(image)).ready_text else {
-      return;
-   };
-   // SAFETY: runs before Discord's threads, and the detour has the parse's
-   // ABI.
-   let trampoline = match unsafe {
-      image.hook_entry(
-         func,
-         prologue.pattern,
-         prologue.len,
-         text_ready as *const () as usize,
-      )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("ready: {err}");
-         return;
+      Err(err) => log::warn!("ready: {err}, READYs under 2 MB pass unhooked"),
+   }
+   match ready::ready_session(ix, &parse) {
+      Ok(session) => {
+         // SAFETY: as above, for the handler's ABI.
+         if let Some(original) = unsafe {
+            crate::hook_sret::<SessionFn>(
+               image,
+               session.func,
+               session_ready as *const () as usize,
+               "ready",
+            )
+         } {
+            let _ = SESSION.set((original, session));
+            log::info!("ready: hooked the session @ {:#x}", session.func);
+         }
       },
-   };
-   // SAFETY: the trampoline replays the displaced prologue and continues in
-   // the parse.
-   let _ = TEXT.set(unsafe { std::mem::transmute::<usize, TextFn>(trampoline) });
-   log::info!("ready: hooked the text parse @ {func:#x}");
-}
-
-fn install_session(image: &Image<'static>, parse: usize) {
-   let session = match desktop::ready_session(image, parse) {
-      Ok(session) => session,
-      Err(err) => {
-         log::warn!("ready: {err}, READY hooks stay off");
-         return;
-      },
-   };
-   let prologue = desktop::Prologues::of(Abi::of(image)).row;
-   // SAFETY: runs before Discord's threads, and the detour has the handler's
-   // ABI.
-   let trampoline = match unsafe {
-      image.hook_entry(
-         session.func,
-         prologue.pattern,
-         prologue.len,
-         session_ready as *const () as usize,
-      )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("ready: {err}");
-         return;
-      },
-   };
-   // SAFETY: the trampoline replays the displaced prologue and continues in
-   // the handler.
-   let original = unsafe { std::mem::transmute::<usize, SessionFn>(trampoline) };
-   let _ = SESSION.set((original, session));
-   log::info!("ready: hooked the session @ {:#x}", session.func);
+      Err(err) => log::warn!("ready: {err}, READY hooks stay off"),
+   }
 }
 
 /// Runs plugin hooks on the payload's READY and points the payload at their

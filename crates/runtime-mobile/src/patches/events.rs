@@ -25,8 +25,12 @@ use crate::{
       FIRST_ID,
       Handler,
       Patches,
+      Place,
       RESULTS_CAP,
-      aids::message_id,
+      aids::{
+         self,
+         message_id,
+      },
       commands,
       number,
       patches,
@@ -146,7 +150,7 @@ impl Patches {
       if event == ROW_LONG_PRESS
          && let Some(index) = payload.field(Prop::INDEX.key()).and_then(Value::as_i32)
       {
-         self.seen.long_pressed = self.row_message(node, index);
+         self.seen.long_pressed = self.row_place(node, index);
       }
       if !self.event_hooks.is_empty()
          && self.event_hooks.iter().any(|hook| hook.event == event)
@@ -188,6 +192,20 @@ impl Patches {
             input,
             id: id.to_owned(),
             text: text.to_owned(),
+            frame: raw,
+         });
+         return true;
+      }
+      if self.sticker_picks > 0
+         && event == Prop::PRESS.key()
+         && let Some(id) = self
+            .mirror
+            .accessibility_id(node)
+            .and_then(|aid| aid.strip_prefix("expression.sticker:"))
+         && self.in_message_picker(node)
+      {
+         queue(Job::Sticker {
+            id:    id.to_owned(),
             frame: raw,
          });
          return true;
@@ -399,5 +417,39 @@ impl Patches {
          .mirror
          .find_down(row, &|aid| message_id(aid).is_some(), 8)?;
       message_id(self.mirror.accessibility_id(hit)?).map(str::to_owned)
+   }
+
+   /// The message in row `index` of list `node`. A row without a message id
+   /// is placed by the nearest row that has one, counting message rows only.
+   fn row_place(&self, node: i32, index: i32) -> Option<Place> {
+      const NEAR_ROWS: i32 = 12;
+      if let Some(id) = self.row_message(node, index) {
+         return Some(Place::Message(id));
+      }
+      let message_row = |at: i32| {
+         let row = self.mirror.row(node, at)?;
+         Some(self.mirror.accessibility_id(row) == Some(aids::MESSAGE_ROW))
+      };
+      if message_row(index) != Some(true) {
+         return None;
+      }
+      for direction in [-1, 1] {
+         let mut offset = 0;
+         for step in 1..=NEAR_ROWS {
+            let other = index + direction * step;
+            match message_row(other) {
+               None => break,
+               Some(false) => continue,
+               Some(true) => offset += 1,
+            }
+            if let Some(anchor) = self.row_message(node, other) {
+               return Some(Place::MessageNear {
+                  anchor,
+                  offset: -direction * offset,
+               });
+            }
+         }
+      }
+      None
    }
 }

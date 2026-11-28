@@ -3,9 +3,11 @@
 //!
 //! The friend requests count is answered with 0 where Phoenix computes it, for
 //! the DM list's Friends row and the inbox's Friends tab, and taken out of the
-//! Home button's count and the badge built like it. The message requests count
-//! also decides whether the Message Requests row shows, so only the DM list's
-//! badge for it draws 0.
+//! Home button's count and the badge built like it. The Friends page's Pending
+//! tab reads it from a tally of every relationship type, where it moves into a
+//! count that is only ever added to it, so the tab itself stays. The message
+//! requests count also decides whether the Message Requests row shows, so only
+//! the DM list's badge for it draws 0.
 
 use std::{
    str::FromStr,
@@ -13,7 +15,6 @@ use std::{
       OnceLock,
       atomic::{
          AtomicBool,
-         AtomicUsize,
          Ordering,
       },
    },
@@ -22,11 +23,12 @@ use std::{
 use phoenix_hook::image::Image;
 use phoenix_sigs::{
    Found,
-   desktop::{
+   index::Index,
+   locate::counts::{
       self,
       FRIENDS_BADGE,
-      HookPoint,
       MESSAGE_REQUESTS_BADGE,
+      TALLIES,
    },
 };
 
@@ -34,6 +36,13 @@ use phoenix_sigs::{
 type BadgeFn = unsafe extern "C" fn(*mut u8, *const u8, usize, u32, usize, usize) -> *mut u8;
 /// `u32 f(&RelationshipStore)`.
 type CountFn = unsafe extern "C" fn(*const u8) -> u32;
+/// `fn(out: &mut [u64; 8], &RelationshipStore) -> out`.
+type TallyFn = unsafe extern "C" fn(*mut u64, *const u8) -> *mut u64;
+
+/// The tally's incoming friend requests, which badge the Pending tab.
+const TALLY_INCOMING: usize = 1;
+/// The tally's count after them, which its readers only add to the others.
+const TALLY_SUMMED: usize = 2;
 
 /// The Home badge's state when it shows a count.
 const STATE_COUNT: u32 = 2;
@@ -48,8 +57,8 @@ static BADGE: [OnceLock<BadgeFn>; BADGES] = [const { OnceLock::new() }; BADGES];
 const BADGE_DETOURS: [BadgeFn; BADGES] = [badge::<0>, badge::<1>];
 static FRIEND_REQUESTS: OnceLock<CountFn> = OnceLock::new();
 static HOME_COUNT: OnceLock<CountFn> = OnceLock::new();
-/// The Home badge's trampoline, which [`home_badge_shim`] calls.
-static HOME_BADGE: AtomicUsize = AtomicUsize::new(0);
+static TALLY: [OnceLock<TallyFn>; TALLIES] = [const { OnceLock::new() }; TALLIES];
+const TALLY_DETOURS: [TallyFn; TALLIES] = [tally::<0>, tally::<1>];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Count {
@@ -69,10 +78,19 @@ impl FromStr for Count {
    }
 }
 
+/// How a hooked function hands back what it returns.
+#[derive(Clone, Copy)]
+enum Returns {
+   /// In registers.
+   Registers,
+   /// Through a slot the caller passes, `x8` on arm64.
+   Slot,
+}
+
 /// Hooks what draws and computes the counts from [`crate::prepare`], before
 /// Discord's threads run.
-pub fn install(image: &Image<'static>) {
-   let found = match desktop::pending_counts(image) {
+pub fn install(image: &Image<'static>, ix: &Index<'_>) {
+   let found = match counts::pending_counts(ix) {
       Ok(found) => found,
       Err(err) => {
          log::warn!("pending counts: {err}, the counts stay");
@@ -81,76 +99,101 @@ pub fn install(image: &Image<'static>) {
    };
    // They read the friend requests count's code, so they look before it is
    // hooked.
-   let home = desktop::home_count(image, found.friend_requests);
-   let home_state = desktop::home_badge(image, found.friend_requests);
+   let home = counts::home_count(ix, found.friend_requests);
+   let home_state = counts::home_badge(ix, found.friend_requests);
+   let tallies = counts::relationship_counts(ix);
 
    for (index, &func) in found.badges.iter().take(BADGES).enumerate() {
       // SAFETY: runs before Discord's threads, and the detour has the badge's
       // ABI.
-      if let Some(original) = unsafe { hook(image, Ok(func), BADGE_DETOURS[index] as usize) } {
-         // SAFETY: the trampoline replays the displaced instructions and
-         // continues in the badge.
-         let _ = BADGE[index].set(unsafe { std::mem::transmute::<usize, BadgeFn>(original) });
+      if let Some(original) = unsafe {
+         attach::<BadgeFn>(
+            image,
+            Ok(func),
+            BADGE_DETOURS[index] as usize,
+            Returns::Slot,
+         )
+      } {
+         let _ = BADGE[index].set(original);
       }
    }
    // SAFETY: as above, for the count's ABI.
    if let Some(original) = unsafe {
-      hook(
+      attach::<CountFn>(
          image,
          Ok(found.friend_requests),
          friend_requests as *const () as usize,
+         Returns::Registers,
       )
    } {
-      // SAFETY: as above, continuing in the count.
-      let _ = FRIEND_REQUESTS.set(unsafe { std::mem::transmute::<usize, CountFn>(original) });
+      let _ = FRIEND_REQUESTS.set(original);
    }
    // SAFETY: as above, for the count's ABI.
-   if let Some(original) = unsafe { hook(image, home, home_count as *const () as usize) } {
-      // SAFETY: as above, continuing in the Home button's count.
-      let _ = HOME_COUNT.set(unsafe { std::mem::transmute::<usize, CountFn>(original) });
+   if let Some(original) = unsafe {
+      attach::<CountFn>(
+         image,
+         home,
+         home_count as *const () as usize,
+         Returns::Registers,
+      )
+   } {
+      let _ = HOME_COUNT.set(original);
    }
-   // SAFETY: as above, the shim keeps the Home badge's registers.
-   if let Some(original) = unsafe { hook(image, home_state, home_badge_shim as *const () as usize) }
-   {
-      HOME_BADGE.store(original, Ordering::Release);
+   // SAFETY: as above, for the Home badge's ABI.
+   if let Some(original) = unsafe {
+      attach::<home_badge::Original>(
+         image,
+         home_state,
+         home_badge::detour_addr(),
+         Returns::Registers,
+      )
+   } {
+      home_badge::set(original);
+   }
+   let tallies = match tallies {
+      Ok(tallies) => tallies,
+      Err(err) => {
+         log::warn!("pending counts: {err}");
+         return;
+      },
+   };
+   for (index, &func) in tallies.iter().enumerate() {
+      // SAFETY: as above, for the tally's ABI.
+      if let Some(original) = unsafe {
+         attach::<TallyFn>(
+            image,
+            Ok(func),
+            TALLY_DETOURS[index] as usize,
+            Returns::Slot,
+         )
+      } {
+         let _ = TALLY[index].set(original);
+      }
    }
 }
 
-/// Sends `func` to `detour` and returns what runs the original.
+/// Sends `func` to `detour` and returns what runs the original as `F`.
 ///
 /// # Safety
 ///
-/// As for [`Image::hook_entry`] and [`Image::swap_words`].
-unsafe fn hook(image: &Image<'static>, func: Found<usize>, detour: usize) -> Option<usize> {
-   let hooked = func.and_then(|func| {
-      let original = match desktop::hook_point(image, func)? {
-         // SAFETY: forwarded from the caller.
-         HookPoint::Entry(prologue) => unsafe {
-            image.hook_entry(func, prologue.pattern, prologue.len, detour)
-         },
-         HookPoint::Slots(slots) => {
-            let writes = slots
-               .iter()
-               .map(|&slot| (slot, detour))
-               .collect::<Vec<(usize, usize)>>();
-            // SAFETY: forwarded from the caller.
-            unsafe { image.swap_words(&writes) }.map(|_| func)
-         },
-      };
-      original
-         .map(|original| (func, original))
-         .map_err(|err| format!("{func:#x}: {err}"))
-   });
-   match hooked {
-      Ok((func, trampoline)) => {
-         log::info!("pending counts: hooked @ {func:#x}");
-         Some(trampoline)
-      },
-      Err(err) => {
-         log::warn!("pending counts: {err}");
-         None
-      },
-   }
+/// As for [`crate::hook`] and [`crate::hook_sret`], by `returns`.
+unsafe fn attach<F: Copy>(
+   image: &Image<'static>,
+   func: Found<usize>,
+   detour: usize,
+   returns: Returns,
+) -> Option<F> {
+   let func = func
+      .map_err(|err| log::warn!("pending counts: {err}"))
+      .ok()?;
+   let original = match returns {
+      // SAFETY: forwarded from the caller.
+      Returns::Registers => unsafe { crate::hook::<F>(image, func, detour, "pending counts") },
+      // SAFETY: forwarded from the caller.
+      Returns::Slot => unsafe { crate::hook_sret::<F>(image, func, detour, "pending counts") },
+   }?;
+   log::info!("pending counts: hooked @ {func:#x}");
+   Some(original)
 }
 
 /// Hides each count in `hidden` and shows the others again.
@@ -203,6 +246,19 @@ extern "C" fn home_count(store: *const u8) -> u32 {
    without_friend_requests(store, count)
 }
 
+extern "C" fn tally<const N: usize>(out: *mut u64, store: *const u8) -> *mut u64 {
+   // SAFETY: the trampoline runs the original with Phoenix's arguments.
+   let returned = unsafe { (*TALLY[N].wait())(out, store) };
+   if HIDE_FRIEND_REQUESTS.load(Ordering::Acquire) {
+      // SAFETY: the original filled the counts `out` points to.
+      unsafe {
+         *out.add(TALLY_SUMMED) += *out.add(TALLY_INCOMING);
+         *out.add(TALLY_INCOMING) = 0;
+      }
+   }
+   returned
+}
+
 /// `count` less the friend requests while they are hidden.
 fn without_friend_requests(store: *const u8, count: u32) -> u32 {
    match FRIEND_REQUESTS.get() {
@@ -214,61 +270,107 @@ fn without_friend_requests(store: *const u8, count: u32) -> u32 {
    }
 }
 
-/// Takes the friend requests out of the Home badge the original returned and
-/// answers it as `state | count << 32`.
-extern "C" fn home_badge(store: *const u8, state: u32, count: u32) -> u64 {
-   let (state, count) = if state == STATE_COUNT {
-      let count = without_friend_requests(store, count);
-      // Phoenix looks for unread DMs only when it counts nothing, so a dot
-      // they would show is lost when only friend requests were counted.
-      (if count == 0 { STATE_NONE } else { STATE_COUNT }, count)
-   } else {
-      (state, count)
-   };
-   u64::from(state) | u64::from(count) << 32
+/// Takes the friend requests out of a Home badge's `(state, count)`.
+fn badge_without_friend_requests(store: *const u8, state: u32, count: u32) -> (u32, u32) {
+   if state != STATE_COUNT {
+      return (state, count);
+   }
+   let count = without_friend_requests(store, count);
+   // Phoenix looks for unread DMs only when it counts nothing, so a dot they
+   // would show is lost when only friend requests were counted.
+   (if count == 0 { STATE_NONE } else { STATE_COUNT }, count)
 }
 
-/// Runs the Home badge and hands the `(state, count)` it returns in `eax` and
-/// `edx`, which no stable Rust ABI returns, through [`home_badge`].
-#[cfg(windows)]
-#[unsafe(naked)]
-extern "C" fn home_badge_shim() {
-   core::arch::naked_asm!(
-      "push rbx",
-      "sub rsp, 32",
-      "mov rbx, rcx",
-      "call qword ptr [rip + {original}]",
-      "mov rcx, rbx",
-      "mov r8d, edx",
-      "mov edx, eax",
-      "call {adjust}",
-      "mov rdx, rax",
-      "shr rdx, 32",
-      "add rsp, 32",
-      "pop rbx",
-      "ret",
-      original = sym HOME_BADGE,
-      adjust = sym home_badge,
-   );
-}
-
-/// [`home_badge_shim`] for the System V ABI, which passes the count in `edx`
-/// already.
+/// The Home badge, `(state, count) f(&Store, _)`, which returns its pair in
+/// the first two return registers.
 #[cfg(not(windows))]
-#[unsafe(naked)]
-extern "C" fn home_badge_shim() {
-   core::arch::naked_asm!(
-      "push rbx",
-      "mov rbx, rdi",
-      "call qword ptr [rip + {original}]",
-      "mov rdi, rbx",
-      "mov esi, eax",
-      "call {adjust}",
-      "mov rdx, rax",
-      "shr rdx, 32",
-      "pop rbx",
-      "ret",
-      original = sym HOME_BADGE,
-      adjust = sym home_badge,
-   );
+mod home_badge {
+   use std::sync::OnceLock;
+
+   /// What the badge returns in its two return registers, each holding a
+   /// `u32`. System V and arm64 return a 16-byte pair of integers the same way.
+   #[repr(C)]
+   pub struct Pair {
+      state: u64,
+      count: u64,
+   }
+
+   pub type Original = unsafe extern "C" fn(*const u8, usize) -> Pair;
+
+   static ORIGINAL: OnceLock<Original> = OnceLock::new();
+
+   pub fn detour_addr() -> usize {
+      detour as *const () as usize
+   }
+
+   pub fn set(original: Original) {
+      let _ = ORIGINAL.set(original);
+   }
+
+   #[expect(
+      clippy::cast_possible_truncation,
+      reason = "the badge returns each u32 in a 64-bit register"
+   )]
+   extern "C" fn detour(store: *const u8, arg: usize) -> Pair {
+      // SAFETY: the trampoline runs the original with Phoenix's arguments.
+      let pair = unsafe { (*ORIGINAL.wait())(store, arg) };
+      let (state, count) =
+         super::badge_without_friend_requests(store, pair.state as u32, pair.count as u32);
+      Pair {
+         state: u64::from(state),
+         count: u64::from(count),
+      }
+   }
+}
+
+/// The Home badge on Win64, which returns `(state, count)` in `eax` and `edx`.
+/// Win64 returns a 16-byte pair through a slot, so a shim takes `edx`.
+#[cfg(windows)]
+mod home_badge {
+   use std::sync::atomic::{
+      AtomicUsize,
+      Ordering,
+   };
+
+   pub type Original = usize;
+
+   /// The badge's trampoline, which [`shim`] calls.
+   static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+
+   pub fn detour_addr() -> usize {
+      shim as *const () as usize
+   }
+
+   pub fn set(original: Original) {
+      ORIGINAL.store(original, Ordering::Release);
+   }
+
+   /// Answers the badge as `state | count << 32` for [`shim`].
+   extern "C" fn adjust(store: *const u8, state: u32, count: u32) -> u64 {
+      let (state, count) = super::badge_without_friend_requests(store, state, count);
+      u64::from(state) | u64::from(count) << 32
+   }
+
+   /// Runs the badge and hands the `(state, count)` it returns in `eax` and
+   /// `edx`, which no stable Rust ABI returns, through [`adjust`].
+   #[unsafe(naked)]
+   extern "C" fn shim() {
+      core::arch::naked_asm!(
+         "push rbx",
+         "sub rsp, 32",
+         "mov rbx, rcx",
+         "call qword ptr [rip + {original}]",
+         "mov rcx, rbx",
+         "mov r8d, edx",
+         "mov edx, eax",
+         "call {adjust}",
+         "mov rdx, rax",
+         "shr rdx, 32",
+         "add rsp, 32",
+         "pop rbx",
+         "ret",
+         original = sym ORIGINAL,
+         adjust = sym adjust,
+      );
+   }
 }

@@ -141,8 +141,12 @@ fn sunbird_item() -> Option<Tree> {
       || "Plugin updates".to_owned(),
       |version| format!("Sunbird {version}"),
    );
+   // The IPA is signed, so iOS takes a new loader only from a reinstall.
+   let reinstall = cfg!(target_os = "ios") && update.loader.is_some();
    let subtitle = if busy {
       status.unwrap_or_else(|| "Updating...".to_owned())
+   } else if reinstall {
+      "Patch a new IPA on the site and install it over this one".to_owned()
    } else {
       let plugins = summary(&update.plugins);
       match (&update.loader, plugins) {
@@ -153,6 +157,8 @@ fn sunbird_item() -> Option<Tree> {
    };
    let trailing = if busy {
       label("Updating", 14.0, 700, BLURPLE)
+   } else if reinstall {
+      pill("Site", Press::OpenSite)
    } else {
       pill("Update", Press::ApplyUpdate)
    };
@@ -164,7 +170,7 @@ fn sunbird_item() -> Option<Tree> {
    )];
    // Plugins update in place, so the site's full download is only for a
    // loader.
-   if update.loader.is_some() && !busy {
+   if update.loader.is_some() && !busy && !reinstall {
       kids.push(row(8.0, vec![
          grow(label(
             "Or get the full download from the site",

@@ -41,7 +41,10 @@ use phoenix_sigs::{
       BinaryFile,
       Machine,
    },
-   gateway_send::DesktopGatewaySend,
+   gateway_send::{
+      DesktopGatewayRecv,
+      DesktopGatewaySend,
+   },
    http::DesktopHttpTransport,
    index::{
       Index,
@@ -255,13 +258,21 @@ fn check(
       }
    };
    let at = |addr: usize| format!("{addr:#x}");
-   let registry = GatewayRegistry::locate(image).map_err(|err| err.to_string());
+   let registry = ix.registry();
    report(
       "gateway registry",
       registry
          .as_ref()
          .map(|registry| format!("{} events", registry.iter().count()))
          .map_err(Clone::clone),
+   );
+   report(
+      "handler ok word",
+      registry
+         .as_ref()
+         .map_err(Clone::clone)
+         .and_then(|registry| registry.ok_word(image, ix.isa))
+         .map(|word| format!("{word:#x}")),
    );
    match machine {
       Machine::X86_64 => {
@@ -272,16 +283,12 @@ fn check(
                desktop::windows_restart_script(image).map(at),
             );
          }
-         let prologues = desktop::Prologues::of(abi);
          let http = DesktopHttpTransport::locate(image);
          report(
             "http transport",
             http.as_ref().map_err(Clone::clone).and_then(|http| {
-               prologues
-                  .frame
-                  .at(image, http.send_fn)
-                  .then(|| format!("{} request {:x?}", at(http.send_fn), http.request))
-                  .ok_or_else(|| "send prologue changed".to_owned())
+               desktop::entry_moved(image, http.send_fn)
+                  .map(|_| format!("{} request {:x?}", at(http.send_fn), http.request))
             }),
          );
          report(
@@ -302,6 +309,17 @@ fn check(
                   gw.start_send_slots.len(),
                   gw.ok_tag
                )
+            }),
+         );
+         report(
+            "gateway receive",
+            DesktopGatewayRecv::locate(image).map(|recv| {
+               recv
+                  .streams
+                  .iter()
+                  .map(|stream| format!("{} ({} slots)", at(stream.poll_next), stream.slots.len()))
+                  .collect::<Vec<_>>()
+                  .join(", ")
             }),
          );
          report(
@@ -406,6 +424,10 @@ fn check(
             desktop::svg_builders(image).map(|svg| format!("{svg:x?}")),
          );
          report("asset loader", desktop::asset_load(image).map(at));
+         report(
+            "icon names",
+            desktop::icon_names(image).map(|names| format!("{} names", names.len())),
+         );
          let row = locate::message::message_row(ix);
          report(
             "message context menu",
@@ -465,122 +487,6 @@ fn check(
             }),
          );
          report("composer gift", desktop::composer_gift(image).map(at));
-         if abi == x86::Abi::Win64 {
-            report(
-               "ready text",
-               registry
-                  .as_ref()
-                  .map_err(|_| "needs the registry".to_owned())
-                  .and_then(|registry| {
-                     let id = registry.id("READY").ok_or("no READY")?;
-                     desktop::ready_parse(image, registry.entry(id).handler)
-                        .and_then(|parse| desktop::ready_text(image, parse))
-                  })
-                  .map(at),
-            );
-            report(
-               "ready session",
-               registry
-                  .as_ref()
-                  .map_err(|_| "needs the registry".to_owned())
-                  .and_then(|registry| {
-                     let id = registry.id("READY").ok_or("no READY")?;
-                     desktop::ready_parse(image, registry.entry(id).handler)
-                        .and_then(|parse| desktop::ready_session(image, parse))
-                  })
-                  .map(|session| {
-                     format!(
-                        "{} (kind +{:#x} = {}, raw +{:#x})",
-                        at(session.func),
-                        session.kind,
-                        session.raw_kind,
-                        session.raw
-                     )
-                  }),
-            );
-            report(
-               "channel toolbar",
-               desktop::channel_toolbar(image).map(|toolbar| {
-                  format!(
-                     "button {}, append {}, sizes {:#x}/{:#x}, click +{:#x}",
-                     at(toolbar.button_site),
-                     at(toolbar.append_site),
-                     toolbar.button_size,
-                     toolbar.toolbar_size,
-                     toolbar.on_click,
-                  )
-               }),
-            );
-            report(
-               "channel sidebar",
-               desktop::channel_sidebar(image).map(|sidebar| {
-                  format!(
-                     "column {}, publish {}, rail {}, handle {}",
-                     at(sidebar.column_site),
-                     at(sidebar.publish_site),
-                     at(sidebar.rail),
-                     at(sidebar.handle_site),
-                  )
-               }),
-            );
-            report(
-               "scene draw",
-               desktop::scene_draw(image).map(|found| {
-                  format!(
-                     "{} quads +{:#x}, mono +{:#x}, subpixel +{:#x}",
-                     at(found.draw),
-                     found.quads,
-                     found.mono,
-                     found.subpixel
-                  )
-               }),
-            );
-         }
-         let pending = desktop::pending_counts(image);
-         let moved = |func: usize| {
-            desktop::hook_point(image, func).map(|point| {
-               match point {
-                  desktop::HookPoint::Entry(prologue) => {
-                     format!("{} ({} bytes moved)", at(func), prologue.len)
-                  },
-                  desktop::HookPoint::Slots(slots) => {
-                     format!("{} (through slots {slots:x?})", at(func))
-                  },
-               }
-            })
-         };
-         report(
-            "pending counts",
-            pending.as_ref().map_err(Clone::clone).and_then(|found| {
-               let badges = found
-                  .badges
-                  .iter()
-                  .map(|&badge| moved(badge))
-                  .collect::<Found<Vec<String>>>()?;
-               Ok(format!(
-                  "badges {}, friend requests {}",
-                  badges.join(", "),
-                  moved(found.friend_requests)?
-               ))
-            }),
-         );
-         let friend_requests = pending
-            .as_ref()
-            .map(|found| found.friend_requests)
-            .map_err(|_| "needs the pending counts".to_owned());
-         report(
-            "home count",
-            friend_requests
-               .clone()
-               .and_then(|func| desktop::home_count(image, func))
-               .and_then(moved),
-         );
-         report(
-            "home badge",
-            friend_requests
-               .and_then(|func| desktop::home_badge(image, func))
-               .and_then(moved),
-         );
          let json = desktop::message_json(image);
          report(
             "message json",
@@ -670,6 +576,17 @@ fn check(
                   gw.start_send_slots.len(),
                   gw.ok_tag
                )
+            }),
+         );
+         report(
+            "gateway receive",
+            phoenix_sigs::macos::gateway_recv(image).map(|recv| {
+               recv
+                  .streams
+                  .iter()
+                  .map(|stream| format!("{} ({} slots)", at(stream.poll_next), stream.slots.len()))
+                  .collect::<Vec<_>>()
+                  .join(", ")
             }),
          );
          report(

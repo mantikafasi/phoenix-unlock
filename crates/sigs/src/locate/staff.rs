@@ -30,6 +30,10 @@ use crate::{
       Op,
       Reg,
       Value,
+      flow::{
+         self,
+         Val,
+      },
    },
 };
 
@@ -55,72 +59,42 @@ struct Read {
 /// pointer loaded from a stack slot a call filled.
 fn reads(ix: &Index<'_>, func: &Func<'_>) -> Vec<Read> {
    let sp = usize::from(ix.isa.sp());
-   let mut bias = [0isize; 32];
-   // Which call filled the guard a register's pointer was loaded from.
-   let mut guard = [None::<usize>; 32];
-   // The stack offset each register points at, and the slots calls filled.
-   let mut stack = [None::<isize>; 32];
+   // The call that last filled each stack slot it was passed the address of.
    let mut filled = HashMap::<isize, usize>::new();
    let mut out = Vec::new();
-   stack[sp] = Some(0);
-   for (step, at) in func.steps().iter().enumerate() {
-      let mut read = |base: Reg, offset: isize, bias: &[isize; 32]| {
-         if let Some(lock) = guard[usize::from(base)] {
+   flow::walk(ix.isa, &func.steps(), |step, at, regs| {
+      let mut read = |base: Reg, offset: isize| {
+         if let Val::Spilled { slot, bias } = regs[usize::from(base)]
+            && let Some(&lock) = filled.get(&slot)
+         {
             out.push(Read {
                step,
                base,
-               offset: bias[usize::from(base)] + offset,
+               offset: bias + offset,
                lock,
             });
          }
       };
       match at.op {
          Op::Load {
-            reg,
             base,
             offset,
-            size,
-         } => {
-            if size == 4 || size == 8 {
-               read(base, offset, &bias);
-            }
-            let slot = stack[usize::from(base)].map(|at| at + offset);
-            let reg = usize::from(reg);
-            bias[reg] = 0;
-            stack[reg] = None;
-            guard[reg] = slot.and_then(|slot| filled.get(&slot).copied());
-         },
-         Op::CmpMem { base, offset, .. } => read(base, offset, &bias),
+            size: 4 | 8,
+            ..
+         }
+         | Op::CmpMem { base, offset, .. } => read(base, offset),
          Op::Call(callee) => {
-            for (reg, slot) in stack.iter().enumerate() {
-               if let Some(slot) = slot
+            for (reg, val) in regs.iter().enumerate() {
+               if let Val::Stack(slot) = *val
                   && reg != sp
                {
-                  filled.insert(*slot, callee);
+                  filled.insert(slot, callee);
                }
             }
          },
-         Op::Offset { reg, base, offset } => {
-            let (reg, base) = (usize::from(reg), usize::from(base));
-            bias[reg] = bias[base] + offset;
-            guard[reg] = guard[base];
-            stack[reg] = stack[base].map(|at| at + offset);
-         },
-         Op::Move { dst, src } => {
-            let (dst, src) = (usize::from(dst), usize::from(src));
-            bias[dst] = bias[src];
-            guard[dst] = guard[src];
-            stack[dst] = stack[src];
-         },
-         Op::Addr { reg, .. } | Op::Imm { reg, .. } => {
-            let reg = usize::from(reg);
-            bias[reg] = 0;
-            guard[reg] = None;
-            stack[reg] = None;
-         },
          _ => {},
       }
-   }
+   });
    out
 }
 

@@ -1,93 +1,69 @@
-//! Live `.theme.css` themes, applied to GPUI's `Scene` right before the
-//! renderer draws it, so every desktop renderer shows the same colors.
+//! Theme file helpers and cross-platform `--radius-scale` Scene hook.
 //!
-//! The renderer's `draw(&mut self, scene: &Scene)` is observed; on entry its
-//! quads, monochrome sprites (icons) and subpixel sprites (text) are recolored
-//! in place. Their element layouts are GPUI's `#[repr(C)]` structs, which the
-//! shaders read as is.
+//! Color theming is handled natively through [`crate::mana_theme`] (Discord's
+//! `SemanticColors` table). This module keeps the `gpui::Scene` draw hook
+//! strictly for scaling `Quad::corner_radii` when a theme sets `--radius-scale`,
+//! saving and restoring the original radii around `draw` so re-presented scenes
+//! never compound-scale.
 
-use std::{
-   path::{
-      Path,
-      PathBuf,
-   },
-   sync::{
-      LazyLock,
-      OnceLock,
-      PoisonError,
-      RwLock,
-   },
+use std::path::{
+   Path,
+   PathBuf,
 };
 
-#[cfg(windows)]
 use phoenix_hook::image::Image;
-use phoenix_sigs::desktop::SceneDraw;
+use phoenix_sigs::index::Index;
 
-use crate::theme_css::{
-   Theme,
-   parse_theme_css,
-};
-
-static SCENE: OnceLock<SceneDraw> = OnceLock::new();
-static THEME: LazyLock<RwLock<Theme>> = LazyLock::new(RwLock::default);
-
-/// Observes the renderer's `draw`. Elsewhere themes stay off, since the
-/// locator only decodes Win64 builds.
-#[cfg(windows)]
-pub fn install(image: &Image<'static>) {
-   draw::install(image);
+/// Installs the cross-platform `--radius-scale` Scene hook during `prepare()`.
+pub fn install(image: &Image<'static>, ix: &Index<'_>) {
+   radius::install(image, ix);
 }
 
 #[must_use]
 pub fn is_supported() -> bool {
-   SCENE.get().is_some()
+   crate::mana_theme::is_supported()
 }
 
-/// Applies `.theme.css` text now. Returns whether it themes anything.
+/// Applies `.theme.css` text live. Returns whether it themes anything.
 pub fn set_css(css: &str) -> bool {
-   let theme = parse_theme_css(css);
-   let active = theme.active;
-   *THEME.write().unwrap_or_else(PoisonError::into_inner) = theme;
-   crate::modal::force_redraw();
-   active
+   crate::mana_theme::set_css(css)
 }
 
 pub fn clear() {
-   set_css("");
+   crate::mana_theme::forget_saved();
+   crate::mana_theme::restore_persisted();
 }
 
-/// A `.theme.css` file in the themes folder.
+/// A `.theme.css` or `.theme.json` file in the themes folder.
 pub struct ThemeFile {
-   pub file: String,
-   pub name: String,
+   pub file:        String,
+   pub name:        String,
+   pub description: Option<String>,
+   pub author:      Option<String>,
 }
 
-/// `*.theme.css` files in `dir`, named by their `@name` header.
+/// `*.theme.css` and `*.theme.json` files in `dir`, named by their metadata.
 #[must_use]
 pub fn list(dir: &Path) -> Vec<ThemeFile> {
-   let mut out: Vec<ThemeFile> = std::fs::read_dir(dir)
+   phoenix_themes::list_themes(dir)
       .into_iter()
-      .flatten()
-      .flatten()
-      .filter_map(|entry| {
-         let file = entry.file_name().into_string().ok()?;
-         let stem = file.strip_suffix(".theme.css")?.to_owned();
-         let name = std::fs::read_to_string(entry.path())
-            .map(|css| parse_theme_css(&css).name)
-            .ok()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(stem);
-         Some(ThemeFile { file, name })
+      .map(|entry| {
+         ThemeFile {
+            file:        entry.file,
+            name:        entry.meta.name,
+            description: entry.meta.description,
+            author:      entry.meta.author,
+         }
       })
-      .collect();
-   out.sort_by(|a, b| a.file.cmp(&b.file));
-   out
+      .collect()
 }
 
 pub fn open_dir(dir: &Path) {
    let _ = std::fs::create_dir_all(dir);
    let opener = if cfg!(windows) {
       "explorer"
+   } else if cfg!(target_os = "macos") {
+      "open"
    } else {
       "xdg-open"
    };
@@ -96,121 +72,161 @@ pub fn open_dir(dir: &Path) {
       .spawn();
 }
 
-#[cfg(windows)]
-mod draw {
-   use std::sync::{
-      OnceLock,
-      PoisonError,
-   };
+mod radius {
+   use std::sync::OnceLock;
 
-   use phoenix_hook::{
-      image::Image,
-      x86::{
-         Observed,
-         Regs,
-         observe,
+   use phoenix_hook::image::Image;
+   use phoenix_sigs::{
+      index::Index,
+      locate::mana_theme::{
+         self,
+         SceneDraw,
       },
    };
-   use phoenix_sigs::desktop;
 
-   use super::{
-      SCENE,
-      THEME,
-   };
-   use crate::theme_css::{
-      Hsla,
-      QuadRole,
-      Theme,
-      remap_border_color,
-      remap_gradient_stops,
-      remap_mono_color,
-      remap_quad_color,
-   };
+   static SCENE: OnceLock<SceneDraw> = OnceLock::new();
 
-   /// `gpui::Quad`: `order`, `border_style`, `bounds`, `content_mask`,
-   /// `background`, `border_color`, `corner_radii`, `border_widths`.
-   static HOOK: OnceLock<Observed> = OnceLock::new();
-
-   mod quad {
-      pub const SIZE: usize = 160;
-      pub const BOUNDS: usize = 8;
-      pub const BACKGROUND_TAG: usize = 40;
-      pub const SOLID: usize = 48;
-      /// The two `LinearColorStop`s of a gradient, an `Hsla` and a percentage.
-      pub const STOPS: [usize; 2] = [68, 88];
-      pub const BORDER: usize = 112;
-      pub const RADII: usize = 128;
+   /// GPUI's `#[repr(C)]` shader structs, verified by `scene_draw`. Each
+   /// `(radii, bounds)` pair names a `[f32; 4]` corner radii field and the
+   /// `[x, y, w, h]` bounds that clamp it.
+   struct Layout {
+      size:  usize,
+      radii: &'static [(usize, usize)],
    }
 
-   /// `gpui::MonochromeSprite` and `gpui::SubpixelSprite` share this layout.
-   mod sprite {
-      pub const SIZE: usize = 112;
-      pub const COLOR: usize = 72;
+   const QUAD: Layout = Layout {
+      size:  160,
+      radii: &[(128, 8)],
+   };
+   /// `corner_radii` clips the blurred extent at `bounds`, and
+   /// `shape_corner_radii` rounds the blurred silhouette at `shape_bounds`.
+   const SHADOW: Layout = Layout {
+      size:  112,
+      radii: &[(24, 8), (88, 72)],
+   };
+   const MAX_PRIMITIVES: usize = 65_536;
+   const MAX_RADIUS: f32 = 64.0;
+
+   /// Restores every scaled radii field when `draw` returns (or unwinds), so
+   /// re-presenting the same `Scene` never compounds `--radius-scale`.
+   struct RadiiGuard {
+      saved: Vec<(*mut u8, [f32; 4])>,
    }
 
-   pub(super) fn install(image: &Image<'static>) {
-      let found = match desktop::scene_draw(image) {
-         Ok(found) => found,
-         Err(err) => {
-            log::warn!("desktop themes: {err}, themes disabled");
-            return;
-         },
-      };
-      // SAFETY: `scene_draw` found a function start, and `prepare` runs before
-      // Discord's render thread exists.
-      match unsafe { observe(image, found.draw, on_draw, 0) } {
-         Ok(hook) => {
-            let _ = SCENE.set(found);
-            let _ = HOOK.set(hook);
-            log::info!(
-               "desktop themes: observing the renderer's draw @ {:#x}",
-               found.draw
-            );
-         },
-         Err(err) => log::warn!("desktop themes: observing draw: {err}"),
+   impl Drop for RadiiGuard {
+      fn drop(&mut self) {
+         for &(at, orig) in &self.saved {
+            // SAFETY: `at` was validated as a live radii field inside one of
+            // the scene's primitive lists for the duration of `draw`.
+            unsafe {
+               write4(std::slice::from_raw_parts_mut(at, 16), 0, orig);
+            }
+         }
       }
    }
 
-   /// A `Vec<T>` in the scene, as `(ptr, len)`.
+   /// Reads a `Vec` in `scene` as `(cap, ptr, len)` with checked address
+   /// arithmetic.
    ///
    /// # Safety
    ///
-   /// `scene + at` is a live `Vec`.
-   const unsafe fn list_at(scene: usize, at: usize) -> (usize, usize) {
-      // SAFETY: forwarded from the caller; `Vec` is `cap`, `ptr`, `len`.
+   /// `scene + at` must point to a live `Vec` (`cap`, `ptr`, `len`).
+   const unsafe fn vec_at(scene: usize, at: usize) -> Option<(usize, usize, usize)> {
+      let Some(addr) = scene.checked_add(at) else {
+         return None;
+      };
+      if addr == 0 || !addr.is_multiple_of(std::mem::align_of::<usize>()) {
+         return None;
+      }
+      // SAFETY: forwarded from the caller; Rust `Vec` layout is `cap`, `ptr`, `len`.
       unsafe {
-         let words = (scene + at) as *const usize;
-         (words.add(1).read(), words.add(2).read())
+         let words = addr as *const usize;
+         Some((words.read(), words.add(1).read(), words.add(2).read()))
       }
    }
 
-   extern "C" fn on_draw(_: usize, regs: &Regs) {
-      let theme = THEME.read().unwrap_or_else(PoisonError::into_inner);
-      let Some(found) = SCENE.get().filter(|_| theme.active) else {
-         return;
-      };
-      let Ok(scene) = usize::try_from(regs.args()[1]) else {
-         return;
-      };
-      // A panic must not unwind into the renderer.
-      let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-         // SAFETY: `draw` received a live `&Scene` that nothing else touches
-         // until it returns, and `scene_draw` decoded where its lists sit.
-         unsafe {
-            let (ptr, len) = list_at(scene, found.quads);
-            recolor_quads(
-               std::slice::from_raw_parts_mut(ptr as *mut u8, len * quad::SIZE),
-               &theme,
-            );
-            for at in [found.mono, found.subpixel] {
-               let (ptr, len) = list_at(scene, at);
-               let sprites = std::slice::from_raw_parts_mut(ptr as *mut u8, len * sprite::SIZE);
-               for sprite in sprites.as_chunks_mut::<{ sprite::SIZE }>().0 {
-                  edit_hsla(sprite, sprite::COLOR, |c| remap_mono_color(&theme, c));
+   /// Scales the radii of every primitive in the `Vec` at `scene + at`,
+   /// recording the originals in `saved`.
+   ///
+   /// # Safety
+   ///
+   /// `scene + at` must be a live `Vec` of `layout` primitives not accessed
+   /// concurrently.
+   unsafe fn scale_list(
+      scene: usize,
+      at: usize,
+      layout: &Layout,
+      scale: f32,
+      saved: &mut Vec<(*mut u8, [f32; 4])>,
+   ) -> Option<()> {
+      // SAFETY: forwarded from the caller.
+      let (cap, ptr, len) = unsafe { vec_at(scene, at)? };
+      if ptr == 0
+         || len > cap
+         || len > MAX_PRIMITIVES
+         || !ptr.is_multiple_of(std::mem::align_of::<f32>())
+      {
+         return None;
+      }
+      let byte_len = len.checked_mul(layout.size)?;
+      // SAFETY: `ptr` holds `len` live primitives of `layout.size` bytes.
+      let items = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, byte_len) };
+      for item in items.chunks_exact_mut(layout.size) {
+         for &(radii, bounds) in layout.radii {
+            let [_, _, w, h] = read4(item, bounds);
+            let half_min = if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 {
+               (0.5 * w.min(h)).min(MAX_RADIUS)
+            } else {
+               MAX_RADIUS
+            };
+            let orig = read4(item, radii);
+            let scaled = orig.map(|r| {
+               if r > 0.5 && r < 24.0 {
+                  (r * scale).clamp(0.0, half_min)
+               } else {
+                  r
                }
+            });
+            if scaled.map(f32::to_bits) != orig.map(f32::to_bits) {
+               saved.push((item[radii..].as_mut_ptr(), orig));
+               write4(item, radii, scaled);
             }
          }
-      }));
+      }
+      Some(())
+   }
+
+   /// Scales corner radii in `scene`'s quads and shadows when
+   /// `--radius-scale` is active and not `1.0`, returning a [`RadiiGuard`]
+   /// that restores the original values on drop.
+   ///
+   /// # Safety
+   ///
+   /// `scene` must be a live `&gpui::Scene` pointer not accessed concurrently.
+   unsafe fn scale_scene_radii(scene: usize) -> Option<RadiiGuard> {
+      let scale = crate::mana_theme::radius_scale()?;
+      if !scale.is_finite() || (scale - 1.0).abs() <= 0.001 {
+         return None;
+      }
+      let found = SCENE.get()?;
+      if scene == 0 {
+         return None;
+      }
+      // A panic must not unwind into the renderer.
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+         let mut saved = Vec::new();
+         // SAFETY: `scene` is live for the duration of `draw`, and both
+         // offsets were decoded from the renderer binary.
+         unsafe {
+            scale_list(scene, found.quads, &QUAD, scale, &mut saved);
+            if let Some(shadows) = found.shadows {
+               scale_list(scene, shadows, &SHADOW, scale, &mut saved);
+            }
+         }
+         (!saved.is_empty()).then_some(RadiiGuard { saved })
+      }))
+      .ok()
+      .flatten()
    }
 
    fn read4(buf: &[u8], at: usize) -> [f32; 4] {
@@ -229,95 +245,128 @@ mod draw {
       }
    }
 
-   /// Runs `f` on the color at `at` when it is visible, and writes it back.
-   fn edit_hsla(buf: &mut [u8], at: usize, f: impl FnOnce(&mut Hsla)) {
-      let mut c = read_hsla(buf, at);
-      if c.a > 0.005 && c.a <= 1.001 {
-         f(&mut c);
-         write4(buf, at, [c.h, c.s, c.l, c.a]);
+   /// Linux `WgpuRenderer::draw` takes all six `SysV` integer registers
+   /// (`rdi..r9`) and returns a 16-byte `(rax, rdx)` pair (`Result`).
+   #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+   mod abi {
+      use std::sync::OnceLock;
+
+      #[repr(C)]
+      pub struct DrawRet(usize, usize);
+
+      pub type DrawFn = unsafe extern "C" fn(usize, usize, usize, usize, usize, usize) -> DrawRet;
+
+      static ORIG_DRAW: OnceLock<DrawFn> = OnceLock::new();
+
+      pub fn set_orig(trampoline: usize) {
+         // SAFETY: `trampoline` runs `WgpuRenderer::draw`'s displaced prologue.
+         let orig = unsafe { std::mem::transmute::<usize, DrawFn>(trampoline) };
+         let _ = ORIG_DRAW.set(orig);
       }
-   }
 
-   fn read_hsla(buf: &[u8], at: usize) -> Hsla {
-      let [h, s, l, a] = read4(buf, at);
-      Hsla { h, s, l, a }
-   }
-
-   /// GPUI's large panels, told apart by size and place in the window.
-   fn quad_role([x, y, w, h]: [f32; 4], (vw, vh): (f32, f32)) -> QuadRole {
-      if w >= vw * 0.85 && h >= vh * 0.85 {
-         QuadRole::FullWindowRoot
-      } else if x <= 12.0 && (44.0..=96.0).contains(&w) && h >= vh * 0.5 {
-         QuadRole::ServerRail
-      } else if (140.0..=380.0).contains(&w) && h >= vh * 0.5 && (x <= 120.0 || x + w >= vw - 40.0)
-      {
-         QuadRole::Sidebar
-      } else if y <= 56.0 && w >= vw * 0.45 && (24.0..=64.0).contains(&h) {
-         QuadRole::HeaderBar
-      } else if w >= vw * 0.45 && h >= vh * 0.45 {
-         QuadRole::MainPane
-      } else {
-         QuadRole::Default
-      }
-   }
-
-   fn recolor_quads(quads: &mut [u8], theme: &Theme) {
-      // The window's own background is the largest quad.
-      let window =
-         quads
-            .as_chunks::<{ quad::SIZE }>()
-            .0
-            .iter()
-            .fold((0.0f32, 0.0f32), |(w, h), q| {
-               let b = read4(q, quad::BOUNDS);
-               (w.max(b[2]), h.max(b[3]))
-            });
-      let sized = window.0 >= 400.0 && window.1 >= 300.0;
-      for q in quads.as_chunks_mut::<{ quad::SIZE }>().0 {
-         let bounds = read4(q, quad::BOUNDS);
-         let [_, _, w, h] = bounds;
-         let large =
-            (w >= 96.0 && h >= 48.0) || (w >= 44.0 && h >= 200.0) || (w >= 200.0 && h >= 28.0);
-         let role = if sized {
-            quad_role(bounds, window)
-         } else {
-            QuadRole::Default
+      pub unsafe extern "C" fn draw_detour(
+         a0: usize,
+         a1: usize,
+         a2: usize,
+         a3: usize,
+         a4: usize,
+         a5: usize,
+      ) -> DrawRet {
+         let Some(orig) = ORIG_DRAW.get().copied() else {
+            return DrawRet(0, 0);
          };
-         let tag = u32::from_le_bytes(
-            q[quad::BACKGROUND_TAG..][..4]
-               .try_into()
-               .unwrap_or_default(),
-         );
-         let is_root = role == QuadRole::FullWindowRoot;
-         match tag {
-            0 => {
-               let [_, _, l, a] = read4(q, quad::SOLID);
-               // A modal or image viewer dims the window with a near-black
-               // translucent quad; recoloring it would light the window up.
-               if is_root && a < 0.96 && l <= 0.15 {
-                  continue;
-               }
-               edit_hsla(q, quad::SOLID, |c| {
-                  remap_quad_color(theme, c, large, false, is_root, role);
-               });
-            },
-            // A gradient, such as a Nitro client theme's background.
-            1 => {
-               let huge = w >= 200.0 && h >= 100.0;
-               let mut stops = quad::STOPS.map(|at| read_hsla(q, at));
-               remap_gradient_stops(theme, &mut stops, large, huge, is_root, role);
-               for (at, c) in quad::STOPS.into_iter().zip(stops) {
-                  write4(q, at, [c.h, c.s, c.l, c.a]);
-               }
-            },
-            _ => {},
-         }
-         edit_hsla(q, quad::BORDER, |c| remap_border_color(theme, c));
-         if let Some(scale) = theme.radius_scale {
-            let radii =
-               read4(q, quad::RADII).map(|r| if r > 0.5 && r < 24.0 { r * scale } else { r });
-            write4(q, quad::RADII, radii);
-         }
+         // SAFETY: `a1` (`rsi`) is `&Scene`; `_guard` restores radii on exit.
+         let _guard = unsafe { super::scale_scene_radii(a1) };
+         // SAFETY: forwarding all six `SysV` register arguments to `orig`.
+         unsafe { orig(a0, a1, a2, a3, a4, a5) }
       }
    }
+
+   /// Windows `DirectXRenderer::draw` takes `(rcx, rdx, r8d)` and returns a
+   /// pointer-sized `Result` in `rax`.
+   #[cfg(all(target_arch = "x86_64", windows))]
+   mod abi {
+      use std::sync::OnceLock;
+
+      pub type DrawFn = unsafe extern "C" fn(usize, usize, usize, usize) -> usize;
+
+      static ORIG_DRAW: OnceLock<DrawFn> = OnceLock::new();
+
+      pub fn set_orig(trampoline: usize) {
+         // SAFETY: `trampoline` runs `DirectXRenderer::draw`'s displaced prologue.
+         let orig = unsafe { std::mem::transmute::<usize, DrawFn>(trampoline) };
+         let _ = ORIG_DRAW.set(orig);
+      }
+
+      pub unsafe extern "C" fn draw_detour(a0: usize, a1: usize, a2: usize, a3: usize) -> usize {
+         let Some(orig) = ORIG_DRAW.get().copied() else {
+            return 0;
+         };
+         // SAFETY: `a1` (`rdx`) is `&Scene`; `_guard` restores radii on exit.
+         let _guard = unsafe { super::scale_scene_radii(a1) };
+         // SAFETY: forwarding Win64 register arguments to `orig`.
+         unsafe { orig(a0, a1, a2, a3) }
+      }
+   }
+
+   /// macOS `MetalRenderer::draw(&mut self, scene: &Scene)` takes `(x0, x1)`
+   /// and returns `()`.
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   mod abi {
+      use std::sync::OnceLock;
+
+      pub type DrawFn = unsafe extern "C" fn(usize, usize);
+
+      static ORIG_DRAW: OnceLock<DrawFn> = OnceLock::new();
+
+      pub fn set_orig(trampoline: usize) {
+         // SAFETY: `trampoline` runs `MetalRenderer::draw`'s displaced prologue.
+         let orig = unsafe { std::mem::transmute::<usize, DrawFn>(trampoline) };
+         let _ = ORIG_DRAW.set(orig);
+      }
+
+      pub unsafe extern "C" fn draw_detour(a0: usize, a1: usize) {
+         let Some(orig) = ORIG_DRAW.get().copied() else {
+            return;
+         };
+         // SAFETY: `a1` (`x1`) is `&Scene`; `_guard` restores radii on exit.
+         let _guard = unsafe { super::scale_scene_radii(a1) };
+         // SAFETY: forwarding `(renderer, scene)` to `orig`.
+         unsafe { orig(a0, a1) };
+      }
+   }
+
+   #[cfg(any(
+      all(target_arch = "x86_64", any(windows, target_os = "linux")),
+      all(target_os = "macos", target_arch = "aarch64")
+   ))]
+   pub(super) fn install(image: &Image<'static>, ix: &Index<'_>) {
+      let found = match mana_theme::scene_draw(ix) {
+         Ok(found) => found,
+         Err(err) => {
+            log::warn!("desktop themes: radius hook disabled: {err}");
+            return;
+         },
+      };
+      // Publish `SCENE` before activating the hook.
+      let _ = SCENE.set(found);
+      // SAFETY: runs during `prepare` before Discord's render thread exists.
+      match unsafe { image.hook_entry(found.draw, abi::draw_detour as *const () as usize) } {
+         Ok(trampoline) => {
+            abi::set_orig(trampoline);
+            log::info!(
+               "desktop themes: hooked renderer draw @ {:#x} for --radius-scale (quads +{:#x})",
+               found.draw,
+               found.quads
+            );
+         },
+         Err(err) => log::warn!("desktop themes: hooking renderer draw: {err}"),
+      }
+   }
+
+   #[cfg(not(any(
+      all(target_arch = "x86_64", any(windows, target_os = "linux")),
+      all(target_os = "macos", target_arch = "aarch64")
+   )))]
+   pub(super) fn install(_image: &Image<'static>, _ix: &Index<'_>) {}
 }

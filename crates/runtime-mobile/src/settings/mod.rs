@@ -15,7 +15,7 @@ mod pages;
 mod plugin;
 mod render;
 mod rows;
-mod theme;
+pub mod theme;
 mod tree;
 #[cfg(target_os = "android")] mod updater;
 

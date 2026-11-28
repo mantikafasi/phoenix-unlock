@@ -254,7 +254,13 @@ impl Platform for Mobile {
                      update.plugins.join(", ")
                   )
                },
-               |version| format!("Build {version}, tap to update in-app"),
+               |version| {
+                  if cfg!(target_os = "ios") {
+                     format!("Build {version}, patch a new IPA on the site")
+                  } else {
+                     format!("Build {version}, tap to update in-app")
+                  }
+               },
             );
             banners::show_banner(
                "Sunbird update available".to_owned(),
@@ -281,6 +287,11 @@ impl Platform for Mobile {
    #[cfg(target_os = "android")]
    fn updates_loader(&self) -> bool {
       true
+   }
+
+   #[cfg(target_os = "ios")]
+   fn loader_update_hint(&self) -> &'static str {
+      "patch a new IPA on sunbird.tools and install it over this one"
    }
 
    #[cfg(target_os = "android")]

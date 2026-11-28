@@ -28,8 +28,10 @@ use phoenix_runtime::{
          in_background,
       },
       checked_icon,
+      granted,
       restart_budget,
    },
+   permissions::url_host,
    store::{
       self,
       Cell,
@@ -50,25 +52,34 @@ use rquickjs::{
    },
 };
 
-#[cfg(target_arch = "x86_64")]
-use crate::counts::{
-   self,
-   Count,
-};
 use crate::{
    accessories::{
       self,
       RenderedAccessory,
+   },
+   call_idle::{
+      self,
+      Timer,
    },
    composer,
    context_menu::{
       self,
       ActionMeta,
    },
+   counts::{
+      self,
+      Count,
+   },
    double_click,
    emoji,
    icons,
-   js::Desktop,
+   js::{
+      Desktop,
+      commands::{
+         self,
+         Outcome,
+      },
+   },
    members::Place,
    modal::{
       self,
@@ -83,6 +94,11 @@ use crate::{
    },
    shortcuts,
    sidebar,
+   spotify::{
+      self,
+      Tweak,
+   },
+   sticker,
    toolbar,
 };
 
@@ -114,6 +130,8 @@ pub struct DesktopAction<'js> {
    pub priority: i32,
    pub visible:  Option<Function<'js>>,
    pub on_press: Function<'js>,
+   /// The action whose submenu this one sits in.
+   pub parent:   Option<u64>,
 }
 
 impl DesktopAction<'_> {
@@ -125,6 +143,7 @@ impl DesktopAction<'_> {
          danger:      self.danger,
          priority:    self.priority,
          has_visible: self.visible.is_some(),
+         parent:      self.parent,
       }
    }
 }
@@ -603,7 +622,7 @@ fn register_action<'js>(ctx: &Ctx<'js>, action: DesktopAction<'js>) -> rquickjs:
 fn remove_action(ctx: &Ctx<'_>, id: u64) {
    if let Some(registry) = ctx.userdata::<Desktop<'_>>() {
       let mut list = registry.actions.borrow_mut();
-      list.retain(|entry| entry.id != id);
+      list.retain(|entry| entry.id != id && entry.parent != Some(id));
       context_menu::sync_actions(list.iter().map(DesktopAction::meta).collect());
    }
 }
@@ -618,8 +637,41 @@ fn add_message_action<'js>(
    let danger = options.get::<_, Option<bool>>("danger")?.unwrap_or(false);
    let priority = options.get::<_, Option<i32>>("priority")?.unwrap_or(0);
    let visible = options.get::<_, Option<Function<'js>>>("visible")?;
-   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let children = options.get::<_, Option<Vec<Object<'js>>>>("children")?;
+   let on_press = match (
+      options.get::<_, Option<Function<'js>>>("onPress")?,
+      &children,
+   ) {
+      (Some(on_press), _) => on_press,
+      (None, Some(_)) => Function::new(ctx.clone(), || {})?,
+      (None, None) => {
+         return Err(Exception::throw_type(
+            ctx,
+            "addMessageAction needs onPress or children",
+         ));
+      },
+   };
    let id = NEXT_ACTION.fetch_add(1, Ordering::Relaxed);
+   // Read every child before registering anything, so a bad one leaves no
+   // half-built submenu behind.
+   let children = children
+      .into_iter()
+      .flatten()
+      .enumerate()
+      .map(|(order, child)| {
+         Ok(DesktopAction {
+            id:       NEXT_ACTION.fetch_add(1, Ordering::Relaxed),
+            plugin:   plugin.to_owned(),
+            label:    child.get("label")?,
+            icon:     checked_icon(ctx, plugin, child.get("icon")?)?,
+            danger:   child.get::<_, Option<bool>>("danger")?.unwrap_or(false),
+            priority: i32::try_from(order).unwrap_or(i32::MAX),
+            visible:  None,
+            on_press: child.get("onPress")?,
+            parent:   Some(id),
+         })
+      })
+      .collect::<rquickjs::Result<Vec<_>>>()?;
    register_action(ctx, DesktopAction {
       id,
       plugin: plugin.to_owned(),
@@ -629,7 +681,11 @@ fn add_message_action<'js>(
       priority,
       visible,
       on_press,
+      parent: None,
    })?;
+   for child in children {
+      register_action(ctx, child)?;
+   }
    let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| remove_action(&ctx, id))?;
    remove.set("update", Function::new(ctx.clone(), || {})?)?;
    Ok(remove)
@@ -815,6 +871,7 @@ fn add_profile_tab<'js>(
       priority,
       visible: None,
       on_press,
+      parent: None,
    })?;
 
    let closer = Rc::clone(&tab);
@@ -1147,6 +1204,56 @@ fn collapse_channels<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Func
    })
 }
 
+fn hold_spotify<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   tweak: Tweak,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_HOLD: AtomicU64 = AtomicU64::new(1);
+
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   if !spotify::acquire(tweak) {
+      return noop_handle(ctx);
+   }
+   let hold = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
+   registry
+      .spotify
+      .borrow_mut()
+      .push((hold, plugin.to_owned(), tweak));
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut holds = registry.spotify.borrow_mut();
+      let before = holds.len();
+      holds.retain(|&(held, ..)| held != hold);
+      if holds.len() != before {
+         spotify::release(tweak);
+      }
+   })
+}
+
+fn spotify_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
+   let object = Object::new(ctx.clone())?;
+   for (name, tweak) in [
+      ("keepPlayingInVoice", Tweak::NoAutoPause),
+      ("keepActivityWhenIdle", Tweak::IdleActivity),
+   ] {
+      if spotify::ready(tweak) {
+         let owner = plugin.to_owned();
+         object.set(
+            name,
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+               hold_spotify(&ctx, &owner, tweak)
+            })?,
+         )?;
+      }
+   }
+   Ok(object)
+}
+
 /// `phoenix.ui.addHeaderButton`: a button after the member list toggle in the
 /// channel header toolbar. `update` changes its icon or label.
 fn add_header_button<'js>(
@@ -1233,6 +1340,110 @@ pub fn press_header_button(engine: &Engine, id: u64) {
    });
 }
 
+/// `phoenix.ui.addComposerButton`: a button ahead of the chat bar's own.
+/// `update` changes its label or tint.
+fn add_composer_button<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   use composer::buttons::{
+      self,
+      Button,
+   };
+
+   static NEXT_BUTTON: AtomicU64 = AtomicU64::new(1);
+
+   let label = options.get::<_, String>("label")?;
+   let on = options.get::<_, Option<u32>>("tint")?.is_some();
+   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   let id = NEXT_BUTTON.fetch_add(1, Ordering::Relaxed);
+   registry
+      .composer_buttons
+      .borrow_mut()
+      .push((id, plugin.to_owned(), on_press));
+   drop(registry);
+   let state = Rc::new(RefCell::new((label.clone(), on)));
+   buttons::set(Button { id, label, on });
+
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      registry
+         .composer_buttons
+         .borrow_mut()
+         .retain(|(held, ..)| *held != id);
+      buttons::remove(&[id]);
+   })?;
+   remove.set(
+      "update",
+      Function::new(
+         ctx.clone(),
+         move |patch: Object<'js>| -> rquickjs::Result<()> {
+            let mut state = state.borrow_mut();
+            if let Some(label) = patch.get::<_, Option<String>>("label")? {
+               state.0 = label;
+            }
+            if patch.contains_key("tint")? {
+               state.1 = patch.get::<_, Option<u32>>("tint")?.is_some();
+            }
+            buttons::set(Button {
+               id,
+               label: state.0.clone(),
+               on: state.1,
+            });
+            Ok(())
+         },
+      )?,
+   )?;
+   Ok(remove)
+}
+
+/// Drops the composer buttons `plugin` added.
+pub fn unload_composer_buttons(registry: &Desktop<'_>, plugin: &str) {
+   let mut gone = Vec::new();
+   registry
+      .composer_buttons
+      .borrow_mut()
+      .retain(|&(id, ref owner, _)| {
+         let held = owner == plugin;
+         if held {
+            gone.push(id);
+         }
+         !held
+      });
+   composer::buttons::remove(&gone);
+}
+
+/// Runs the `onPress` of composer button `id`.
+pub fn press_composer_button(engine: &Engine, id: u64) {
+   engine.with(|ctx| {
+      let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+         return;
+      };
+      let found = registry
+         .composer_buttons
+         .borrow()
+         .iter()
+         .find(|(held, ..)| *held == id)
+         .map(|(_, plugin, press)| (plugin.clone(), press.clone()));
+      drop(registry);
+      let Some((plugin, press)) = found else {
+         return;
+      };
+      let Ok(arg) = build_message_context(&ctx, 0, 0, false) else {
+         return;
+      };
+      if let Err(err) = press.call::<_, Value<'_>>((arg,)).catch(&ctx) {
+         log::error!("[{plugin}] addComposerButton onPress: {err}");
+      }
+   });
+}
+
 /// `phoenix.ui.addShortcut`: `run` for a letter or digit pressed with Ctrl or
 /// Alt while Discord is focused, which Discord then never sees.
 fn add_shortcut<'js>(
@@ -1270,9 +1481,6 @@ fn add_shortcut<'js>(
    let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
       return noop_handle(ctx);
    };
-   if !phoenix_ui_desktop::SHORTCUTS {
-      return noop_handle(ctx);
-   }
    let id = NEXT_SHORTCUT.fetch_add(1, Ordering::Relaxed);
    registry
       .shortcuts
@@ -1404,9 +1612,7 @@ fn notify<'js>(
       .get::<_, Option<String>>("title")?
       .unwrap_or_default();
    let body = options.get::<_, Option<String>>("body")?;
-   let accent = options
-      .get::<_, Option<f64>>("accent")?
-      .map_or(notices::ACCENT, to_argb);
+   let accent = options.get::<_, Option<f64>>("accent")?.map(to_argb);
    let duration = match options.get::<_, Option<f64>>("durationMs")? {
       Some(ms) if ms <= 0.0 => None,
       Some(ms) => Some(Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(notices::DURATION)),
@@ -1458,8 +1664,8 @@ pub fn press_notice(id: u64) {
    });
 }
 
-/// Wires desktop `phoenix.ui`, `phoenix.messages.onSend` / `onEmojiPick`, and
-/// `phoenix.commands` onto the plugin's API objects.
+/// Wires desktop `phoenix.ui`, `phoenix.messages.onSend` / `onEmojiPick` /
+/// `onStickerPick`, and `phoenix.commands` onto the plugin's API objects.
 pub fn desktop_patch_api<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
@@ -1482,19 +1688,18 @@ pub fn desktop_patch_api<'js>(
          move |ctx: Ctx<'js>, _function: Opt<Value<'js>>| on_emoji_pick(&ctx, &name),
       )?,
    )?;
-   let commands = Object::new(ctx.clone())?;
-   commands.set(
-      "register",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, _options: Opt<Value<'js>>| {
-         noop_handle(&ctx)
-      })?,
+   let name = plugin.to_owned();
+   messages.set(
+      "onStickerPick",
+      Function::new(
+         ctx.clone(),
+         move |ctx: Ctx<'js>, function: Function<'js>| on_sticker_pick(&ctx, &name, function),
+      )?,
    )?;
-   commands.set(
-      "list",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>| rquickjs::Array::new(ctx))?,
-   )?;
-   api.set("commands", commands)?;
+   api.set("commands", commands::object(ctx, plugin)?)?;
+   api.set("fonts", crate::js::fonts::object(ctx, plugin)?)?;
    api.set("themes", crate::js::themes::object(ctx, plugin)?)?;
+   api.set("spotify", spotify_object(ctx, plugin)?)?;
    api.set("ui", desktop_ui_object(ctx, plugin)?)
 }
 
@@ -1518,6 +1723,23 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
             .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
       })?,
    )?;
+   let link_owner = plugin.to_owned();
+   ui.set(
+      "openUrl",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, url: String| {
+         if !granted(&ctx, &link_owner).is_some_and(|permissions| permissions.link(&url)) {
+            return Err(Exception::throw_message(
+               &ctx,
+               &format!(
+                  "{}: links off Discord need http on the plugin's // @permissions line",
+                  url_host(&url).as_deref().unwrap_or("openUrl")
+               ),
+            ));
+         }
+         phoenix_ui_desktop::open_url(&url)
+            .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
+      })?,
+   )?;
    let notify_owner = plugin.to_owned();
    ui.set(
       "notify",
@@ -1531,6 +1753,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       "hideCount",
       Function::new(ctx.clone(), move |ctx: Ctx<'js>, name: String| {
          hide_count(&ctx, &count_owner, &name)
+      })?,
+   )?;
+
+   let idle_owner = plugin.to_owned();
+   ui.set(
+      "disableCallIdle",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, name: String| {
+         disable_call_idle(&ctx, &idle_owner, &name)
       })?,
    )?;
 
@@ -1619,8 +1849,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          add_header_button(&ctx, &header_owner, &options)
       })?,
    )?;
-   for slot_fn in [
+   let composer_owner = plugin.to_owned();
+   ui.set(
       "addComposerButton",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         add_composer_button(&ctx, &composer_owner, &options)
+      })?,
+   )?;
+   for slot_fn in [
       "addProfileSection",
       "patchProps",
       "onNode",
@@ -1646,16 +1882,18 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          Function::new(ctx.clone(), |ctx: Ctx<'js>| Value::new_null(ctx))?,
       )?;
    }
+   let dialog_owner = plugin.to_owned();
    ui.set(
       "choose",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
-         choose_dialog(&ctx, &options)
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         choose_dialog(&ctx, &dialog_owner, &options)
       })?,
    )?;
+   let sheet_owner = plugin.to_owned();
    ui.set(
       "showSheet",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
-         sheet_dialog(&ctx, &options)
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         sheet_dialog(&ctx, &sheet_owner, &options)
       })?,
    )?;
    Ok(ui)
@@ -1665,6 +1903,7 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
 /// was dismissed.
 fn choose_dialog<'js>(
    ctx: &Ctx<'js>,
+   plugin: &str,
    options: &Object<'js>,
 ) -> rquickjs::Result<rquickjs::Promise<'js>> {
    let title = options.get::<_, Option<String>>("title")?;
@@ -1678,12 +1917,13 @@ fn choose_dialog<'js>(
    }
    let body = message.map(|text| ModalSection::Text { title: None, text });
    let title = title.unwrap_or_else(|| "Sunbird".to_owned());
-   in_background(ctx, move || answer(title, body, items))
+   in_background(ctx, plugin, move || answer(title, body, items))
 }
 
 /// `phoenix.ui.showSheet` as a native Mana modal with the code viewer.
 fn sheet_dialog<'js>(
    ctx: &Ctx<'js>,
+   plugin: &str,
    options: &Object<'js>,
 ) -> rquickjs::Result<rquickjs::Promise<'js>> {
    let title = options.get::<_, Option<String>>("title")?;
@@ -1702,7 +1942,7 @@ fn sheet_dialog<'js>(
       highlight,
    };
    let title = title.unwrap_or_else(|| "Sunbird".to_owned());
-   in_background(ctx, move || answer(title, Some(body), items))
+   in_background(ctx, plugin, move || answer(title, Some(body), items))
 }
 
 /// Opens a choose dialog and waits for the picked index, -1 when it is
@@ -1740,21 +1980,18 @@ fn parse_choice_options<'js>(options: &Object<'js>) -> rquickjs::Result<Vec<moda
       .collect())
 }
 
-/// Runs registered `phoenix.messages.onSend` hooks against the JSON payload
-/// of an outgoing `POST /channels/<channel_id>/messages` request on desktop.
+/// Runs a plugin command the message types out, then the
+/// `phoenix.messages.onSend` hooks, against the JSON payload of an outgoing
+/// `POST /channels/<channel_id>/messages` request on desktop.
 pub fn intercept_send_body(engine: &Engine, channel_id: &str, body: &[u8]) -> RequestAction {
    engine.with(|ctx| {
-      let Some(registry) = ctx.userdata::<Registry<'_>>() else {
-         return RequestAction::Pass;
-      };
-      let interceptors = registry
-         .interceptors
-         .borrow()
-         .iter()
-         .map(|(_, plugin, function)| (plugin.clone(), function.clone()))
-         .collect::<Vec<_>>();
-      drop(registry);
-      if interceptors.is_empty() {
+      let hooked = ctx
+         .userdata::<Registry<'_>>()
+         .is_some_and(|registry| !registry.interceptors.borrow().is_empty());
+      let commanded = ctx
+         .userdata::<Desktop<'_>>()
+         .is_some_and(|registry| !registry.commands.borrow().is_empty());
+      if !hooked && !commanded {
          return RequestAction::Pass;
       }
       let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(body) else {
@@ -1767,29 +2004,18 @@ pub fn intercept_send_body(engine: &Engine, channel_id: &str, body: &[u8]) -> Re
       else {
          return RequestAction::Pass;
       };
-      let Ok(argument) = Object::new(ctx.clone()) else {
-         return RequestAction::Pass;
+      let typed = match commands::typed(&original) {
+         Some((name, args)) => commands::run(&ctx, name, args, channel_id),
+         None => Outcome::Unknown,
       };
-      let _ = argument.set("channelId", channel_id);
-
-      let mut value = original.clone();
-      for (plugin, function) in interceptors {
-         restart_budget(&ctx);
-         match function
-            .call::<_, Value<'_>>((value.clone(), argument.clone()))
-            .catch(&ctx)
-         {
-            Ok(result) if result.as_bool() == Some(false) => {
-               return RequestAction::Drop;
-            },
-            Ok(result) => {
-               if let Some(text) = result.as_string().and_then(|text| text.to_string().ok()) {
-                  value = text;
-               }
-            },
-            Err(err) => log::error!("[{plugin}] onSend: {err}"),
-         }
-      }
+      let value = match typed {
+         Outcome::Unknown => original.clone(),
+         Outcome::Nothing => return RequestAction::Drop,
+         Outcome::Send(text) => text,
+      };
+      let Some(value) = intercept_text(&ctx, channel_id, value) else {
+         return RequestAction::Drop;
+      };
       if value == original {
          return RequestAction::Pass;
       }
@@ -1798,6 +2024,49 @@ pub fn intercept_send_body(engine: &Engine, channel_id: &str, body: &[u8]) -> Re
       }
       serde_json::to_vec(&payload).map_or(RequestAction::Pass, RequestAction::Replace)
    })
+}
+
+/// The context `onSend` hooks and commands get for a message to `channel_id`.
+pub fn send_context<'js>(ctx: &Ctx<'js>, channel_id: &str) -> rquickjs::Result<Object<'js>> {
+   let argument = Object::new(ctx.clone())?;
+   argument.set("channelId", channel_id)?;
+   argument.set("currentUserId", Value::new_null(ctx.clone()))?;
+   argument.set("reply", Function::new(ctx.clone(), String::new)?)?;
+   Ok(argument)
+}
+
+/// `text` after every `phoenix.messages.onSend` hook, or `None` when one
+/// cancels the send.
+pub fn intercept_text(ctx: &Ctx<'_>, channel_id: &str, text: String) -> Option<String> {
+   let interceptors = ctx.userdata::<Registry<'_>>().map_or_default(|registry| {
+      registry
+         .interceptors
+         .borrow()
+         .iter()
+         .map(|(_, plugin, function)| (plugin.clone(), function.clone()))
+         .collect::<Vec<_>>()
+   });
+   if interceptors.is_empty() {
+      return Some(text);
+   }
+   let argument = send_context(ctx, channel_id).ok()?;
+   let mut value = text;
+   for (plugin, function) in interceptors {
+      restart_budget(ctx);
+      match function
+         .call::<_, Value<'_>>((value.clone(), argument.clone()))
+         .catch(ctx)
+      {
+         Ok(result) if result.as_bool() == Some(false) => return None,
+         Ok(result) => {
+            if let Some(text) = result.as_string().and_then(|text| text.to_string().ok()) {
+               value = text;
+            }
+         },
+         Err(err) => log::error!("[{plugin}] onSend: {err}"),
+      }
+   }
+   Some(value)
 }
 
 /// Counts the handler toward the emoji unlock. Desktop has no picker presses
@@ -1824,8 +2093,70 @@ fn on_emoji_pick<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function
    })
 }
 
+fn on_sticker_pick<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   function: Function<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT: AtomicU64 = AtomicU64::new(0);
+
+   let id = NEXT.fetch_add(1, Ordering::Relaxed);
+   let registry = ctx
+      .userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .sticker_pickers
+      .borrow_mut()
+      .push((id, plugin.to_owned(), function));
+   sticker::set_active(true);
+   drop(registry);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut pickers = registry.sticker_pickers.borrow_mut();
+         pickers.retain(|(existing, ..)| *existing != id);
+         sticker::set_active(!pickers.is_empty());
+      }
+   })
+}
+
+/// Offers sticker `sticker_id`, chosen in `channel_id`, to the
+/// `onStickerPick` handlers, and whether one took it.
+pub fn pick_sticker(engine: &Engine, sticker_id: u64, channel_id: u64) -> bool {
+   engine.with(|ctx| {
+      let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+         return false;
+      };
+      let handlers = registry
+         .sticker_pickers
+         .borrow()
+         .iter()
+         .map(|(_, plugin, handler)| (plugin.clone(), handler.clone()))
+         .collect::<Vec<_>>();
+      drop(registry);
+      let Ok(context) = Object::new(ctx.clone()) else {
+         return false;
+      };
+      let _ = context.set("channelId", channel_id.to_string());
+      if let Ok(reply) = Function::new(ctx.clone(), String::new) {
+         let _ = context.set("reply", reply);
+      }
+      let id = sticker_id.to_string();
+      for (plugin, handler) in handlers {
+         restart_budget(&ctx);
+         match handler
+            .call::<_, Value<'_>>((id.as_str(), context.clone()))
+            .catch(&ctx)
+         {
+            Ok(taken) if taken.as_bool() == Some(true) => return true,
+            Ok(_) => {},
+            Err(err) => log::error!("[{plugin}] onStickerPick: {err}"),
+         }
+      }
+      false
+   })
+}
+
 /// `phoenix.ui.hideCount`, until the returned remover runs.
-#[cfg(target_arch = "x86_64")]
 fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result<Function<'js>> {
    static NEXT_HIDE: AtomicU64 = AtomicU64::new(1);
 
@@ -1852,10 +2183,35 @@ fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result
    })
 }
 
-/// macOS has no pending count locators yet, so the counts stay.
-#[cfg(not(target_arch = "x86_64"))]
-fn hide_count<'js>(ctx: &Ctx<'js>, _plugin: &str, _name: &str) -> rquickjs::Result<Function<'js>> {
-   noop_handle(ctx)
+/// `phoenix.ui.disableCallIdle`, until the returned remover runs.
+fn disable_call_idle<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   name: &str,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_HOLD: AtomicU64 = AtomicU64::new(1);
+
+   let timer = name.parse::<Timer>().map_err(|()| {
+      Exception::throw_type(
+         ctx,
+         &format!("unknown call idle timer {name:?}, expected \"dmCall\" or \"guildAfk\""),
+      )
+   })?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   let hold = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
+   let mut off = registry.idle_off.borrow_mut();
+   off.push((hold, plugin.to_owned(), timer));
+   call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut off = registry.idle_off.borrow_mut();
+      off.retain(|&(held, ..)| held != hold);
+      call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
+   })
 }
 
 pub fn on_send<'js>(

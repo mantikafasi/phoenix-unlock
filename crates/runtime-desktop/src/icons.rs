@@ -98,7 +98,6 @@ pub fn install(image: &Image<'static>) {
    if let Some(orig) = unsafe {
       crate::hook_sret::<AssetLoadFn>(
          image,
-         |pro| pro.asset_load,
          load,
          load_detour as *const () as usize,
          "desktop icons: asset loader hook failed",

@@ -356,7 +356,6 @@ pub mod arm64 {
       let Some(orig_name) = (unsafe {
          crate::hook::<NameProducerFn>(
             image,
-            |pro| pro.frame,
             header.name_producer,
             name_producer_detour as *const () as usize,
             "desktop headers: name producer hook failed",
@@ -368,7 +367,6 @@ pub mod arm64 {
       let Some(orig_child) = (unsafe {
          crate::hook::<ChildNodeFn>(
             image,
-            |pro| pro.frame,
             header.child_node,
             child_node_detour as *const () as usize,
             "desktop headers: child_node hook failed",

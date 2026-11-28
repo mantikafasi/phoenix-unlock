@@ -10,5 +10,3 @@ jobs:
       contents: write
       pull-requests: write
     uses: manic-systems/workflows/.github/workflows/auto-merge.yml@02fcd089a850e25bc6eff55f74db80c12b54391e # v2.3.4
-    with:
-      authors: dependabot[bot] sunbird-bot[bot]

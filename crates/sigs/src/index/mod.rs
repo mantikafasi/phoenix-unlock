@@ -11,6 +11,7 @@
 //! reference tables, calls and address loads, so each query is a binary
 //! search.
 
+pub mod flow;
 pub mod op;
 mod thumb;
 
@@ -32,6 +33,7 @@ pub use crate::index::op::{
 use crate::{
    Found,
    one,
+   registry::GatewayRegistry,
 };
 
 /// How far before a match a string literal can start. Rust merges literals
@@ -65,6 +67,7 @@ pub struct Index<'img> {
    base:      usize,
    tables:    OnceLock<Tables>,
    strs:      OnceLock<Vec<StrSlot>>,
+   registry:  OnceLock<Found<GatewayRegistry>>,
 }
 
 impl<'img> Index<'img> {
@@ -83,6 +86,7 @@ impl<'img> Index<'img> {
          base,
          tables: OnceLock::new(),
          strs: OnceLock::new(),
+         registry: OnceLock::new(),
       };
       index.add_leaves();
       index
@@ -170,6 +174,15 @@ impl<'img> Index<'img> {
       list.sort_unstable_by_key(|func| func.start);
       list.dedup_by_key(|func| func.start);
       Funcs { list }
+   }
+
+   /// The gateway registry, walked once (it scans the whole image).
+   pub fn registry(&self) -> Found<&GatewayRegistry> {
+      self
+         .registry
+         .get_or_init(|| GatewayRegistry::locate(self.image).map_err(|err| err.to_string()))
+         .as_ref()
+         .map_err(Clone::clone)
    }
 
    fn tables(&self) -> &Tables {
@@ -281,8 +294,7 @@ impl<'img> Index<'img> {
          part
             .iter()
             .filter(|&&(start, end)| {
-               let head = op::decode(self.image, self.isa, start, end.min(start + bytes));
-               keep(&head[..head.len().min(steps)])
+               keep(&op::decode_head(self.image, self.isa, start, end.min(start + bytes), steps))
             })
             .map(|&(start, _)| start)
             .collect::<Vec<_>>()
@@ -556,6 +568,12 @@ impl<'ix> Func<'ix> {
       op::decode(self.ix.image, self.ix.isa, self.start, self.end)
    }
 
+   /// The first `count` steps, decoding no further.
+   #[must_use]
+   pub fn head(&self, count: usize) -> Vec<Step> {
+      op::decode_head(self.ix.image, self.ix.isa, self.start, self.end, count)
+   }
+
    /// The functions this one calls, in instruction order, tail jumps
    /// included. On arm64 the outliner turns repeated sequences into a few
    /// frameless instructions ending in `b T` or `ret`: a call to one counts as
@@ -586,26 +604,70 @@ impl<'ix> Func<'ix> {
          .collect()
    }
 
-   fn through_outlined(&self, target: usize) -> Option<usize> {
-      const MOST: usize = 6;
-      if self.ix.isa != Isa::Aarch64 {
-         return Some(target);
-      }
-      let Some(callee) = self.ix.function(target) else {
-         return Some(target);
-      };
-      if callee.size() > MOST * 4 {
-         return Some(target);
-      }
-      for step in op::decode(self.ix.image, self.ix.isa, target, callee.end) {
-         match step.op {
-            Op::Jump(tail) => return Some(tail),
-            Op::Ret => return None,
-            Op::Call(_) | Op::Branch(_) => return Some(target),
-            _ => {},
+   pub(crate) fn through_outlined(&self, target: usize) -> Option<usize> {
+      self.outlined(target, 6).map_or(Some(target), |stub| {
+         match stub.last().map(|step| step.op) {
+            Some(Op::Jump(tail)) => Some(tail),
+            _ => None,
          }
+      })
+   }
+
+   /// The steps of the arm64 outlined stub of at most `most` instructions at
+   /// `target`, through its closing `b T` or `ret`, or `None` when `target` is
+   /// a function of its own.
+   pub(crate) fn outlined(&self, target: usize, most: usize) -> Option<Vec<Step>> {
+      if self.ix.isa != Isa::Aarch64 {
+         return None;
       }
-      Some(target)
+      let callee = self.ix.function(target)?;
+      if callee.size() > most * 4 {
+         return None;
+      }
+      let mut steps = op::decode(self.ix.image, self.ix.isa, target, callee.end);
+      let end = steps
+         .iter()
+         .position(|step| matches!(step.op, Op::Jump(_) | Op::Ret | Op::Call(_) | Op::Branch(_)))?;
+      if !matches!(steps[end].op, Op::Jump(_) | Op::Ret) {
+         return None;
+      }
+      steps.truncate(end + 1);
+      Some(steps)
+   }
+
+   /// [`Func::steps`] with each arm64 outlined stub's instructions in place of
+   /// the call or tail jump to it. A stub a call reaches that ends in `b T`
+   /// becomes a call to `T`, and one ending in `ret` returns to the caller.
+   /// macOS setters open with a 7-instruction stub saving their arguments.
+   #[must_use]
+   pub fn flat_steps(&self) -> Vec<Step> {
+      const MOST: usize = 12;
+      let mut flat = Vec::new();
+      for step in self.steps() {
+         let (target, called) = match step.op {
+            Op::Call(target) => (target, true),
+            Op::Jump(target) if !(self.start..self.end).contains(&target) => (target, false),
+            _ => {
+               flat.push(step);
+               continue;
+            },
+         };
+         let Some(mut stub) = self.outlined(target, MOST) else {
+            flat.push(step);
+            continue;
+         };
+         if let Some(last) = stub.last_mut() {
+            match last.op {
+               Op::Jump(tail) if called => last.op = Op::Call(tail),
+               Op::Ret if called => {
+                  stub.pop();
+               },
+               _ => {},
+            }
+         }
+         flat.extend(stub);
+      }
+      flat
    }
 
    /// The addresses this function loads, in instruction order.

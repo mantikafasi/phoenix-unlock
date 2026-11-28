@@ -28,6 +28,7 @@ impl Engine {
          let Some((resolve, reject)) = ctx
             .userdata::<Registry<'_>>()
             .and_then(|registry| registry.pending.borrow_mut().remove(&id))
+            .map(|(_, resolve, reject)| (resolve, reject))
          else {
             return;
          };
@@ -88,9 +89,10 @@ pub enum Settlement {
 
 /// Runs `work` on its own thread and returns a promise it settles. The
 /// resolvers stay in the registry, since JS values cannot leave the thread
-/// that holds the engine.
+/// that holds the engine, under `owner` so unloading it drops them.
 pub fn in_background<'js>(
    ctx: &Ctx<'js>,
+   owner: &str,
    work: impl FnOnce() -> Settlement + Send + 'static,
 ) -> rquickjs::Result<rquickjs::Promise<'js>> {
    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -101,7 +103,7 @@ pub fn in_background<'js>(
       .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?
       .pending
       .borrow_mut()
-      .insert(id, (resolve, reject));
+      .insert(id, (owner.to_owned(), resolve, reject));
    std::thread::spawn(move || {
       let settlement = work();
       if let Some(engine) = crate::engine() {

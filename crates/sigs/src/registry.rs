@@ -1,8 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{
+   BTreeMap,
+   HashMap,
+   HashSet,
+};
 
 use phoenix_hook::image::Image;
 
-use crate::GATEWAY_HANDLER_FIELD;
+use crate::{
+   Found,
+   GATEWAY_HANDLER_FIELD,
+   index::{
+      Isa,
+      Op,
+      Reg,
+      Value,
+      op,
+   },
+};
 
 /// Every Phoenix build has this event, so its entry seeds the walk.
 const SEED: &str = "MESSAGE_CREATE";
@@ -116,6 +130,131 @@ impl GatewayRegistry {
          .enumerate()
          .map(|(index, entry)| (EventId(index), entry))
    }
+
+   /// The first word of a handler's `Ok`, the constant most handlers store
+   /// through the hidden return pointer. Its niche moves between builds, and
+   /// an `Ok` Phoenix reads as `Err` crashes it.
+   pub fn ok_word(&self, image: &Image<'_>, isa: Isa) -> Found<u64> {
+      let functions = image.functions();
+      let mut votes = BTreeMap::<u64, usize>::new();
+      let handlers = self
+         .entries
+         .iter()
+         .map(|entry| {
+            // Thumb handler pointers carry bit 0.
+            if matches!(isa, Isa::Thumb2) { entry.handler & !1 } else { entry.handler }
+         })
+         .collect::<HashSet<usize>>();
+      for handler in handlers {
+         let at = functions.partition_point(|&(start, _)| start <= handler);
+         let Some(&(start, end)) = at.checked_sub(1).map(|at| &functions[at]) else {
+            continue;
+         };
+         if start != handler {
+            continue;
+         }
+         for word in stored_results(&op::decode(image, isa, start, end), isa) {
+            *votes.entry(word).or_default() += 1;
+         }
+      }
+      let mut ranked = votes.into_iter().collect::<Vec<(u64, usize)>>();
+      ranked.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+      match ranked[..] {
+         [] => Err("no handler stores a constant result".to_owned()),
+         [(word, count), (other, next), ..] if count < 2 * next => Err(format!(
+            "handler results split between {word:#x} ({count}) and {other:#x} ({next})"
+         )),
+         [(word, _), ..] => Ok(word),
+      }
+   }
+}
+
+/// The distinct pointer-sized constants `steps` store at offset 0 of the value
+/// the hidden return pointer points at, following the pointer through moves
+/// and stack spills.
+fn stored_results(steps: &[op::Step], isa: Isa) -> HashSet<u64> {
+   let width = if matches!(isa, Isa::Thumb2) { 4 } else { 8 };
+   let sp = isa.sp();
+   let mut sret = HashSet::from([isa.sret()]);
+   let mut spilled = HashSet::<isize>::new();
+   let mut imms = HashMap::<Reg, u64>::new();
+   let mut words = HashSet::new();
+   let forget = |reg: Reg, sret: &mut HashSet<Reg>, imms: &mut HashMap<Reg, u64>| {
+      sret.remove(&reg);
+      imms.remove(&reg);
+   };
+   for step in steps {
+      match step.op {
+         Op::Imm { reg, value } => {
+            sret.remove(&reg);
+            imms.insert(reg, value);
+         },
+         Op::Move { dst, src } => {
+            let (is_sret, imm) = (sret.contains(&src), imms.get(&src).copied());
+            forget(dst, &mut sret, &mut imms);
+            if is_sret {
+               sret.insert(dst);
+            }
+            if let Some(imm) = imm {
+               imms.insert(dst, imm);
+            }
+         },
+         Op::Store {
+            value: Value::Reg(reg),
+            base,
+            offset,
+            size,
+         } if base == sp && size == width => {
+            if sret.contains(&reg) {
+               spilled.insert(offset);
+            } else {
+               spilled.remove(&offset);
+            }
+         },
+         Op::Store {
+            value,
+            base,
+            offset: 0,
+            size,
+         } if size == width && sret.contains(&base) => {
+            let word = match value {
+               Value::Imm(word) => Some(word),
+               Value::Reg(reg) => imms.get(&reg).copied(),
+            };
+            words.extend(word);
+         },
+         Op::StorePair {
+            values: [first, _],
+            base,
+            offset: 0,
+            size,
+         } if size == width && sret.contains(&base) => words.extend(imms.get(&first).copied()),
+         Op::Load {
+            reg,
+            base,
+            offset,
+            size,
+         } => {
+            forget(reg, &mut sret, &mut imms);
+            if base == sp && size == width && spilled.contains(&offset) {
+               sret.insert(reg);
+            }
+         },
+         Op::Offset { reg, .. } => forget(reg, &mut sret, &mut imms),
+         Op::LoadPair { regs, .. } => {
+            for reg in regs {
+               forget(reg, &mut sret, &mut imms);
+            }
+         },
+         Op::Call(_) => {
+            let clobbered = isa.caller_saved();
+            sret.retain(|&reg| clobbered & (1 << reg) == 0);
+            imms.retain(|&reg, _| clobbered & (1 << reg) == 0);
+         },
+         _ => {},
+      }
+   }
+   words
 }
 
 /// Finds the primary event table(s) containing [`SEED`]. Supports both a

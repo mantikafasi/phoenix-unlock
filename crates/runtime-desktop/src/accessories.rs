@@ -19,15 +19,8 @@ use std::{
    },
 };
 
-use phoenix_hook::{
-   image::Image,
-   x86::Abi,
-};
+use phoenix_hook::image::Image;
 use phoenix_sigs::{
-   desktop::{
-      Prologue,
-      Prologues,
-   },
    index::Index,
    locate::{
       message::{
@@ -275,7 +268,6 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    let Some(orig) = (unsafe {
       crate::hook::<RenderRowFn>(
          image,
-         |pro| pro.row,
          render_row,
          render_row_detour as *const () as usize,
          "desktop accessories: MessageRow hook failed",
@@ -309,11 +301,6 @@ fn install_body_tint(image: &Image<'static>, ix: &Index<'_>, render_row: usize) 
    let (body_fn, msg_id_off) = (body.func, body.message_id);
    BODY_MSG_ID_OFFSET.store(msg_id_off, Ordering::Release);
    ROW_COLORS_OFFSET.store(colors_off, Ordering::Release);
-   let pick: fn(Prologues) -> Prologue = if Prologues::of(Abi::of(image)).row.at(image, body_fn) {
-      |pro| pro.row
-   } else {
-      |pro| pro.frame
-   };
 
    // SAFETY: runs from `prepare` before Discord threads execute;
    // `build_body_detour` matches `build_message_body`'s verified 6-argument
@@ -321,7 +308,6 @@ fn install_body_tint(image: &Image<'static>, ix: &Index<'_>, render_row: usize) 
    let Some(orig) = (unsafe {
       crate::hook::<BuildMessageBodyFn>(
          image,
-         pick,
          body_fn,
          build_body_detour as *const () as usize,
          "desktop accessories: message body tint hook failed",
@@ -480,7 +466,6 @@ pub fn install_optimistic_delete(image: &Image<'static>, ix: &Index<'_>) {
       let Some(orig) = (unsafe {
          crate::hook::<OptimisticDeleteFn>(
             image,
-            |pro| pro.frame,
             func,
             DETOURS[index] as *const () as usize,
             "desktop accessories: optimistic delete hook failed",
@@ -617,7 +602,6 @@ mod arm64 {
       let Some(orig) = (unsafe {
          crate::hook::<RenderFn>(
             image,
-            |pro| pro.frame,
             row.func,
             detour as *const () as usize,
             "desktop accessories: MessageRow hook failed",
@@ -664,7 +648,6 @@ mod arm64 {
       let Some(orig) = (unsafe {
          crate::hook::<BodyFn>(
             image,
-            |pro| pro.frame,
             func,
             body_detour as *const () as usize,
             "desktop accessories: message body tint hook failed",

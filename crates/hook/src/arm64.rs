@@ -649,73 +649,19 @@ pub fn absolute_jump(to: usize) -> [u8; JUMP_LEN] {
    jump
 }
 
-/// `ldr x3, #16; ldr x16, #20; br x16; nop; .quad fallback; .quad detour`:
-/// jumps to `detour` with `fallback` in `x3`, preserving `x0..=x2`.
+/// `ldr x3, #16; ldr x3, [x3]; ldr x16, #16; br x16; .quad slot; .quad
+/// detour`: jumps to `detour` with the word at `slot` in `x3`, preserving
+/// `x0..=x2`.
 #[must_use]
-pub fn pass_x3_stub(detour: usize, fallback: usize) -> [u8; 32] {
+pub fn pass_x3_stub(detour: usize, slot: usize) -> [u8; 32] {
    let mut stub = [0; 32];
    stub[..4].copy_from_slice(&0x5800_0083u32.to_le_bytes());
-   stub[4..8].copy_from_slice(&0x5800_00B0u32.to_le_bytes());
-   stub[8..12].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
-   stub[12..16].copy_from_slice(&0xD503_201Fu32.to_le_bytes());
-   stub[16..24].copy_from_slice(&(fallback as u64).to_le_bytes());
+   stub[4..8].copy_from_slice(&0xF940_0063u32.to_le_bytes());
+   stub[8..12].copy_from_slice(&0x5800_0090u32.to_le_bytes());
+   stub[12..16].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
+   stub[16..24].copy_from_slice(&(slot as u64).to_le_bytes());
    stub[24..32].copy_from_slice(&(detour as u64).to_le_bytes());
    stub
-}
-
-/// `code`, the instructions displaced from `from`, rewritten to run anywhere:
-/// PC-relative ones load or branch to their absolute target through `x16`
-/// instead. `None` when one can't be moved, like a literal load.
-#[must_use]
-pub fn relocate(code: &[u8], from: usize) -> Option<Vec<u8>> {
-   const LDR_X16_8: u32 = 0x5800_0050;
-   const BR_X16: u32 = 0xD61F_0200;
-   const SKIP_LITERAL: u32 = 0x1400_0003;
-
-   let mut out = Vec::new();
-   let mut words = |words: &[u32]| words.iter().for_each(|word| out.extend(word.to_le_bytes()));
-   for (at, &raw) in code.as_chunks::<4>().0.iter().enumerate() {
-      let pc = from + at * 4;
-      let word = u32::from_le_bytes(raw);
-      let quad = |value: usize| {
-         let bytes = (value as u64).to_le_bytes();
-         [
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-         ]
-      };
-      // Conditional branches keep their condition and land on a local veneer
-      // two words on: `cond +8; b past; ldr x16, #8; br x16; .quad target`.
-      let veneer = |word: u32, target: usize| {
-         let [low, high] = quad(target);
-         [word, 0x1400_0005, LDR_X16_8, BR_X16, low, high]
-      };
-      match decode(word, pc) {
-         Insn::Adrp { rd, page: target } => {
-            let [low, high] = quad(target);
-            words(&[0x5800_0040 | u32::from(rd), SKIP_LITERAL, low, high]);
-         },
-         Insn::B { target } => {
-            let [low, high] = quad(target);
-            words(&[LDR_X16_8, BR_X16, low, high]);
-         },
-         Insn::Bl { target } => {
-            // `ldr x16, #12; blr x16; b past; .quad target`.
-            let [low, high] = quad(target);
-            words(&[0x5800_0070, 0xD63F_0200, SKIP_LITERAL, low, high]);
-         },
-         Insn::BCond { target, .. } | Insn::Cbz { target, .. } => {
-            words(&veneer((word & 0xFF00_001F) | (2 << 5), target));
-         },
-         Insn::Tbz { target, .. } => words(&veneer((word & 0xFFF8_001F) | (2 << 5), target)),
-         // `adr` and literal loads.
-         _ if word & 0x9F00_0000 == 0x1000_0000 || word & 0x3B00_0000 == 0x1800_0000 => {
-            return None;
-         },
-         _ => words(&[word]),
-      }
-   }
-   Some(out)
 }
 
 /// `mov xd, xm`.
@@ -773,35 +719,120 @@ pub fn sret_callee(detour: usize) -> Vec<u8> {
    code
 }
 
+/// The argument registers an [`observe_stub`] saves for its observer, as they
+/// were on entry.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C)]
+pub struct Regs {
+   /// `x0` to `x8`, `x8` holding the return slot of a large return.
+   pub x:   [u64; 9],
+   /// `x30`, the caller's return address.
+   pub ret: u64,
+   pub v:   [u128; 8],
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Regs {
+   /// The first four integer arguments, `x0` to `x3`.
+   #[must_use]
+   pub const fn args(&self) -> [u64; 4] {
+      [self.x[0], self.x[1], self.x[2], self.x[3]]
+   }
+}
+
+/// Called on every entry of an observed function, on the caller's thread,
+/// with the context passed to [`observe`]. It must not unwind.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub type Observer = extern "C" fn(ctx: usize, regs: &Regs);
+
+/// Code that saves `x0` to `x8`, `x30` and `q0` to `q7` as a `Regs`, calls
+/// `observer(ctx, &regs)`, restores them and jumps to the word at `slot`.
+#[must_use]
+pub fn observe_stub(observer: usize, ctx: usize, slot: usize) -> Vec<u8> {
+   const FRAME: u32 = 0xD0;
+   const NOP: u32 = 0xD503_201F;
+   let pair = |base: u32, scale: u32, first: u32, second: u32, at: u32| {
+      base | ((at / scale) & 0x7F) << 15 | second << 10 | 31 << 5 | first
+   };
+   let pairs = |gpr: u32, simd: u32| {
+      let gprs = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 30)]
+         .into_iter()
+         .zip((0..).step_by(16))
+         .map(move |((first, second), at)| pair(gpr, 8, first, second, at));
+      let simds = [(0, 1), (2, 3), (4, 5), (6, 7)]
+         .into_iter()
+         .zip((80..).step_by(32))
+         .map(move |((first, second), at)| pair(simd, 16, first, second, at));
+      gprs.chain(simds).collect::<Vec<u32>>()
+   };
+   let literal = |at: usize, pool: usize, index: usize, reg: u32| {
+      let words = u32::try_from(pool + index * 2 - at).unwrap_or(0);
+      0x5800_0000 | words << 5 | reg
+   };
+   let mut words = vec![0xD100_03FF | FRAME << 10];
+   words.extend(pairs(0xA900_0000, 0xAD00_0000));
+   let calls_at = words.len();
+   words.extend([0, 0x9100_03E1, 0, 0xD63F_0200]);
+   words.extend(pairs(0xA940_0000, 0xAD40_0000));
+   words.push(0x9100_03FF | FRAME << 10);
+   let jumps_at = words.len();
+   words.extend([0, 0xF940_0210, 0xD61F_0200]);
+   if words.len() % 2 == 1 {
+      words.push(NOP);
+   }
+   let pool = words.len();
+   words[calls_at] = literal(calls_at, pool, 0, 0);
+   words[calls_at + 2] = literal(calls_at + 2, pool, 1, 16);
+   words[jumps_at] = literal(jumps_at, pool, 2, 16);
+   let mut code = words
+      .iter()
+      .flat_map(|word| word.to_le_bytes())
+      .collect::<Vec<u8>>();
+   for word in [ctx, observer, slot] {
+      code.extend((word as u64).to_le_bytes());
+   }
+   code
+}
+
+/// Makes every call to the function at `addr` run `observer(ctx, regs)` first,
+/// then the function unchanged, through a sunhook entry hook.
+///
+/// # Safety
+///
+/// `addr` starts a function.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub unsafe fn observe(
+   image: &Image<'static>,
+   addr: usize,
+   observer: Observer,
+   ctx: usize,
+) -> Result<crate::Observed, crate::Error> {
+   use std::sync::atomic::AtomicPtr;
+
+   let slot = Box::leak(Box::new(AtomicPtr::new(std::ptr::null_mut())));
+   let stub = crate::image::jit_copy(&observe_stub(
+      observer as usize,
+      ctx,
+      std::ptr::from_ref(slot).addr(),
+   ))
+   .ok_or_else(|| {
+      crate::Error::Attach {
+         backend: "observe",
+         target:  addr,
+         message: "no memory for the stub".to_owned(),
+      }
+   })?;
+   let (target, stub) = image.hook_targets(addr, stub)?;
+   // SAFETY: forwarded from the caller, the stub keeps the function's
+   // arguments, and sunhook fills `slot` before the jump to the stub is
+   // written.
+   let hook = unsafe { crate::Inline::attach_into(target, stub, slot) }?;
+   Ok(crate::Observed { addr, hook })
+}
+
 #[cfg(test)]
 mod tests {
    use super::*;
-
-   #[test]
-   fn relocates_branches_to_their_absolute_targets() {
-      // bl +0x100 at 0x1000, then a plain `mov x29, sp`.
-      let code = [0x9400_0040u32, 0x9100_03FD]
-         .iter()
-         .flat_map(|word| word.to_le_bytes())
-         .collect::<Vec<u8>>();
-      let moved = relocate(&code, 0x1000).expect("movable");
-      let words = moved
-         .as_chunks::<4>()
-         .0
-         .iter()
-         .map(|&word| u32::from_le_bytes(word))
-         .collect::<Vec<u32>>();
-      assert_eq!(words, [
-         0x5800_0070,
-         0xD63F_0200,
-         0x1400_0003,
-         0x1100,
-         0,
-         0x9100_03FD
-      ]);
-      // `adr x0, #0` has no absolute form here.
-      assert_eq!(relocate(&0x1000_0000u32.to_le_bytes(), 0), None);
-   }
 
    #[test]
    fn sret_thunks_reach_their_targets() {

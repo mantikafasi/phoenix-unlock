@@ -118,6 +118,11 @@ pub trait Platform: Sync {
       false
    }
 
+   /// How the user gets a newer loader when [`Self::updates_loader`] is false.
+   fn loader_update_hint(&self) -> &'static str {
+      "restart Sunbird to update"
+   }
+
    /// Installs the site's loader `version`, with `update`'s plugins, and
    /// releases `slot` when done.
    fn update_loader(&self, _slot: Slot, _version: &str, _update: &Update) {}

@@ -3,6 +3,7 @@
 
 use std::{
    ffi::c_void,
+   io,
    ptr,
 };
 
@@ -20,6 +21,7 @@ const WINHTTP_ADDREQ_FLAG_ADD: u32 = 0x2000_0000;
 const WINHTTP_ADDREQ_FLAG_REPLACE: u32 = 0x8000_0000;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+const WINHTTP_OPTION_IPV6_FAST_FALLBACK: u32 = 140;
 const INTERNET_SCHEME_HTTP: i32 = 1;
 const INTERNET_SCHEME_HTTPS: i32 = 2;
 
@@ -59,6 +61,7 @@ unsafe extern "system" {
       send: i32,
       receive: i32,
    ) -> i32;
+   fn WinHttpSetOption(handle: *mut c_void, option: u32, buffer: *const c_void, len: u32) -> i32;
    fn WinHttpCrackUrl(
       url: *const u16,
       url_len: u32,
@@ -113,6 +116,20 @@ unsafe extern "system" {
    ) -> i32;
 }
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+   fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+   fn FormatMessageW(
+      flags: u32,
+      source: *const c_void,
+      id: u32,
+      language: u32,
+      buffer: *mut u16,
+      size: u32,
+      args: *const c_void,
+   ) -> u32;
+}
+
 struct Handle(*mut c_void);
 
 impl Drop for Handle {
@@ -131,8 +148,42 @@ fn wide(text: &str) -> Vec<u16> {
 fn os_err(url: &str, context: &str) -> FetchError {
    FetchError::Platform {
       url:     url.to_owned(),
-      message: format!("{context}: {}", std::io::Error::last_os_error()),
+      message: format!("{context}: {}", last_error()),
    }
+}
+
+/// The thread's last error. `WinHTTP` words its codes (12000 to 12999) in the message table of
+/// `winhttp.dll`, which `io::Error` never reads.
+fn last_error() -> String {
+   const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x0200;
+   const FORMAT_MESSAGE_FROM_HMODULE: u32 = 0x0800;
+
+   let err = io::Error::last_os_error();
+   let Some(code) = err.raw_os_error().filter(|code| (12000..13000).contains(code)) else {
+      return err.to_string();
+   };
+   let module = wide("winhttp.dll");
+   let mut text = [0u16; 512];
+   // SAFETY: winhttp.dll is linked so the module handle is live, and `text` holds the 512 units
+   // passed as its size.
+   let len = unsafe {
+      FormatMessageW(
+         FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_IGNORE_INSERTS,
+         GetModuleHandleW(module.as_ptr()),
+         code.cast_unsigned(),
+         0,
+         text.as_mut_ptr(),
+         512,
+         ptr::null(),
+      )
+   };
+   text
+      .get(..len as usize)
+      .filter(|words| !words.is_empty())
+      .map_or_else(
+         || err.to_string(),
+         |words| format!("{} (os error {code})", String::from_utf16_lossy(words).trim_end()),
+      )
 }
 
 #[expect(
@@ -209,6 +260,17 @@ pub fn send(request: &Request) -> Result<Response, FetchError> {
    // SAFETY: `session.0` is a live session handle.
    unsafe {
       WinHttpSetTimeouts(session.0, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS);
+   }
+   let fast_fallback = 1u32;
+   // Older Windows rejects the option, so the result is ignored.
+   // SAFETY: `session.0` is a live session handle and `fast_fallback` is a 4-byte BOOL.
+   unsafe {
+      WinHttpSetOption(
+         session.0,
+         WINHTTP_OPTION_IPV6_FAST_FALLBACK,
+         (&raw const fast_fallback).cast(),
+         4,
+      );
    }
 
    // SAFETY: `host_buf` is NUL-terminated UTF-16.

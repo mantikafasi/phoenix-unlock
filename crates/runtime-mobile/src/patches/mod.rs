@@ -136,6 +136,11 @@ pub struct Contribution {
 pub enum Place {
    Screen,
    Message(String),
+   /// A row with no message id, `offset` message rows after `anchor`'s.
+   MessageNear {
+      anchor: String,
+      offset: i32,
+   },
    User(Option<String>),
    /// A DM, whose one recipient member decorations are about.
    Channel(String),
@@ -317,10 +322,18 @@ pub struct Draft {
 }
 
 impl Draft {
+   /// Drops `WPatch` props, which index the words table of the batch the
+   /// template came in, and the iOS host rejects the whole batch when one
+   /// points elsewhere.
    fn from_node(node: &Node) -> Self {
       Self {
          kind:  node.kind.clone(),
-         props: node.props.clone(),
+         props: node
+            .props
+            .iter()
+            .filter(|(_, value)| !matches!(value, Value::WPatch { .. }))
+            .cloned()
+            .collect(),
          kids:  node.kids.iter().map(Self::from_node).collect(),
          press: None,
          src:   node.src,
@@ -381,6 +394,7 @@ struct Patches {
    commands:       Vec<Command>,
    interceptors:   usize,
    pickers:        usize,
+   sticker_picks:  usize,
    event_hooks:    Vec<EventHookMeta>,
    node_watchers:  Vec<NodeWatcher>,
    prop_rules:     Vec<PropPatch>,
@@ -672,6 +686,15 @@ pub fn set_emoji_pickers(count: usize) {
    }
    patches().pickers = count;
    emoji::unlock(count > 0);
+}
+
+/// How many `onStickerPick` handlers plugins hold, so sticker presses in the
+/// picker are taken only while one exists.
+pub fn set_sticker_pickers(count: usize) {
+   if count > 0 {
+      ACTIVE.store(true, Ordering::Release);
+   }
+   patches().sticker_picks = count;
 }
 
 /// Drops everything `plugin` added.

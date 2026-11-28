@@ -109,7 +109,10 @@ fn press(pressed: Press) {
          if let (Some(plugin), Some(source)) = (plugin(index), draft) {
             match phoenix_runtime::save_source(&plugin.name, source) {
                Ok(()) => log::info!("saved {} and restarted it", plugin.name),
-               Err(err) => log::error!("saving {} failed: {err}", plugin.name),
+               Err(err) => {
+                  log::error!("saving {} failed: {err}", plugin.name);
+                  let _ = crate::picker::toast(&err.to_string());
+               },
             }
          }
       },

@@ -73,7 +73,7 @@ struct Curl {
 /// # Safety
 ///
 /// `T` must be the C function pointer type of the symbol `name`.
-unsafe fn sym<T>(lib: *mut c_void, name: &CStr) -> Option<T> {
+pub unsafe fn sym<T>(lib: *mut c_void, name: &CStr) -> Option<T> {
    const { assert!(size_of::<T>() == size_of::<*mut c_void>()) };
    // SAFETY: `lib` is a live `dlopen` handle and `name` is NUL-terminated.
    let found = unsafe { libc::dlsym(lib, name.as_ptr()) };

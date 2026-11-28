@@ -420,7 +420,6 @@ mod arm64 {
       if let Some(orig) = unsafe {
          crate::hook_sret::<NameChildFn>(
             image,
-            |pro| pro.frame,
             row.name_closure,
             member_name_detour as *const () as usize,
             "desktop members: member name hook failed",
@@ -443,7 +442,6 @@ mod arm64 {
       let hooked = unsafe {
          let Some(orig_row) = crate::hook_sret::<DmRowFn>(
             image,
-            |pro| pro.frame,
             row.func,
             dm_row_detour as *const () as usize,
             "desktop members: DM row hook failed",
@@ -453,7 +451,6 @@ mod arm64 {
          let _ = ORIG_DM_ROW.set(orig_row);
          let Some(orig_box) = crate::hook_sret::<DmNameBoxFn>(
             image,
-            |pro| pro.frame,
             row.name_box,
             dm_name_box_detour as *const () as usize,
             "desktop members: DM name box hook failed",
@@ -463,7 +460,6 @@ mod arm64 {
          let _ = ORIG_DM_NAME_BOX.set(orig_box);
          let Some(orig_child) = crate::hook_sret::<NameChildFn>(
             image,
-            |pro| pro.frame,
             row.div_child_any,
             div_child_any_detour as *const () as usize,
             "desktop members: DM child hook failed",

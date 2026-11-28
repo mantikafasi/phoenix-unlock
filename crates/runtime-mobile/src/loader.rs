@@ -36,19 +36,21 @@ const UPDATE_APK: &str = "phoenix-update.apk";
 /// overwrites what the other handed to the installer.
 pub const DISCORD_UPDATE_APK: &str = "discord-update.apk";
 
+/// Named as `loader_crcs` lists it, without the `plugins/` prefix.
 const LOADER_ASSET: &str = if cfg!(target_arch = "x86_64") {
-   "plugins/libphoenix-x86_64.so"
+   "libphoenix-x86_64.so"
 } else if cfg!(target_arch = "arm") {
-   "plugins/libphoenix-armv7.so"
+   "libphoenix-armv7.so"
 } else {
-   "plugins/libphoenix-arm64.so"
+   "libphoenix-arm64.so"
 };
+const ELF: &[u8] = b"\x7fELF";
 
 /// Stages `update`'s plugins for loader `version`, then installs it.
 pub fn install(slot: Slot, version: &str, update: &Update) {
    slot.step("Downloading plugins...");
    let _ = update::stage_plugins(version, update);
-   run_loader_self_update(slot);
+   run_loader_self_update(slot, || listed(version, update));
 }
 
 /// Runs the in-app loader self-update directly against the site's current
@@ -58,11 +60,11 @@ pub fn self_update_from_site() {
       log::info!("self-update: already running");
       return;
    };
-   thread::spawn(move || run_loader_self_update(slot));
+   thread::spawn(move || run_loader_self_update(slot, download));
 }
 
-fn run_loader_self_update(slot: Slot) {
-   match self_update(&slot) {
+fn run_loader_self_update(slot: Slot, loader: impl FnOnce() -> Result<patcher::Library, String>) {
+   match self_update(&slot, loader) {
       Ok(()) => slot.finish(None),
       Err(message) => {
          log::error!("self-update: {message}");
@@ -72,11 +74,14 @@ fn run_loader_self_update(slot: Slot) {
    }
 }
 
-fn self_update(slot: &Slot) -> Result<(), String> {
+fn self_update(
+   slot: &Slot,
+   loader: impl FnOnce() -> Result<patcher::Library, String>,
+) -> Result<(), String> {
    slot.step("Downloading loader...");
    let _ = crate::picker::toast("Downloading Sunbird update...");
 
-   let loader = download()?;
+   let loader = loader()?;
    let base = crate::host::base_apk().map_err(|err| format!("Self-update failed: {err}"))?;
    if installed_from_splits(&base) {
       let _ = crate::picker::open(update::SITE);
@@ -90,14 +95,26 @@ fn self_update(slot: &Slot) -> Result<(), String> {
    crate::install::open(&path).map_err(|err| format!("Self-update failed: {err}"))
 }
 
-/// The site's loader for this phone's ABI.
+/// The loader for `version`, which a release landing after the check replaces
+/// on the site.
+fn listed(version: &str, update: &Update) -> Result<patcher::Library, String> {
+   let bytes = update::download_loader(LOADER_ASSET, ELF, version, update)
+      .map_err(|err| format!("Download failed: {err}"))?;
+   library(bytes)
+}
+
+/// The site's loader for this phone's ABI, whatever version it is.
 pub fn download() -> Result<patcher::Library, String> {
-   let url = format!("{}{LOADER_ASSET}", update::ASSETS);
+   let url = format!("{}plugins/{LOADER_ASSET}", update::ASSETS);
    let bytes =
       phoenix_runtime::fetch::get(&url).map_err(|err| format!("Download failed: {err}"))?;
-   if !bytes.starts_with(b"\x7fELF") || memmem::find(&bytes, b"phoenix-version:").is_none() {
+   if !bytes.starts_with(ELF) || memmem::find(&bytes, b"phoenix-version:").is_none() {
       return Err("Downloaded loader is invalid".to_owned());
    }
+   library(bytes)
+}
+
+fn library(bytes: Vec<u8>) -> Result<patcher::Library, String> {
    patcher::Library::new(patcher::LOADER, bytes)
       .map_err(|err| format!("Downloaded loader is invalid: {err}"))
 }

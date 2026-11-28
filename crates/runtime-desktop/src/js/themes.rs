@@ -54,18 +54,28 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
       Function::new(
          ctx.clone(),
          |ctx: Ctx<'js>| -> rquickjs::Result<Array<'js>> {
-            let active = ACTIVE
+            let active = match ACTIVE
                .lock()
                .unwrap_or_else(PoisonError::into_inner)
                .as_ref()
-               .and_then(|(_, file)| file.clone());
+            {
+               Some((_, file)) => file.clone(),
+               None => crate::mana_theme::active_file(),
+            };
             let arr = Array::new(ctx.clone())?;
             for (i, theme) in gpui_theme::list(&themes_dir()).into_iter().enumerate() {
                let item = Object::new(ctx.clone())?;
                item.set("active", active.as_deref() == Some(theme.file.as_str()))?;
                item.set("id", theme.file)?;
                item.set("name", theme.name)?;
-               item.set("authors", Array::new(ctx.clone())?)?;
+               if let Some(description) = theme.description {
+                  item.set("description", description)?;
+               }
+               let authors = Array::new(ctx.clone())?;
+               if let Some(author) = theme.author {
+                  authors.set(0, author)?;
+               }
+               item.set("authors", authors)?;
                arr.set(i, item)?;
             }
             Ok(arr)
@@ -76,14 +86,15 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
    themes.set(
       "apply",
       Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: String| {
-         // Only files inside the themes folder.
-         let path = themes_dir().join(&id);
-         if id.contains(['/', '\\', ':']) || !path.is_file() {
-            return Err(Exception::throw_message(&ctx, &format!("no theme {id}")));
+         let dir = themes_dir();
+         if !crate::mana_theme::is_supported() {
+            return Err(Exception::throw_message(
+               &ctx,
+               "themes are not supported on this build",
+            ));
          }
-         let css = std::fs::read_to_string(&path)
-            .map_err(|err| Exception::throw_message(&ctx, &format!("reading {id}: {err}")))?;
-         gpui_theme::set_css(&css);
+         crate::mana_theme::apply_file(&dir, &id)
+            .map_err(|err| Exception::throw_message(&ctx, &err))?;
          set_active(Some((owner.clone(), Some(id))));
          Ok(())
       })?,
@@ -93,6 +104,7 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
       "setCss",
       Function::new(ctx.clone(), move |css: String| {
          set_active(Some((owner.clone(), None)));
+         crate::mana_theme::forget_saved();
          gpui_theme::set_css(&css)
       })?,
    )?;
@@ -103,6 +115,11 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
          gpui_theme::clear();
       })?,
    )?;
+   attach_reload(ctx, &themes, plugin)?;
+   themes.set(
+      "quickCss",
+      Function::new(ctx.clone(), crate::mana_theme::quick_css)?,
+   )?;
    themes.set(
       "openThemesDir",
       Function::new(ctx.clone(), || {
@@ -111,4 +128,32 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
       })?,
    )?;
    Ok(themes)
+}
+
+fn attach_reload<'js>(
+   ctx: &Ctx<'js>,
+   themes: &Object<'js>,
+   plugin: &str,
+) -> rquickjs::Result<()> {
+   let owner = plugin.to_owned();
+   themes.set(
+      "reload",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+         if !crate::mana_theme::is_supported() {
+            return Ok(false);
+         }
+         let owns_file = ACTIVE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|(active_owner, file)| active_owner == &owner && file.is_some());
+         if !owns_file {
+            return Ok(false);
+         }
+         crate::mana_theme::reload_active()
+            .map(|reloaded| reloaded.unwrap_or(false))
+            .map_err(|err| Exception::throw_message(&ctx, &err))
+      })?,
+   )?;
+   Ok(())
 }

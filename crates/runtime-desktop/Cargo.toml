@@ -12,6 +12,7 @@ log                = { workspace = true }
 phoenix-hook       = { workspace = true }
 phoenix-runtime    = { features = [ "sqlite" ], workspace = true }
 phoenix-sigs       = { workspace = true }
+phoenix-themes     = { workspace = true }
 phoenix-ui-desktop = { workspace = true }
 rquickjs           = { workspace = true }
 serde              = { workspace = true }

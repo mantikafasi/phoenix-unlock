@@ -1,21 +1,18 @@
 //! x86-64 disassembly, and on Windows and Linux live entry hooks that report a
 //! call's argument registers, for the debug tools.
 
-#[cfg(any(windows, target_os = "linux"))]
-use std::ffi::c_void;
 use std::ops::Range;
+#[cfg(any(windows, target_os = "linux"))]
+use std::{
+   ffi::c_void,
+   sync::atomic::AtomicPtr,
+};
 
 pub use iced_x86::Register;
-#[cfg(any(windows, target_os = "linux"))]
-use iced_x86::{
-   BlockEncoder,
-   BlockEncoderOptions,
-   FlowControl,
-   InstructionBlock,
-};
 use iced_x86::{
    Decoder,
    DecoderOptions,
+   FlowControl,
    Formatter as _,
    Instruction,
    IntelFormatter,
@@ -27,7 +24,6 @@ use crate::image::Image;
 use crate::{
    Error,
    image::{
-      ABSOLUTE_JUMP_LEN,
       absolute_jump,
       alloc_exec,
    },
@@ -48,9 +44,96 @@ const fn addr(value: u64) -> usize {
    value as usize
 }
 
-/// Whether `code` at `ip` is whole instructions that run the same from
-/// anywhere: no RIP-relative operand and no branch.
-#[must_use]
+/// The bytes of a `jmp [rip]` and its target, the longest jump sunhook writes
+/// over a function's opening.
+pub const ENTRY_JUMP_LEN: usize = 14;
+
+/// The whole instructions opening `func` that an absolute entry jump covers.
+///
+/// sunhook runs them relocated, and only from the top, so a function that ends
+/// within them or branches into them past their first byte is refused.
+pub fn displaced(image: &Image<'_>, func: usize) -> Result<Vec<Instruction>, String> {
+   let end = match image.function_bounds(func) {
+      Some((start, _)) if start != func => {
+         return Err(format!("{func:#x} is inside the function at {start:#x}"));
+      },
+      Some((_, end)) => end,
+      None => leaf_end(image, func).ok_or("no unwind data bounds the function")?,
+   };
+   let code = image
+      .read(func, end - func)
+      .ok_or("the function is unmapped")?;
+   let mut decoder = Decoder::with_ip(64, code, func as u64, DecoderOptions::NONE);
+   let mut displaced = Vec::new();
+   let mut covered = 0;
+   while covered < ENTRY_JUMP_LEN {
+      if !decoder.can_decode() {
+         return Err("the function is shorter than the 14-byte jump".to_owned());
+      }
+      let instruction = decoder.decode();
+      if instruction.is_invalid() {
+         return Err("the opening does not decode".to_owned());
+      }
+      covered += instruction.len();
+      let ends = matches!(
+         instruction.flow_control(),
+         FlowControl::Return
+            | FlowControl::UnconditionalBranch
+            | FlowControl::IndirectBranch
+            | FlowControl::Interrupt
+      );
+      if ends && covered < ENTRY_JUMP_LEN {
+         return Err("the function ends within the 14-byte jump".to_owned());
+      }
+      displaced.push(instruction);
+   }
+
+   let opening = func + 1..func + covered;
+   let mut decoder = Decoder::with_ip(64, code, func as u64, DecoderOptions::NONE);
+   let mut instruction = Instruction::default();
+   while decoder.can_decode() {
+      decoder.decode_out(&mut instruction);
+      let branches = matches!(
+         instruction.flow_control(),
+         FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch | FlowControl::Call
+      );
+      if branches && opening.contains(&addr(instruction.near_branch_target())) {
+         return Err(format!("{:#x} branches into the opening", instruction.ip()));
+      }
+   }
+   Ok(displaced)
+}
+
+/// Where a leaf at `func` ends: the first return or jump past every forward
+/// branch before it, within a page. Windows packs leaves with no padding.
+fn leaf_end(image: &Image<'_>, func: usize) -> Option<usize> {
+   const MOST: usize = 0x1000;
+   let code = image.read(func, MOST)?;
+   let mut decoder = Decoder::with_ip(64, code, func as u64, DecoderOptions::NONE);
+   let mut instruction = Instruction::default();
+   let mut reach = func;
+   while decoder.can_decode() {
+      decoder.decode_out(&mut instruction);
+      if instruction.is_invalid() {
+         return None;
+      }
+      let next = addr(instruction.next_ip());
+      let target = addr(instruction.near_branch_target());
+      if (next..func + MOST).contains(&target) {
+         reach = reach.max(target);
+      }
+      let ends = matches!(
+         instruction.flow_control(),
+         FlowControl::Return | FlowControl::UnconditionalBranch | FlowControl::IndirectBranch
+      );
+      if ends && next > reach {
+         return Some(next);
+      }
+   }
+   None
+}
+
+/// Whether `code` at `ip` can run unchanged after it is copied elsewhere.
 pub fn relocatable(code: &[u8], ip: usize) -> bool {
    let mut decoder = Decoder::with_ip(64, code, ip as u64, DecoderOptions::NONE);
    let mut instruction = Instruction::default();
@@ -58,7 +141,7 @@ pub fn relocatable(code: &[u8], ip: usize) -> bool {
       decoder.decode_out(&mut instruction);
       if instruction.is_invalid()
          || instruction.is_ip_rel_memory_operand()
-         || instruction.flow_control() != iced_x86::FlowControl::Next
+         || instruction.flow_control() != FlowControl::Next
       {
          return false;
       }
@@ -1095,185 +1178,50 @@ impl Regs {
 #[cfg(any(windows, target_os = "linux"))]
 pub type Observer = extern "C" fn(ctx: usize, regs: &Regs);
 
-/// A function [`observe`] redirects through its stub.
-#[cfg(any(windows, target_os = "linux"))]
-pub struct Observed {
-   addr:     usize,
-   original: [u8; ABSOLUTE_JUMP_LEN],
-}
-
-#[cfg(any(windows, target_os = "linux"))]
-const STUB_PAGE: usize = 0x1000;
-#[cfg(any(windows, target_os = "linux"))]
-const TRAMPOLINE_AT: usize = 0x100;
-
-#[cfg(any(windows, target_os = "linux"))]
-impl Observed {
-   #[must_use]
-   pub const fn addr(&self) -> usize {
-      self.addr
-   }
-
-   /// Puts the function's first bytes back. The stub and trampoline stay
-   /// allocated, since a thread may still run them.
-   ///
-   /// # Safety
-   ///
-   /// As for [`observe`].
-   pub unsafe fn remove(&self, image: &Image<'static>) -> Result<(), Error> {
-      // SAFETY: forwarded from the caller.
-      unsafe { hot_patch(image, self.addr, &self.original) }
-   }
-}
-
 /// Makes every call to the function at `addr` run `observer(ctx, regs)` first,
-/// then the function unchanged.
-///
-/// The displaced prologue is decoded and relocated, so unlike
-/// [`Image::hook_entry`] it needs no known pattern. The entry is patched while
-/// other threads run: one that reaches it meanwhile spins on a `jmp $` until
-/// the jump is whole.
+/// then the function unchanged, through a sunhook entry hook.
 ///
 /// # Safety
 ///
-/// `addr` starts a function of `image` that nothing branches back into within
-/// its first 14 bytes, and no thread is paused inside those bytes.
+/// `addr` starts a function.
 #[cfg(any(windows, target_os = "linux"))]
 pub unsafe fn observe(
    image: &Image<'static>,
    addr: usize,
    observer: Observer,
    ctx: usize,
-) -> Result<Observed, Error> {
-   let refuse = |message: &str| {
+) -> Result<crate::Observed, Error> {
+   const JMP_RIP: usize = 6;
+
+   let mut code = stub(observer, ctx);
+   // The stub ends in `jmp [rip]` on an aligned word that sunhook fills with
+   // the original's entry before the function jumps to the stub.
+   while (code.len() + JMP_RIP) % 8 != 0 {
+      code.push(0x90);
+   }
+   code.extend(absolute_jump(0));
+   let page = alloc_exec(0, code.len()).ok_or_else(|| {
       Error::Attach {
          backend: "observe",
          target:  addr,
-         message: message.to_owned(),
+         message: "no memory for the stub".to_owned(),
       }
-   };
-   if addr % 8 == 7 {
-      return Err(refuse(
-         "the entry ends an 8-byte word, so it cannot be parked atomically",
-      ));
-   }
-   if let Some((start, end)) = image.function_bounds(addr) {
-      if start != addr {
-         return Err(refuse("not a function start"));
-      }
-      if end - addr < ABSOLUTE_JUMP_LEN {
-         return Err(refuse("the function is shorter than the 14-byte jump"));
-      }
-   }
-   let code = image.read(addr, 32).ok_or(Error::Unmapped { addr })?;
-   let original: [u8; ABSOLUTE_JUMP_LEN] = code[..ABSOLUTE_JUMP_LEN]
-      .try_into()
-      .map_err(|_| Error::Unmapped { addr })?;
-   let mut decoder = Decoder::with_ip(64, code, addr as u64, DecoderOptions::NONE);
-   let mut displaced = Vec::new();
-   let mut covered = 0;
-   while covered < ABSOLUTE_JUMP_LEN {
-      let instruction = decoder.decode();
-      if instruction.is_invalid() {
-         return Err(refuse("the prologue does not decode"));
-      }
-      covered += instruction.len();
-      let ends = matches!(
-         instruction.flow_control(),
-         FlowControl::Return
-            | FlowControl::UnconditionalBranch
-            | FlowControl::IndirectBranch
-            | FlowControl::Interrupt
-      );
-      if ends && covered < ABSOLUTE_JUMP_LEN {
-         return Err(refuse("the function ends within the 14-byte jump"));
-      }
-      displaced.push(instruction);
-   }
-
-   let page = alloc_near(addr).ok_or_else(|| refuse("no free memory within 1.75 GiB"))?;
-   let trampoline = page + TRAMPOLINE_AT;
-   let mut relocated = BlockEncoder::encode(
-      64,
-      InstructionBlock::new(&displaced, trampoline as u64),
-      BlockEncoderOptions::NONE,
-   )
-   .map_err(|err| refuse(&format!("relocating the prologue: {err}")))?
-   .code_buffer;
-   relocated.extend(absolute_jump(addr + covered));
-   let stub = stub(observer, ctx, trampoline);
-   debug_assert!(stub.len() <= TRAMPOLINE_AT && relocated.len() <= STUB_PAGE - TRAMPOLINE_AT);
-   // SAFETY: a fresh page of `STUB_PAGE` bytes, filled before the entry
-   // jumps to it.
-   unsafe {
-      std::ptr::copy_nonoverlapping(stub.as_ptr(), page as *mut u8, stub.len());
-      std::ptr::copy_nonoverlapping(relocated.as_ptr(), trampoline as *mut u8, relocated.len());
-   }
-   // SAFETY: forwarded from the caller.
-   unsafe { hot_patch(image, addr, &absolute_jump(page)) }?;
-   Ok(Observed { addr, original })
-}
-
-/// Writes 14 bytes at a function entry other threads may be calling: first a
-/// `jmp $` that parks them, then the tail, then the head.
-#[cfg(any(windows, target_os = "linux"))]
-unsafe fn hot_patch(
-   image: &Image<'static>,
-   addr: usize,
-   bytes: &[u8; ABSOLUTE_JUMP_LEN],
-) -> Result<(), Error> {
-   // SAFETY: `addr % 8 != 7`, so each two-byte write is one atomic word swap,
-   // and the tail is only reached through the head.
-   unsafe {
-      image.write_code(addr, &[0xEB, 0xFE])?;
-      image.write_code(addr + 2, &bytes[2..])?;
-      image.write_code(addr, &bytes[..2])
-   }
-}
-
-/// A fresh executable page within reach of RIP-relative operands at `addr`.
-/// The kernel takes the address as a hint, so a page it put elsewhere goes
-/// back.
-#[cfg(target_os = "linux")]
-fn alloc_near(addr: usize) -> Option<usize> {
-   const STEP: usize = 0x1_0000;
-   const REACH: usize = 0x7000_0000;
-   let home = addr & !(STEP - 1);
-   (1..REACH / STEP)
-      .flat_map(|step| [home.checked_sub(step * STEP), home.checked_add(step * STEP)])
-      .flatten()
-      .find_map(|candidate| {
-         let got = alloc_exec(candidate, STUB_PAGE)?;
-         if got.abs_diff(addr) < REACH {
-            return Some(got);
-         }
-         // SAFETY: the fresh mapping nothing else uses.
-         unsafe { libc::munmap(got as *mut c_void, STUB_PAGE) };
-         None
-      })
-}
-
-/// A fresh executable page within reach of RIP-relative operands at `addr`.
-#[cfg(windows)]
-fn alloc_near(addr: usize) -> Option<usize> {
-   const GRANULARITY: usize = 0x1_0000;
-   const REACH: usize = 0x7000_0000;
-   let home = addr & !(GRANULARITY - 1);
-   (1..REACH / GRANULARITY)
-      .flat_map(|step| {
-         [
-            home.checked_sub(step * GRANULARITY),
-            home.checked_add(step * GRANULARITY),
-         ]
-      })
-      .flatten()
-      .find_map(|candidate| alloc_exec(candidate, STUB_PAGE))
+   })?;
+   // SAFETY: a fresh page of at least `code.len()` writable bytes.
+   unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len()) };
+   // SAFETY: the aligned word ending the stub, in a page that stays mapped.
+   let slot = unsafe { &*((page + code.len() - 8) as *const AtomicPtr<c_void>) };
+   let (target, stub) = image.hook_targets(addr, page)?;
+   // SAFETY: forwarded from the caller, and the stub keeps the function's
+   // arguments.
+   let hook = unsafe { crate::Inline::attach_into(target, stub, slot) }?;
+   Ok(crate::Observed { addr, hook })
 }
 
 /// Saves the argument registers and `rax`, calls `observer(ctx, &regs)` on a
-/// 16-byte aligned stack, restores them and jumps to `trampoline`.
+/// 16-byte aligned stack and restores them.
 #[cfg(target_os = "linux")]
-fn stub(observer: Observer, ctx: usize, trampoline: usize) -> Vec<u8> {
+fn stub(observer: Observer, ctx: usize) -> Vec<u8> {
    // push rax, rdi, rsi, rdx, rcx, r8, r9; sub rsp, 0x80
    let mut code = vec![
       0x50, 0x57, 0x56, 0x52, 0x51, 0x41, 0x50, 0x41, 0x51, 0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00,
@@ -1296,15 +1244,13 @@ fn stub(observer: Observer, ctx: usize, trampoline: usize) -> Vec<u8> {
    code.extend([
       0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00, 0x41, 0x59, 0x41, 0x58, 0x59, 0x5A, 0x5E, 0x5F, 0x58,
    ]);
-   code.extend(absolute_jump(trampoline));
    code
 }
 
 /// Saves the argument registers, calls `observer(ctx, &regs)` on a 16-byte
-/// aligned stack with its shadow space, restores them and jumps to
-/// `trampoline`.
+/// aligned stack with its shadow space and restores them.
 #[cfg(windows)]
-fn stub(observer: Observer, ctx: usize, trampoline: usize) -> Vec<u8> {
+fn stub(observer: Observer, ctx: usize) -> Vec<u8> {
    let mut code = vec![
       0x51, 0x52, 0x41, 0x50, 0x41, 0x51, // push rcx, rdx, r8, r9
       0x48, 0x83, 0xEC, 0x68, // sub rsp, 0x68
@@ -1327,7 +1273,6 @@ fn stub(observer: Observer, ctx: usize, trampoline: usize) -> Vec<u8> {
       0x48, 0x83, 0xC4, 0x68, // add rsp, 0x68
       0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, // pop r9, r8, rdx, rcx
    ]);
-   code.extend(absolute_jump(trampoline));
    code
 }
 

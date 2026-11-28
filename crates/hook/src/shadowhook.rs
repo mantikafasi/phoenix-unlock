@@ -7,7 +7,10 @@ use std::{
       self,
       NonNull,
    },
-   sync::OnceLock,
+   sync::{
+      OnceLock,
+      atomic::AtomicPtr,
+   },
 };
 
 use sunhook_sys::{
@@ -60,13 +63,34 @@ pub fn init() -> Result<(), Error> {
    }
 }
 
-impl Hook for ShadowHook {
-   unsafe fn attach(target: NonNull<c_void>, detour: NonNull<c_void>) -> Result<Self, Error> {
-      init()?;
-      let mut original = ptr::null_mut();
+impl ShadowHook {
+   /// As [`Hook::attach`], but the original's entry also lands in `slot`
+   /// before the jump is written, so a stub that reads it can be the detour.
+   ///
+   /// # Safety
+   ///
+   /// As for [`Hook::attach`].
+   pub unsafe fn attach_into(
+      target: NonNull<c_void>,
+      detour: NonNull<c_void>,
+      slot: &'static AtomicPtr<c_void>,
+   ) -> Result<Self, Error> {
       // SAFETY: forwarded from the caller.
-      let stub =
-         unsafe { shadowhook_hook_func_addr(target.as_ptr(), detour.as_ptr(), &raw mut original) };
+      unsafe { Self::hook(target, detour, slot.as_ptr()) }
+   }
+
+   /// # Safety
+   ///
+   /// As for [`Hook::attach`], and `slot` is writable. Unique mode stores
+   /// into it only while hooking.
+   unsafe fn hook(
+      target: NonNull<c_void>,
+      detour: NonNull<c_void>,
+      slot: *mut *mut c_void,
+   ) -> Result<Self, Error> {
+      init()?;
+      // SAFETY: forwarded from the caller.
+      let stub = unsafe { shadowhook_hook_func_addr(target.as_ptr(), detour.as_ptr(), slot) };
       let attach_error = || {
          Error::Attach {
             backend: "shadowhook",
@@ -76,12 +100,21 @@ impl Hook for ShadowHook {
          }
       };
       let stub = NonNull::new(stub).ok_or_else(attach_error)?;
-      let original = NonNull::new(original).ok_or_else(attach_error)?;
+      // SAFETY: the caller's `slot` is readable, and shadowhook filled it.
+      let original = NonNull::new(unsafe { slot.read() }).ok_or_else(attach_error)?;
       Ok(Self {
          stub,
          target: target.addr().get(),
          original,
       })
+   }
+}
+
+impl Hook for ShadowHook {
+   unsafe fn attach(target: NonNull<c_void>, detour: NonNull<c_void>) -> Result<Self, Error> {
+      let mut original = ptr::null_mut();
+      // SAFETY: forwarded from the caller.
+      unsafe { Self::hook(target, detour, &raw mut original) }
    }
 
    fn original(&self) -> NonNull<c_void> {

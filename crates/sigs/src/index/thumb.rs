@@ -16,6 +16,9 @@ use crate::index::op::{
    Value,
 };
 
+/// `sp`, `r13`.
+const SP: Reg = 13;
+
 const fn sext(value: u32, bits: u32) -> i32 {
    let shift = 32 - bits;
    (value << shift).cast_signed() >> shift
@@ -82,19 +85,25 @@ pub fn decode(image: &Image<'_>, code: &[u8], start: usize) -> Vec<Step> {
          break;
       }
       constants.step = steps.len();
+      let mut writeback = None;
       let (op, native) = if wide {
          let hw2 = u32::from(halves[index + 1]);
          (
-            wide_op(image, hw1, hw2, pc, &mut constants),
+            wide_op(image, hw1, hw2, pc, &mut constants, &mut writeback),
             hw1 << 16 | hw2,
          )
       } else {
-         (narrow_op(image, hw1, pc, &mut constants), hw1)
+         (
+            narrow_op(image, hw1, pc, &mut constants, &mut writeback),
+            hw1,
+         )
       };
       steps.push(Step {
          at,
          len: if wide { 4 } else { 2 },
          op,
+         writeback,
+         writes: 0,
          native: Native::Thumb(native),
       });
       index += if wide { 2 } else { 1 };
@@ -109,7 +118,13 @@ pub fn decode(image: &Image<'_>, code: &[u8], start: usize) -> Vec<Step> {
    clippy::cast_sign_loss,
    reason = "each field is masked to its encoded width before the cast"
 )]
-fn narrow_op(image: &Image<'_>, hw: u32, pc: u32, constants: &mut Constants) -> Op {
+fn narrow_op(
+   image: &Image<'_>,
+   hw: u32,
+   pc: u32,
+   constants: &mut Constants,
+   writeback: &mut Option<(Reg, isize)>,
+) -> Op {
    let low3 = |shift: u32| ((hw >> shift) & 7) as Reg;
    let imm5 = (hw >> 6) & 0x1F;
    let load = |scale: u32, size: u8| {
@@ -128,9 +143,26 @@ fn narrow_op(image: &Image<'_>, hw: u32, pc: u32, constants: &mut Constants) -> 
          size,
       }
    };
+   let pushed = (hw & 0xFF).count_ones() + ((hw >> 8) & 1);
    match hw {
       0x4770 => Op::Ret,
       _ if hw & 0xFF00 == 0xBD00 => Op::Ret,
+      _ if hw & 0xFE00 == 0xB400 => {
+         *writeback = Some((SP, -4 * pushed as isize));
+         Op::Other
+      },
+      _ if hw & 0xFE00 == 0xBC00 => {
+         *writeback = Some((SP, 4 * pushed as isize));
+         Op::Other
+      },
+      _ if hw & 0xFF00 == 0xB000 => {
+         let imm = ((hw & 0x7F) * 4) as isize;
+         Op::Offset {
+            reg:    SP,
+            base:   SP,
+            offset: if hw & 0x80 == 0 { imm } else { -imm },
+         }
+      },
       _ if hw & 0xF000 == 0xD000 && (hw >> 8) & 0xE != 0xE => {
          Op::Branch(pc.wrapping_add_signed(sext((hw & 0xFF) << 1, 9)) as usize)
       },
@@ -196,6 +228,14 @@ fn narrow_op(image: &Image<'_>, hw: u32, pc: u32, constants: &mut Constants) -> 
       _ if hw & 0xF800 == 0x6000 => store(4, 4),
       _ if hw & 0xF800 == 0x7000 => store(1, 1),
       _ if hw & 0xF800 == 0x8000 => store(2, 2),
+      _ if hw & 0xF800 == 0x9000 => {
+         Op::Store {
+            value:  Value::Reg(((hw >> 8) & 7) as Reg),
+            base:   SP,
+            offset: ((hw & 0xFF) * 4) as isize,
+            size:   4,
+         }
+      },
       _ if hw & 0xF800 == 0x9800 => {
          Op::Load {
             reg:    ((hw >> 8) & 7) as Reg,
@@ -215,7 +255,14 @@ fn narrow_op(image: &Image<'_>, hw: u32, pc: u32, constants: &mut Constants) -> 
    clippy::cast_sign_loss,
    reason = "each field is masked to its encoded width before the cast"
 )]
-fn wide_op(image: &Image<'_>, hw1: u32, hw2: u32, pc: u32, constants: &mut Constants) -> Op {
+fn wide_op(
+   image: &Image<'_>,
+   hw1: u32,
+   hw2: u32,
+   pc: u32,
+   constants: &mut Constants,
+   writeback: &mut Option<(Reg, isize)>,
+) -> Op {
    let rn = hw1 & 0xF;
    let rt = hw2 >> 12;
    let rd = (hw2 >> 8) & 0xF;
@@ -252,6 +299,21 @@ fn wide_op(image: &Image<'_>, hw1: u32, hw2: u32, pc: u32, constants: &mut Const
       }
    };
    let branches = hw1 & 0xF800 == 0xF000;
+   // `P U W` of the doubleword and 8-bit-offset forms: indexed before the
+   // access, added, written back.
+   let (pair_pre, pair_up, pair_back) = (hw1 & 0x100 != 0, hw1 & 0x80 != 0, hw1 & 0x20 != 0);
+   let imm8 = |scale: u32, add: bool| {
+      let imm = ((hw2 & 0xFF) * scale) as isize;
+      if add { imm } else { -imm }
+   };
+   let sp_imm = |value: u32, add: bool| {
+      let value = value as isize;
+      Op::Offset {
+         reg:    SP,
+         base:   SP,
+         offset: if add { value } else { -value },
+      }
+   };
    match (hw1, hw2) {
       _ if branches && hw2 & 0xD000 == 0xD000 => {
          Op::Call(pc.wrapping_add_signed(branch_imm(true)) as usize)
@@ -296,6 +358,49 @@ fn wide_op(image: &Image<'_>, hw1: u32, hw2: u32, pc: u32, constants: &mut Const
       },
       (0xF85D, 0xFB04) => Op::Ret,
       (0xE8BD, _) if hw2 & 0x8000 != 0 => Op::Ret,
+      (0xE92D | 0xE8BD, _) => {
+         let moved = 4 * hw2.count_ones() as isize;
+         *writeback = Some((SP, if hw1 == 0xE92D { -moved } else { moved }));
+         Op::Other
+      },
+      // `sub`/`add sp, sp, #imm`, the modified immediate and the plain 12-bit
+      // forms.
+      _ if hw1 & 0xFBEF == 0xF1AD && rd == u32::from(SP) && hw2 & 0x8000 == 0 => {
+         sp_imm(expand(imm12), false)
+      },
+      _ if hw1 & 0xFBEF == 0xF10D && rd == u32::from(SP) && hw2 & 0x8000 == 0 => {
+         sp_imm(expand(imm12), true)
+      },
+      _ if hw1 & 0xFBFF == 0xF2AD && rd == u32::from(SP) && hw2 & 0x8000 == 0 => {
+         sp_imm(imm12, false)
+      },
+      _ if hw1 & 0xFBFF == 0xF20D && rd == u32::from(SP) && hw2 & 0x8000 == 0 => {
+         sp_imm(imm12, true)
+      },
+      // `ldrd`/`strd`, past the exclusive forms that share the encoding.
+      _ if hw1 & 0xFE40 == 0xE840 && (pair_pre || pair_back) && rn != 15 => {
+         let moved = imm8(4, pair_up);
+         if pair_back {
+            *writeback = Some((rn as Reg, moved));
+         }
+         let (base, offset) = (rn as Reg, if pair_pre { moved } else { 0 });
+         let regs = [rt as Reg, ((hw2 >> 8) & 0xF) as Reg];
+         if hw1 & 0x10 == 0 {
+            Op::StorePair {
+               values: regs,
+               base,
+               offset,
+               size: 4,
+            }
+         } else {
+            Op::LoadPair {
+               regs,
+               base,
+               offset,
+               size: 4,
+            }
+         }
+      },
       _ if hw1 & 0xFF7F == 0xF85F => {
          let offset = hw2 & 0xFFF;
          let base = pc & !3;
@@ -316,6 +421,36 @@ fn wide_op(image: &Image<'_>, hw1: u32, hw2: u32, pc: u32, constants: &mut Const
          Op::Atomic {
             base:   rn as Reg,
             offset: 0,
+         }
+      },
+      // `ldr`/`str` with an 8-bit offset, indexed or negative, past the
+      // unprivileged `P U` = `1 1` forms.
+      _ if hw1 & 0xFF80 == 0xF800
+         && hw2 & 0x0800 != 0
+         && rn != 15
+         && !(hw2 & 0x0600 == 0x0600 && hw2 & 0x0100 == 0) =>
+      {
+         let size = 1u8 << ((hw1 >> 5) & 3);
+         let (indexed, added, written) = (hw2 & 0x400 != 0, hw2 & 0x200 != 0, hw2 & 0x100 != 0);
+         let moved = imm8(1, added);
+         if written {
+            *writeback = Some((rn as Reg, moved));
+         }
+         let (base, offset) = (rn as Reg, if indexed { moved } else { 0 });
+         if hw1 & 0x10 == 0 {
+            Op::Store {
+               value: Value::Reg(rt as Reg),
+               base,
+               offset,
+               size,
+            }
+         } else {
+            Op::Load {
+               reg: rt as Reg,
+               base,
+               offset,
+               size,
+            }
          }
       },
       _ if hw1 & 0xFFF0 == 0xF8D0 => mem(4, false),

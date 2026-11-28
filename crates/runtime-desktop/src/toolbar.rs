@@ -2,11 +2,12 @@
 //! `phoenix.ui.addHeaderButton`.
 //!
 //! The toolbar's member list button is built by Discord's own icon button
-//! builder and added with `append`. The builder's call hands [`button_detour`]
-//! the `App`, and once `append` adds the member list button,
-//! [`append_detour`] builds each plugin button the same way, with a click
-//! handler of ours, and adds it after. The toolbar has no member list button
-//! where Discord shows no member list, and plugin buttons follow it there.
+//! builder and added with `append`. Building the member list button hands
+//! [`button_detour`] the `App`, and the next `append` on that thread adds it,
+//! after which [`append_detour`] builds each plugin button the same way, with
+//! a click handler of ours, and adds it after. The toolbar has no member list
+//! button where Discord shows no member list, and plugin buttons follow it
+//! there.
 
 use std::{
    cell::Cell,
@@ -26,9 +27,10 @@ use std::{
 };
 
 use phoenix_hook::image::Image;
-use phoenix_sigs::desktop::{
-   self,
-   layout,
+use phoenix_sigs::{
+   desktop::layout,
+   index::Index,
+   locate::channel,
 };
 
 use crate::gpui::{
@@ -65,6 +67,7 @@ pub struct HeaderButton {
 
 static BUTTON: OnceLock<ButtonFn> = OnceLock::new();
 static APPEND: OnceLock<AppendFn> = OnceLock::new();
+static MEMBERS_ID: AtomicUsize = AtomicUsize::new(0);
 static ON_CLICK: AtomicUsize = AtomicUsize::new(0);
 static TOOLBAR_SIZE: AtomicUsize = AtomicUsize::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
@@ -86,57 +89,45 @@ static CLICK_VTBL: RcFnVtbl = RcFnVtbl {
    extra:         ptr::null(),
 };
 
-/// Hooks the member list button's builder and append calls from
+/// Hooks the toolbar icon button builder and `append` from
 /// [`crate::prepare`], before Discord's threads run.
-pub fn install(image: &Image<'static>) {
-   if !cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-      return;
-   }
-   let found = match desktop::channel_toolbar(image) {
+pub fn install(image: &Image<'static>, ix: &Index<'_>) {
+   let found = match channel::channel_toolbar(ix) {
       Ok(found) => found,
       Err(err) => {
          log::warn!("header buttons: {err}, none are drawn");
          return;
       },
    };
+   MEMBERS_ID.store(found.members_id, Ordering::Release);
    ON_CLICK.store(found.on_click, Ordering::Release);
    TOOLBAR_SIZE.store(found.toolbar_size, Ordering::Release);
    let hooked = hook(
       image,
-      found.button_site,
+      &BUTTON,
+      found.button,
       button_detour as *const () as usize,
-      |target| {
-         // SAFETY: the call's own target, the toolbar icon button builder.
-         let _ = BUTTON.set(unsafe { std::mem::transmute::<usize, ButtonFn>(target) });
-      },
    ) && hook(
       image,
-      found.append_site,
+      &APPEND,
+      found.append,
       append_detour as *const () as usize,
-      |target| {
-         // SAFETY: the call's own target, the toolbar's append.
-         let _ = APPEND.set(unsafe { std::mem::transmute::<usize, AppendFn>(target) });
-      },
    );
    READY.store(hooked, Ordering::Release);
 }
 
-/// Points the call at `site` to `detour` and hands `store` its old target.
-fn hook(image: &Image<'static>, site: usize, detour: usize, store: impl FnOnce(usize)) -> bool {
-   // SAFETY: runs from `prepare` before Discord's threads; each detour takes
-   // its callee's exact arguments, so the island adds nothing, and waits for
-   // `store` before it calls the original.
-   match unsafe { image.hook_call(site, &[], detour) } {
-      Ok(target) => {
-         store(target);
-         log::info!("header buttons: hooked @ {site:#x}");
-         true
-      },
-      Err(err) => {
-         log::warn!("header buttons: hook @ {site:#x} failed: {err}");
-         false
-      },
-   }
+/// Hooks `target` with `detour` and stores its original in `slot`.
+fn hook<F: Copy>(image: &Image<'static>, slot: &OnceLock<F>, target: usize, detour: usize) -> bool {
+   // SAFETY: runs from `prepare` before Discord's threads; each detour has its
+   // target's signature as `F`, the return slot first, and waits for `slot`
+   // before it calls the original.
+   let Some(original) = (unsafe { crate::hook_sret::<F>(image, target, detour, "header buttons") })
+   else {
+      return false;
+   };
+   let _ = slot.set(original);
+   log::info!("header buttons: hooked @ {target:#x}");
+   true
 }
 
 /// Whether header buttons can be drawn on this build.
@@ -197,7 +188,9 @@ unsafe extern "C" fn button_detour(
    flag: u8,
    cx: *mut c_void,
 ) -> *mut u8 {
-   APP.set(cx as usize);
+   if id as usize == MEMBERS_ID.load(Ordering::Acquire) {
+      APP.set(cx as usize);
+   }
    let button = *BUTTON.wait();
    // SAFETY: forwards the builder's own arguments.
    unsafe { button(out, id, id_len, icon, tooltip, selected, flag, cx) }

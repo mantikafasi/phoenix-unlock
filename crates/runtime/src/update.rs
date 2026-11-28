@@ -195,11 +195,9 @@ pub fn fetch_catalog() {
 }
 
 /// Installs a plugin the site lists. Site plugins can call API an older loader
-/// lacks, so platforms with an in-app loader updater wait until the loader is
-/// current.
+/// lacks, so they wait until the loader is current.
 pub fn install_listed(name: &str) -> Result<crate::installer::Installed, crate::Error> {
-   let updates_loader = crate::platform().is_some_and(<dyn crate::Platform>::updates_loader);
-   if updates_loader && let Some(version) = found().and_then(|update| update.loader) {
+   if let Some(version) = found().and_then(|update| update.loader) {
       return Err(crate::Error::LoaderOutdated { version });
    }
    crate::install(&format!("{ASSETS}plugins/{name}.js"))
@@ -219,11 +217,15 @@ fn query() -> Result<Option<Update>, String> {
    let site =
       serde_json::from_slice::<Site>(&body).map_err(|err| format!("version.json: {err}"))?;
    let loader = (site.loader.as_str() > VERSION).then_some(site.loader);
-   // Plugins come along with a loader update, so one tap brings both.
+   let updates_loader = crate::platform().is_some_and(<dyn crate::Platform>::updates_loader);
+   // Plugins come along with an in-app loader update, so one tap brings both. Elsewhere the
+   // site's plugins would run on this older loader, so they wait for the new one.
+   let plugins_wait = loader.is_some() && !updates_loader;
    let mut plugins = Vec::new();
    let mut plugin_crcs = BTreeMap::new();
    for plugin in crate::plugins() {
-      if let Some(&crc) = site.plugins.get(&plugin.name)
+      if !plugins_wait
+         && let Some(&crc) = site.plugins.get(&plugin.name)
          && crate::source(&plugin.name)
             .is_some_and(|source| crc32fast::hash(source.as_bytes()) != crc)
       {
@@ -412,12 +414,13 @@ pub fn apply() {
             platform.update_loader(slot, version, &update);
             return;
          }
-         if update.plugins.is_empty() {
-            let msg = format!("Sunbird {version} is available — restart Sunbird to update.");
-            slot.finish(Some(msg.clone()));
-            crate::toast(&msg);
-            return;
-         }
+         let msg = format!(
+            "Sunbird {version} is available, {}.",
+            platform.loader_update_hint()
+         );
+         slot.finish(Some(msg.clone()));
+         crate::toast(&msg);
+         return;
       }
       let mut updated_plugins = Vec::new();
       let mut failed = Vec::new();

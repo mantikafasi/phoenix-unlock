@@ -69,7 +69,7 @@ pub fn check() {
       source:    "Sunbird".to_owned(),
       title:     title.to_owned(),
       body:      Some(body.clone()),
-      accent:    WARNING,
+      accent:    Some(WARNING),
       duration:  None,
       pressable: false,
    };

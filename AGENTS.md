@@ -38,7 +38,7 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `crates/ui-mobile` | Typed codec for mobile UI-op batches (`src/props.in` is Phoenix's prop table, `templates.json` holds captured layouts, `motion.rs` drives native springs, `mirror.rs` keeps a live view tree for host tests). |
 | `crates/ui-desktop` | Desktop UI host primitives (clipboard, URLs, notifications, tray, GPUI surface hooks), one file per OS. |
 | `crates/wire` | Tagged values and bridge frames (`HostCall`, `DispatchEvent`). |
-| `crates/hook` | Image scanner, `swap_words`, and ShadowHook through `sunhook-sys` on Android ARM. |
+| `crates/hook` | Image scanner, `swap_words`, and every inline hook through ShadowHook (`sunhook-sys`) on Android ARM, Windows and Linux x86-64, and macOS arm64. It runs in unique mode, so a second hook on one function (including `phoenix.native.hook`) is refused. |
 | `crates/sigs`, `crates/sigscan` | Gateway registry walk, handler ABI, and binary locators (`desktop.rs`, `mobile.rs`, `macos.rs`). `sigscan` dumps a library's registry, runs `check` (every locator for that platform, exit 1 on a miss), and looks up strings, refs, and disassembly. |
 | `crates/patcher` | Patches and signs split APKs as a library and CLI (merged single APK or individually signed splits). |
 | `crates/patcher-web` | `crates/patcher` compiled to wasm for the site. |
@@ -50,6 +50,7 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `scripts/*.nu` | `phoenix.nu` builds, patches, and installs on a phone; `site.nu` builds the site's native libs and wasm. |
 | `scripts/sunbird-{linux,macos}.sh` | Desktop installers served by the site. Each creates a launcher that fetches the loader before every start and leaves Discord's own files untouched. |
 | `scripts/dev.ps1` | Windows dev loop (details below). |
+| `scripts/dev-macos.sh` | macOS dev loop: builds, copies plugins, relaunches the installed `Sunbird.app` copy with the new dylib, and wraps the debug shell (`help` lists commands). |
 
 ## Building
 
@@ -129,7 +130,9 @@ Phoenix re-execs itself once with its malloc settings and `DISCORD_DESKTOP_MALLO
 **Logs, debugging, and arm64 hooks**
 Stream logs with `/usr/bin/log stream --predicate 'eventMessage CONTAINS "phoenix:"'`. After killed launches, pass `--args -ApplePersistenceIgnoreState YES` or macOS's "reopen windows?" alert stalls Discord; opening a `discord://-/channels/<guild>/<channel>` URL with `open -a <copy>` loads a channel without manual input. The binary has no symbols (`sigscan strings`/`refs`/`flat` resolve `adrp` pairs and outlined stubs); lldb attaches over ssh once Developer Mode is on (`DevToolsSecurity -enable`), using `script dbg = lldb.debugger; threading.Timer(n, lambda: dbg.GetSelectedTarget().GetProcess().SendAsyncInterrupt()).start()` + `detach` to end waits (never set `process handle SIGTRAP -p true`, which kills Discord).
 
-`__TEXT` never takes `PROT_WRITE`, so `Image::write_code` remaps via `vm_protect(VM_PROT_COPY)`. Arm64 `hook_entry` overwrites 4 instructions with `ldr x16,#8; br x16; .quad` and refuses literal loads or branches back into them (follow a lone `b` target first). For large returns, x86 passes the return slot first while arm64 passes it in `x8`; because `gpui.rs` and detours use x86 order, arm64 calls out through `image::sret_caller` and enters detours through `image::sret_callee`. `Pattern::new` panics without a literal byte (and a panic in the loader constructor aborts Discord), so pass the x86 frame prologue to arm64 `hook_entry`, which ignores it.
+Debug builds (`cargo build -p phoenix-loader` without `--release`, about 90 s to start) take input over ssh. The debug shell's `GET /ui/screen` returns the front window as a PNG in points, and `POST /ui/input` takes `{"kind":"click","x","y","count"?,"right"?}`, `{"kind":"text","text"}`, `{"kind":"key","key","mods"?}` or `{"kind":"scroll","x","y","dy"}` in the same points. GPUI draws nothing while the screen is locked (keep `caffeinate -d` running), and clicks on message content can open links in the owner's browser.
+
+`__TEXT` never takes `PROT_WRITE`, so `Image::write_code` remaps via `vm_protect(VM_PROT_COPY)`. For large returns, x86 passes the return slot first while arm64 passes it in `x8`; because `gpui.rs` and detours use x86 order, arm64 calls out through `image::sret_caller` and enters detours through `image::sret_callee`.
 
 **Gateway and UI**
-macOS keeps message, reaction, presence, and typing events in a flat table apart from the domain tables (in two copies, dispatching `MESSAGE_DELETE` through the second; `MESSAGE_CREATE` is also in it with a different handler than the domain table's unused one), so `registry.rs` swaps both copies and takes the flat table's handler. Plugin pages and dialogs use AppKit windows (`ui-desktop/src/macos/panel.rs`), and Command-Shift-I opens DevTools through an `NSEvent` local monitor while Discord is focused.
+macOS keeps message, reaction, presence, and typing events in a flat table apart from the domain tables (in two copies, dispatching `MESSAGE_DELETE` through the second; `MESSAGE_CREATE` is also in it with a different handler than the domain table's unused one), so `registry.rs` swaps both copies and takes the flat table's handler. The settings sidebar calls its selected-page map (16 bytes, under sunhook's 20-byte jump) directly, so `settings.rs` rewrites that one `bl` while Sunbird is open. `phoenix.ui.addComposerButton` buttons draw ahead of the chat bar's own through a detour on its render (`composer.rs`). Command-Shift-I opens DevTools through an `NSEvent` local monitor while Discord is focused.

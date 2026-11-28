@@ -2,5 +2,45 @@
   "desktop": {
     "linux": "0.1.0.2334",
     "windows": "0.1.0.2229"
+  },
+  "android": {
+    "versionCode": 357205,
+    "versionName": "357.5 - Alpha",
+    "verifiedWith": "v0.2.0",
+    "url": "https://tracker.vendetta.rocks/tracker/download/357205/",
+    "splits": {
+      "base": {
+        "sha256": "4ff62b1348e689f13e13798a70c35d4d375f318c671edee32dd62fcc5a0883e5",
+        "size": 81916623
+      },
+      "config.arm64_v8a": {
+        "sha256": "09a95e14e9dbe636aac282bba1e126d54e31bd4d7c55a29d83293fef67cce874",
+        "size": 177815380
+      },
+      "config.armeabi_v7a": {
+        "sha256": "1f2d3131c5b026fa8bad30aea103d1fceef56831c74993f5efbb7f67d170cf51",
+        "size": 119246766
+      },
+      "config.x86_64": {
+        "sha256": "196c7f31541a1bff7b26eb03320ac38e0ed7a8babed83576d33560525970b955",
+        "size": 197517005
+      },
+      "config.hdpi": {
+        "sha256": "11619c0067012ec07a40f9d52dfb69d267bc57a43138c6943071fda9ecc0e5ca",
+        "size": 7295030
+      },
+      "config.xxhdpi": {
+        "sha256": "19719fddc295ba9cf31b8a68e29002302cb117f7379ac5d0c30dfeee55e5f669",
+        "size": 11212349
+      },
+      "config.de": {
+        "sha256": "139c35a7e48d284a0099cfd1c60a8f9d53e0e541fb9c4c1fa6ba0960e7fcab68",
+        "size": 29081
+      },
+      "config.en": {
+        "sha256": "a158de2871a2339db07137fcbbfa854e6ffc45b9942876b118447609b9f051fa",
+        "size": 45465
+      }
+    }
   }
 }

@@ -11,12 +11,8 @@ use std::sync::{
    },
 };
 
-use phoenix_hook::{
-   image::Image,
-   x86::Abi,
-};
+use phoenix_hook::image::Image;
 use phoenix_sigs::{
-   desktop,
    index::Index,
    locate,
 };
@@ -42,23 +38,16 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
          return;
       },
    };
-   let prologue = desktop::Prologues::of(Abi::of(image)).emoji_check;
    // SAFETY: runs before Discord's threads, and the detour has the check's
    // ABI.
-   let trampoline = match unsafe {
-      image.hook_entry(
-         found.func,
-         prologue.pattern,
-         prologue.len,
-         unavailable_reason as *const () as usize,
-      )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("emoji check: {err}");
-         return;
-      },
-   };
+   let trampoline =
+      match unsafe { image.hook_entry(found.func, unavailable_reason as *const () as usize) } {
+         Ok(trampoline) => trampoline,
+         Err(err) => {
+            log::warn!("emoji check: {err}");
+            return;
+         },
+      };
    // SAFETY: the trampoline replays the displaced instructions and continues
    // in the check.
    let original = unsafe { std::mem::transmute::<usize, CheckFn>(trampoline) };

@@ -61,6 +61,20 @@ impl Isa {
       }
    }
 
+   /// The register a function returning through a slot receives it in: `x8`
+   /// on arm64, the first argument elsewhere.
+   #[must_use]
+   pub const fn slot(self) -> Option<Reg> {
+      if matches!(self, Self::Aarch64) { Some(8) } else { self.arg(0) }
+   }
+
+   /// The register argument `index` of a function returning through a slot
+   /// arrives in, past the slot where it takes an argument register.
+   #[must_use]
+   pub const fn slot_arg(self, index: usize) -> Option<Reg> {
+      if matches!(self, Self::Aarch64) { self.arg(index) } else { self.arg(index + 1) }
+   }
+
    /// The stack pointer.
    #[must_use]
    pub const fn sp(self) -> Reg {
@@ -72,10 +86,40 @@ impl Isa {
       }
    }
 
+   /// The registers a call may change, a bit per [`Reg`].
+   #[must_use]
+   pub const fn caller_saved(self) -> u32 {
+      match self {
+         // rax, rcx, rdx, rsi, rdi, r8 to r11.
+         #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+         Self::X86_64 { win64: false } => 0x0FC7,
+         // rax, rcx, rdx, r8 to r11.
+         #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+         Self::X86_64 { win64: true } => 0x0F07,
+         // x0 to x18 and the link register.
+         Self::Aarch64 => 0x4007_FFFF,
+         // r0 to r3, r12 and the link register.
+         Self::Thumb2 => 0x500F,
+      }
+   }
+
    /// The register a function returns an integer in.
    #[must_use]
    pub const fn ret(self) -> Reg {
       0
+   }
+
+   /// The register the hidden pointer to a large return value arrives in.
+   #[must_use]
+   pub const fn sret(self) -> Reg {
+      match self {
+         #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+         Self::X86_64 { win64: true } => 1,
+         #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+         Self::X86_64 { win64: false } => 7,
+         Self::Aarch64 => 8,
+         Self::Thumb2 => 0,
+      }
    }
 }
 
@@ -108,6 +152,21 @@ pub enum Op {
    /// `[base + offset] = value`, `size` bytes.
    Store {
       value:  Value,
+      base:   Reg,
+      offset: isize,
+      size:   u8,
+   },
+   /// `regs = [base + offset]`, two `size`-byte registers from consecutive
+   /// slots, `ldp` or `ldrd`.
+   LoadPair {
+      regs:   [Reg; 2],
+      base:   Reg,
+      offset: isize,
+      size:   u8,
+   },
+   /// `[base + offset] = values`, `stp` or `strd`.
+   StorePair {
+      values: [Reg; 2],
       base:   Reg,
       offset: isize,
       size:   u8,
@@ -149,6 +208,29 @@ pub enum Op {
    Other,
 }
 
+impl Op {
+   /// The register a store or pair store writes at `offset`, with the store's
+   /// size, `(reg, offset, size)`.
+   #[must_use]
+   pub const fn stored_reg(self) -> Option<(Reg, isize, u8)> {
+      match self {
+         Self::Store {
+            value: Value::Reg(reg),
+            offset,
+            size,
+            ..
+         }
+         | Self::StorePair {
+            values: [reg, _],
+            offset,
+            size,
+            ..
+         } => Some((reg, offset, size)),
+         _ => None,
+      }
+   }
+}
+
 /// What a store writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Value {
@@ -160,10 +242,17 @@ pub enum Value {
 /// shared [`Op`] cannot express.
 #[derive(Clone, Copy, Debug)]
 pub struct Step {
-   pub at:     usize,
-   pub len:    u8,
-   pub op:     Op,
-   pub native: Native,
+   pub at:        usize,
+   pub len:       u8,
+   pub op:        Op,
+   /// The base register a pre- or post-indexed access, `push` or `pop` moves
+   /// after it, and by how much.
+   pub writeback: Option<(Reg, isize)>,
+   /// Every general-purpose register the instruction writes, a bit per
+   /// [`Reg`], whatever `op` it lowered to. The stack pointer's moves are in
+   /// `writeback` or `op` instead, and Thumb-2 leaves this empty.
+   pub writes:    u32,
+   pub native:    Native,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -176,15 +265,22 @@ pub enum Native {
 
 /// Decodes `[start, end)` of `image`, which holds `isa` code.
 pub fn decode(image: &Image<'_>, isa: Isa, start: usize, end: usize) -> Vec<Step> {
+   decode_head(image, isa, start, end, usize::MAX)
+}
+
+/// Decodes at most `limit` instructions of `[start, end)`.
+pub fn decode_head(image: &Image<'_>, isa: Isa, start: usize, end: usize, limit: usize) -> Vec<Step> {
    let Some(code) = image.read(start, end.saturating_sub(start)) else {
       return Vec::new();
    };
-   match isa {
+   let mut steps = match isa {
       #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
-      Isa::X86_64 { .. } => x86(image, code, start),
-      Isa::Aarch64 => aarch64(code, start),
+      Isa::X86_64 { .. } => return x86(image, code, start, limit),
+      Isa::Aarch64 => aarch64(&code[..code.len().min(limit.saturating_mul(4))], start),
       Isa::Thumb2 => crate::index::thumb::decode(image, code, start),
-   }
+   };
+   steps.truncate(limit);
+   steps
 }
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
@@ -195,16 +291,20 @@ pub fn decode(image: &Image<'_>, isa: Isa, start: usize, end: usize) -> Vec<Step
    clippy::cast_sign_loss,
    reason = "one arm per instruction form, each value bounded by the encoding before the cast"
 )]
-fn x86(image: &Image<'_>, code: &[u8], ip: usize) -> Vec<Step> {
+fn x86(image: &Image<'_>, code: &[u8], ip: usize, limit: usize) -> Vec<Step> {
    use iced_x86::{
       Decoder,
       DecoderOptions,
       FlowControl,
       Instruction,
+      InstructionInfoFactory,
       Mnemonic,
+      OpAccess,
       OpKind,
       Register,
    };
+
+   const SP: Reg = 4;
 
    let gpr = |register: Register| -> Option<Reg> {
       let full = register.full_register();
@@ -213,8 +313,9 @@ fn x86(image: &Image<'_>, code: &[u8], ip: usize) -> Vec<Step> {
    let addr = |value: u64| usize::try_from(value).ok();
    let mut decoder = Decoder::with_ip(64, code, ip as u64, DecoderOptions::NONE);
    let mut instruction = Instruction::default();
+   let mut info = InstructionInfoFactory::new();
    let mut steps = Vec::new();
-   while decoder.can_decode() {
+   while steps.len() < limit && decoder.can_decode() {
       decoder.decode_out(&mut instruction);
       if instruction.is_invalid() {
          break;
@@ -257,6 +358,28 @@ fn x86(image: &Image<'_>, code: &[u8], ip: usize) -> Vec<Step> {
                },
                _ => Op::Other,
             }
+         },
+         (_, Mnemonic::Add)
+            if instruction.op0_kind() == OpKind::Register
+               && matches!(
+                  instruction.op1_kind(),
+                  OpKind::Immediate8
+                     | OpKind::Immediate8to64
+                     | OpKind::Immediate32
+                     | OpKind::Immediate8to32
+                     | OpKind::Immediate32to64
+                     | OpKind::Immediate16
+               ) =>
+         {
+            gpr(instruction.op0_register())
+               .filter(|&reg| reg != 4)
+               .map_or(Op::Other, |reg| {
+                  Op::Offset {
+                     reg,
+                     base: reg,
+                     offset: instruction.immediate(1).cast_signed() as isize,
+                  }
+               })
          },
          (_, Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd) => {
             let base = gpr(instruction.memory_base());
@@ -392,10 +515,40 @@ fn x86(image: &Image<'_>, code: &[u8], ip: usize) -> Vec<Step> {
             })
          },
       };
+      let writes = info
+         .info(&instruction)
+         .used_registers()
+         .iter()
+         .filter(|used| {
+            matches!(
+               used.access(),
+               OpAccess::Write
+                  | OpAccess::CondWrite
+                  | OpAccess::ReadWrite
+                  | OpAccess::ReadCondWrite
+            )
+         })
+         .filter_map(|used| gpr(used.register()))
+         .filter(|&reg| reg != SP)
+         .fold(0, |writes, reg| writes | 1 << reg);
+      let moves_sp = instruction.op_count() == 2
+         && instruction.op0_register() == Register::RSP
+         && !matches!(instruction.op1_kind(), OpKind::Register | OpKind::Memory);
+      let writeback = match instruction.mnemonic() {
+         Mnemonic::Push => Some((SP, -8)),
+         Mnemonic::Pop => Some((SP, 8)),
+         Mnemonic::Sub if moves_sp => {
+            Some((SP, -(instruction.immediate(1).cast_signed() as isize)))
+         },
+         Mnemonic::Add if moves_sp => Some((SP, instruction.immediate(1).cast_signed() as isize)),
+         _ => None,
+      };
       steps.push(Step {
          at,
          len: instruction.len() as u8,
          op,
+         writeback,
+         writes,
          native: Native::X86(instruction.mnemonic()),
       });
    }
@@ -413,11 +566,13 @@ fn aarch64(code: &[u8], pc: usize) -> Vec<Step> {
    // The last `adrp` each register got, by step index, and its page.
    let mut pages = [(usize::MAX, 0usize); 32];
    let mut steps = Vec::with_capacity(code.len() / 4);
+   let words = code.as_chunks::<4>().0;
    for (index, (at, insn)) in arm64::decode_all(code, pc).enumerate() {
       let page = |rn: Reg| {
          let (set, page) = pages[usize::from(rn)];
          (set != usize::MAX && index - set <= PAIR_REACH).then_some(page)
       };
+      let mut writeback = None;
       let op = match insn {
          Insn::Adrp { rd, page } => {
             pages[usize::from(rd)] = (index, page);
@@ -530,16 +685,161 @@ fn aarch64(code: &[u8], pc: usize) -> Vec<Step> {
                offset: 0,
             }
          },
+         Insn::Other(word) => {
+            let (op, moved) = arm64_other(word);
+            writeback = moved;
+            op
+         },
          _ => Op::Other,
       };
       steps.push(Step {
          at,
          len: 4,
          op,
+         writeback,
+         writes: words
+            .get(index)
+            .map_or(0, |&word| arm64_writes(u32::from_le_bytes(word))),
          native: Native::Arm64(insn),
       });
    }
    steps
+}
+
+/// The general-purpose registers an arm64 instruction writes, `x31` aside
+/// since it is `sp` or the zero register. Loads into SIMD registers and FP
+/// data processing write none, conversions to an integer register aside.
+const fn arm64_writes(word: u32) -> u32 {
+   const fn bit(reg: u32) -> u32 {
+      if reg == 31 { 0 } else { 1 << reg }
+   }
+   let rd = bit(word & 0x1F);
+   let rt2 = bit((word >> 10) & 0x1F);
+   let rs = bit((word >> 16) & 0x1F);
+   let load = word & 0x40_0000 != 0;
+   match (word >> 25) & 0xF {
+      // Data processing, immediate and register.
+      0b1000 | 0b1001 | 0b0101 | 0b1101 => rd,
+      // `mrs`, and `bl`/`blr`'s link register.
+      0b1010 | 0b1011 => {
+         if word & 0xFFF0_0000 == 0xD530_0000 {
+            rd
+         } else if word & 0xFC00_0000 == 0x9400_0000 || word & 0xFFFF_FC1F == 0xD63F_0000 {
+            bit(30)
+         } else {
+            0
+         }
+      },
+      // Loads and stores, the vector ones writing no general register.
+      class if class & 0b0101 == 0b0100 => {
+         if word & 0x0400_0000 != 0 {
+            0
+         } else if word & 0x3B00_0000 == 0x1800_0000 {
+            if word >> 30 == 3 { 0 } else { rd }
+         } else if word & 0x3A00_0000 == 0x2800_0000 {
+            if load { rd | rt2 } else { 0 }
+         } else if word & 0x3F00_0000 == 0x0800_0000 {
+            // Exclusives and compare-and-swaps write their status or old value.
+            rd | rs | if load { rt2 } else { 0 }
+         } else if word & 0xC0_0000 == 0 && word & 0x20_0C00 != 0x20_0000 {
+            0
+         } else {
+            rd
+         }
+      },
+      // Conversions from a floating-point register to an integer one.
+      _ if word & 0x5F20_FC00 == 0x1E20_0000 && matches!((word >> 16) & 7, 0 | 1 | 4 | 5 | 6) => rd,
+      _ => 0,
+   }
+}
+
+/// The forms [`arm64::decode`] leaves as [`Insn::Other`] that track stack and
+/// field values: general register pairs, unscaled and indexed single loads and
+/// stores, and `sub` of an immediate. Each comes with the base register an
+/// indexed form moves.
+#[allow(
+   clippy::cast_possible_truncation,
+   clippy::cast_possible_wrap,
+   reason = "each field is masked to its encoded width before the cast"
+)]
+fn arm64_other(word: u32) -> (Op, Option<(Reg, isize)>) {
+   let rt = (word & 0x1F) as Reg;
+   let rn = ((word >> 5) & 0x1F) as Reg;
+   let signed =
+      |value: u32, bits: u32| ((value << (32 - bits)).cast_signed() >> (32 - bits)) as isize;
+   // `ldp`/`stp`/`ldpsw`: opc 101 V mode L imm7 Rt2 Rn Rt, mode 1 post, 2
+   // offset, 3 pre. SIMD pairs only matter for moving `sp`.
+   let (mode, opc, load) = ((word >> 23) & 7, word >> 30, word & (1 << 22) != 0);
+   if word & 0x3E00_0000 == 0x2C00_0000 && matches!(mode, 1 | 3) {
+      let imm = signed((word >> 15) & 0x7F, 7) * (4 << opc);
+      return (Op::Other, Some((rn, imm)));
+   }
+   if word & 0x3A00_0000 == 0x2800_0000
+      && matches!(mode, 1..=3)
+      && (opc == 0 || opc == 2 || (opc == 1 && load))
+   {
+      let size: u8 = if opc == 2 { 8 } else { 4 };
+      let imm = signed((word >> 15) & 0x7F, 7) * isize::from(size);
+      let regs = [rt, ((word >> 10) & 0x1F) as Reg];
+      let offset = if mode == 1 { 0 } else { imm };
+      let op = if load {
+         Op::LoadPair {
+            regs,
+            base: rn,
+            offset,
+            size,
+         }
+      } else {
+         Op::StorePair {
+            values: regs,
+            base: rn,
+            offset,
+            size,
+         }
+      };
+      return (op, (mode != 2).then_some((rn, imm)));
+   }
+   // `ldur`/`stur` and the indexed `ldr`/`str`: size 111 0 00 opc 0 imm9 mode
+   // Rn Rt, mode 0 unscaled, 1 post, 3 pre.
+   let (mode, opc, scale) = ((word >> 10) & 3, (word >> 22) & 3, word >> 30);
+   let prefetch = (scale == 3 && opc >= 2) || (scale == 2 && opc == 3);
+   if word & 0x3F20_0000 == 0x3C00_0000 && matches!(mode, 1 | 3) {
+      return (Op::Other, Some((rn, signed((word >> 12) & 0x1FF, 9))));
+   }
+   if word & 0x3F20_0000 == 0x3800_0000 && mode != 2 && !prefetch {
+      let size = 1u8 << scale;
+      let imm = signed((word >> 12) & 0x1FF, 9);
+      let offset = if mode == 1 { 0 } else { imm };
+      let op = if opc == 0 {
+         Op::Store {
+            value: Value::Reg(rt),
+            base: rn,
+            offset,
+            size,
+         }
+      } else {
+         Op::Load {
+            reg: rt,
+            base: rn,
+            offset,
+            size,
+         }
+      };
+      return (op, (mode != 0).then_some((rn, imm)));
+   }
+   // `sub rd, rn, #imm{, lsl #12}`.
+   if word & 0x7F80_0000 == 0x5100_0000 {
+      let imm = (((word >> 10) & 0xFFF) as isize) << if word & (1 << 22) != 0 { 12 } else { 0 };
+      return (
+         Op::Offset {
+            reg:    rt,
+            base:   rn,
+            offset: -imm,
+         },
+         None,
+      );
+   }
+   (Op::Other, None)
 }
 
 /// How far after an `adrp` its `add` or `ldr` is looked for, as in

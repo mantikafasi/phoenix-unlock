@@ -15,7 +15,7 @@ iced-x86 = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
-[target.'cfg(all(target_os = "android", any(target_arch = "aarch64", target_arch = "arm")))'.dependencies]
+[target.'cfg(any(all(target_os = "android", any(target_arch = "aarch64", target_arch = "arm")), all(target_arch = "x86_64", any(target_os = "linux", windows)), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 sunhook-sys = { workspace = true }
 
 [lints]

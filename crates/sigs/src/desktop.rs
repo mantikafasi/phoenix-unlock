@@ -99,7 +99,7 @@ impl Prologue {
    }
 }
 
-/// The prologues of the functions the runtime hooks.
+/// The prologues locators tell functions apart by.
 #[derive(Clone, Copy)]
 pub struct Prologues {
    /// `MessageRow::render`, `build_message_body` and `MessageContextMenu`.
@@ -107,16 +107,8 @@ pub struct Prologues {
    /// `host::section`, `Workspace::render_overlays`, `Store::delete_message`
    /// and `ReqwestTransport::send`.
    pub frame:       Prologue,
-   pub media_fetch: Prologue,
    /// The asset loader, [`asset_load`].
    pub asset_load:  Prologue,
-   /// `getEmojiUnavailableReason`, a leaf: its first four instructions on
-   /// Win64, five on System V, up to the `jne`.
-   pub emoji_check: Prologue,
-   /// READY's parse, [`ready_parse`]. Only seen on Win64 so far.
-   pub ready_parse: Option<Prologue>,
-   /// [`ready_text`], Win64 only.
-   pub ready_text:  Option<Prologue>,
 }
 
 impl Prologues {
@@ -139,45 +131,21 @@ impl Prologues {
                   pattern: FRAME_PROLOGUE,
                   len:     FRAME_PROLOGUE_LEN,
                },
-               media_fetch: Prologue {
-                  pattern: MEDIA_FETCH_PROLOGUE,
-                  len:     MEDIA_FETCH_PROLOGUE_LEN,
-               },
                asset_load:  Prologue {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
-               emoji_check: Prologue {
-                  pattern: Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02"),
-                  len:     14,
-               },
-               // `push rbp; push rsi; sub rsp, imm32; lea rbp, [rsp + imm32]`.
-               ready_parse: Some(Prologue {
-                  pattern: Pattern::new("55 56 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ??"),
-                  len:     17,
-               }),
-               ready_text:  Some(Prologue {
-                  pattern: Pattern::new("41 56 56 57 53 48 81 EC ?? ?? ?? ?? 4C 89 C7"),
-                  len:     15,
-               }),
             }
          },
          Abi::SysV => {
             Self {
                row:         SYSV_FRAME,
                frame:       SYSV_FRAME,
-               media_fetch: SYSV_FRAME,
                // Four pushes and `sub rsp, imm32`.
                asset_load:  Prologue {
                   pattern: Pattern::new("41 57 41 56 41 54 53 48 81 EC ?? ?? ?? ??"),
                   len:     14,
                },
-               emoji_check: Prologue {
-                  pattern: Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E"),
-                  len:     14,
-               },
-               ready_parse: None,
-               ready_text:  None,
             }
          },
       }
@@ -814,271 +782,12 @@ pub fn notification_gate(image: &Image<'_>) -> Found<usize> {
    }
 }
 
-/// The id the DM list gives its pending friend requests badge.
-pub const FRIENDS_BADGE: &[u8] = b"dm-friends-badge";
-/// The id the DM list gives its message requests badge.
-pub const MESSAGE_REQUESTS_BADGE: &[u8] = b"dm-message-requests-badge";
-
-/// What draws Phoenix's pending friend and message request counts.
-#[derive(Clone, Debug)]
-pub struct PendingCounts {
-   /// The DM list's row badge, `fn(out, id: &str, count: u32, _, _) -> out`,
-   /// which draws [`FRIENDS_BADGE`] and [`MESSAGE_REQUESTS_BADGE`] only. Linux
-   /// builds give each id its own copy of it.
-   pub badges:          Vec<usize>,
-   /// `u32 f(&RelationshipStore)`, the incoming friend and game friend
-   /// requests the DM list's Friends row and the inbox's Friends tab show.
-   pub friend_requests: usize,
-}
-
-/// The DM list draws both badges through one builder, each call just after the
-/// `lea` of its id. The friends count comes from the call whose `eax` the
-/// count argument was copied from.
-pub fn pending_counts(image: &Image<'_>) -> Found<PendingCounts> {
-   let (friends_call, badge) = badge_call(image, FRIENDS_BADGE)?;
-   let (_, requests_badge) = badge_call(image, MESSAGE_REQUESTS_BADGE)?;
-   let badges = if badge == requests_badge {
-      vec![badge]
-   } else if same_shape(image, badge, requests_badge) {
-      vec![badge, requests_badge]
-   } else {
-      return Err(format!(
-         "the DM badges are drawn by {badge:#x} and {requests_badge:#x}"
-      ));
-   };
-   let friend_requests = count_source(image, friends_call)?;
-   function_code(image, friend_requests, "friend requests count")?;
-   if !counts_incoming(image, friend_requests) {
-      return Err(format!(
-         "friend requests count at {friend_requests:#x} compares no type with 3"
-      ));
-   }
-   Ok(PendingCounts {
-      badges,
-      friend_requests,
-   })
-}
-
-/// Whether `first` and `second` run the same instructions, whatever they
-/// branch to or call. Each copy of a generic calls its own copies of others.
-fn same_shape(image: &Image<'_>, first: usize, second: usize) -> bool {
-   let shape = |func: usize| {
-      function_code(image, func, "").map(|code| {
-         phoenix_hook::x86::disasm(code, func, usize::MAX)
-            .into_iter()
-            .map(|line| {
-               match line.target {
-                  Some(_) => line.text.split(' ').next().unwrap_or_default().to_owned(),
-                  None => line.text,
-               }
-            })
-            .collect::<Vec<String>>()
-      })
-   };
-   matches!((shape(first), shape(second)), (Ok(first), Ok(second)) if first == second)
-}
-
-/// `u32 f(&RelationshipStore)`, the number on the Home button.
-///
-/// It adds the DM mentions to the friend requests `friend_requests` counts,
-/// inlined but for its one call, which counts the game friend requests. The
-/// Home button is the other caller of that which counts incoming requests and
-/// returns a plain count.
-pub fn home_count(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
-   let game_requests = game_requests(image, friend_requests)?;
-   let counts = callers(image, game_requests)
-      .into_iter()
-      .filter(|&func| {
-         func != friend_requests && !returns_badge(image, func) && counts_incoming(image, func)
-      })
-      .collect::<Vec<_>>();
-   one("Home count", &counts)
-}
-
-/// `(state, count) f(&Store, _)`, a badge built from the same counts as
-/// [`home_count`].
-///
-/// State 2 is a count, state 1 an unread dot. The badge is the caller of the
-/// game friend requests count which returns a count in `edx`.
-pub fn home_badge(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
-   let game_requests = game_requests(image, friend_requests)?;
-   let badges = callers(image, game_requests)
-      .into_iter()
-      .filter(|&func| func != friend_requests && returns_badge(image, func))
-      .collect::<Vec<_>>();
-   one("Home badge", &badges)
-}
-
-/// The one call `friend_requests` makes, which counts the game friend requests.
-fn game_requests(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
-   let calls = straight_calls(image, friend_requests);
-   let [(_, game_requests)] = calls[..] else {
-      return Err(format!(
-         "friend requests count at {friend_requests:#x} makes {} calls, not 1",
-         calls.len()
-      ));
-   };
-   Ok(game_requests)
-}
-
-/// Whether `func` compares a relationship type with 3, an incoming request, as
-/// it opens.
-fn counts_incoming(image: &Image<'_>, func: usize) -> bool {
-   function_code(image, func, "").is_ok_and(|code| {
-      phoenix_hook::x86::disasm(code, func, 0x80)
-         .iter()
-         .any(|line| line.text.starts_with("cmp byte ptr [") && line.text.ends_with("],3"))
-   })
-}
-
-/// Whether `func` can answer state 2 in `eax` and sets `edx` just before its
-/// epilogue.
-fn returns_badge(image: &Image<'_>, func: usize) -> bool {
-   let Ok(code) = function_code(image, func, "") else {
-      return false;
-   };
-   let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
-   let Some(ret) = lines.iter().position(|line| line.text == "ret") else {
-      return false;
-   };
-   let body = &lines[..ret];
-   let sets_count = body
-      .iter()
-      .rev()
-      .find(|line| !line.text.starts_with("pop ") && !line.text.starts_with("add rsp,"))
-      .is_some_and(|line| line.text.starts_with("mov edx,"));
-   sets_count && body.iter().any(|line| line.text == "mov eax,2")
-}
-
-/// The one `lea` of the UI id `id`.
-fn id_lea(image: &Image<'_>, id: &[u8]) -> Found<usize> {
-   // The ids are packed back to back without a NUL, so `literal` misses them.
-   let leas = image
-      .find_bytes(id)
-      .into_iter()
-      .flat_map(|at| lea_refs(image, at))
-      .collect::<Vec<_>>();
-   one(&format!("{} lea", String::from_utf8_lossy(id)), &leas)
-}
-
-/// The site and callee of the `call` that draws the badge with id `id`, the
-/// first after the `lea` of the id.
-fn badge_call(image: &Image<'_>, id: &[u8]) -> Found<(usize, usize)> {
-   let lea = id_lea(image, id)?;
-   calls_in(image, lea, 0x40).first().copied().ok_or_else(|| {
-      format!(
-         "no call follows the {} lea at {lea:#x}",
-         String::from_utf8_lossy(id)
-      )
-   })
-}
-
-/// Follows the count argument of the `call` at `site` back through register
-/// copies to the call that returned it in `eax`.
-fn count_source(image: &Image<'_>, site: usize) -> Found<usize> {
-   let func = image
-      .function_containing(site)
-      .ok_or_else(|| format!("badge call at {site:#x} is in no function"))?;
-   let code = image
-      .read(func, site - func)
-      .ok_or_else(|| format!("DM list at {func:#x} is unmapped"))?;
-   let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
-   let mut reg = reg32_name(Abi::of(image).arg(3));
-   for (at, line) in lines.iter().enumerate().rev() {
-      let Some(source) = line.text.strip_prefix(&format!("mov {reg},")) else {
-         continue;
-      };
-      if source != "eax" {
-         if source.contains('[') {
-            return Err(format!(
-               "the friends badge count is loaded from memory at {:#x}",
-               line.addr
-            ));
-         }
-         source.clone_into(&mut reg);
-         continue;
-      }
-      // Win64 pads calls that can unwind with a `nop`.
-      let before = lines[..at].iter().rev().find(|prev| prev.text != "nop");
-      return match before {
-         Some(call) if call.text.starts_with("call ") => {
-            call_target(image, &code[call.addr - func..], call.addr)
-               .map(|(_, target)| target)
-               .ok_or_else(|| format!("call at {:#x} has no target", call.addr))
-         },
-         _ => Err(format!("{reg} at {:#x} is no call's result", line.addr)),
-      };
-   }
-   Err(format!("the badge call at {site:#x} has no count source"))
-}
-
-/// The 32-bit name of a 64-bit general register, as the disassembly prints it.
-fn reg32_name(register: Register) -> String {
-   let name = reg_name(register);
-   match name.strip_prefix('r') {
-      Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => format!("{name}d"),
-      Some(rest) => format!("e{rest}"),
-      None => name,
-   }
-}
-
-/// The `jmp [rip]` and 8-byte target [`Image::hook_entry`] writes.
-const ENTRY_JUMP_LEN: usize = 14;
-
-/// The whole instructions opening `func` that an absolute jump covers, for a
-/// hook on a function no fixed prologue describes.
-pub fn entry_prologue(image: &Image<'_>, func: usize) -> Found<Prologue> {
-   let head = image
-      .read(func, 32)
-      .ok_or_else(|| format!("{func:#x} is unmapped"))?;
-   let mut len = 0;
-   for line in phoenix_hook::x86::disasm(head, func, head.len()) {
-      len += line.len;
-      if len < ENTRY_JUMP_LEN {
-         continue;
-      }
-      if !phoenix_hook::x86::relocatable(&head[..len], func) {
-         return Err(format!("{func:#x} opens with code that cannot move"));
-      }
-      let hex = head[..len]
-         .iter()
-         .map(|byte| format!("{byte:02X}"))
-         .collect::<Vec<_>>()
-         .join(" ");
-      let pattern = Pattern::leak(hex).ok_or("prologue bytes make no pattern")?;
-      return Ok(Prologue { pattern, len });
-   }
-   Err(format!("{func:#x} opens with less than a jump's bytes"))
-}
-
-/// How the runtime sends a function's calls to a detour.
-#[derive(Clone, Debug)]
-pub enum HookPoint {
-   /// Its opening instructions move to a trampoline.
-   Entry(Prologue),
-   /// Its opening cannot move, and code only reaches it through these slots.
-   /// The function itself stays callable as the original.
-   Slots(Vec<usize>),
-}
-
-/// [`entry_prologue`], or else the slots every call to `func` reads.
-pub fn hook_point(image: &Image<'_>, func: usize) -> Found<HookPoint> {
-   let entry = match entry_prologue(image, func) {
-      Ok(prologue) => return Ok(HookPoint::Entry(prologue)),
-      Err(err) => err,
-   };
-   if !image.rip_refs(func..func + 1).is_empty() {
-      return Err(entry);
-   }
-   let slots = image
-      .pointers_to(func)
-      .into_iter()
-      .filter(|&slot| !image.rip_refs(slot..slot + 1).is_empty())
-      .collect::<Vec<usize>>();
-   if slots.is_empty() {
-      return Err(format!("{entry}, and no code reads a pointer to it"));
-   }
-   Ok(HookPoint::Slots(slots))
+/// How many bytes of `func`'s opening `Image::hook_entry` moves to a
+/// trampoline, or why it cannot.
+pub fn entry_moved(image: &Image<'_>, func: usize) -> Found<usize> {
+   phoenix_hook::x86::displaced(image, func)
+      .map(|displaced| displaced.iter().map(iced_x86::Instruction::len).sum())
+      .map_err(|err| format!("{func:#x}: {err}"))
 }
 
 /// Discord's own GPUI and Mana builders the settings page calls.
@@ -2497,100 +2206,6 @@ pub fn asset_load(image: &Image<'_>) -> Found<usize> {
 
 /// GPUI's renderer `draw(&mut self, scene: &Scene)`.
 ///
-/// Also where `Scene` keeps the primitive lists a theme recolors before they
-/// are drawn, each a `Vec` (`cap`, `ptr`, `len`) at the offset given.
-#[derive(Clone, Copy, Debug)]
-pub struct SceneDraw {
-   pub draw:     usize,
-   pub quads:    usize,
-   pub mono:     usize,
-   pub subpixel: usize,
-}
-
-/// [`SceneDraw`], from the renderer's error for a frame it cannot draw.
-///
-/// `"scene too large: {} paths, {} shadows, {} quads, ..."`. A closure formats
-/// it, reading each list's `len` off the scene, its second argument, in the
-/// order the template names them. `draw` is the closure's one caller.
-pub fn scene_draw(image: &Image<'_>) -> Found<SceneDraw> {
-   const ANCHOR: &[u8] = b"scene too large:";
-   if Abi::of(image) != Abi::Win64 {
-      return Err("scene draw locator requires Win64".to_owned());
-   }
-   let text = one("scene template", &image.find_bytes(ANCHOR))?;
-   // The template starts with a length byte, so the load can point before
-   // the text.
-   let loads = [text - 1, text]
-      .iter()
-      .flat_map(|&at| lea_refs(image, at))
-      .collect::<Vec<_>>();
-   let load = one("scene template load", &loads)?;
-   let (formatter, _) = image
-      .function_bounds(load)
-      .ok_or("scene formatter has no function bounds")?;
-
-   let tail = image
-      .read(text + ANCHOR.len(), 0x100)
-      .ok_or("scene template is unmapped")?;
-   let tail = &tail[..tail.iter().position(|&b| b == 0).unwrap_or(tail.len())];
-   let names = tail
-      .split(|b| !b.is_ascii_lowercase())
-      .filter(|name| !name.is_empty())
-      .collect::<Vec<_>>();
-
-   // `mov r64, [scene + disp32]`, the scene in the second argument register.
-   let (scene, scene_ext) = reg(Abi::of(image).arg(1));
-   let code = image
-      .read(formatter, load - formatter)
-      .ok_or("scene formatter is unmapped")?;
-   let lens = (0..code.len().saturating_sub(7))
-      .filter(|&at| {
-         code[at] & 0xFB == 0x48
-            && code[at] & 1 == scene_ext
-            && code[at + 1] == 0x8B
-            && code[at + 2] & 0xC7 == 0x80 | scene
-      })
-      .map(|at| {
-         u32::from_le_bytes([code[at + 3], code[at + 4], code[at + 5], code[at + 6]]) as usize
-      })
-      .collect::<Vec<_>>();
-   if lens.len() != names.len() {
-      return Err(format!(
-         "scene formatter reads {} lengths for {} names",
-         lens.len(),
-         names.len()
-      ));
-   }
-   let vec_of = |name: &[u8]| {
-      names
-         .iter()
-         .position(|&n| n == name)
-         .and_then(|i| lens[i].checked_sub(0x10))
-         .ok_or_else(|| format!("scene template has no {}", String::from_utf8_lossy(name)))
-   };
-
-   let sites = call_sites(image, |callee| callee == formatter);
-   let (site, _) = one("scene formatter call", &sites)?;
-   let (draw, end) = image
-      .function_bounds(site)
-      .ok_or("renderer draw has no function bounds")?;
-   let found = SceneDraw {
-      draw,
-      quads: vec_of(b"quads")?,
-      mono: vec_of(b"mono")?,
-      subpixel: vec_of(b"subpixel")?,
-   };
-   // `draw` walks the quads through their `ptr`, right before `len`.
-   let ptr = u32::try_from(found.quads + 8).map_err(|_| "quads offset overflows")?;
-   let body = image
-      .read(draw, end - draw)
-      .ok_or("renderer draw is unmapped")?;
-   if !body.windows(4).any(|w| w == ptr.to_le_bytes()) {
-      return Err(format!("renderer draw never reads the quads at {ptr:#x}"));
-   }
-   Ok(found)
-}
-
 /// The `jne rel32` that leaves the composer's Nitro gift button out.
 ///
 /// The composer fills an `Option` for the button: its block, after the
@@ -2644,387 +2259,6 @@ pub fn composer_gift(image: &Image<'_>) -> Found<usize> {
       .map(|at| start + at)
       .filter(|&jne| jne % 8 != 7)
       .ok_or_else(|| format!("no jne skips the gift button before {none:#x}"))
-}
-
-/// The type name `Entity::read` panics with for the channel sidebar's width
-/// state, `discord_desktop::ui::sidebar_resize::SidebarResize`.
-const SIDEBAR_RESIZE: &[u8] = b"discord_desktop::ui::sidebar_resize::SidebarResize";
-/// The workspace's id for the channel sidebar's resize handle.
-const SIDEBAR_HANDLE_ID: &[u8] = b"channel-sidebar-resize";
-
-/// What collapses the channel sidebar.
-///
-/// The workspace sizes the sidebar from `SidebarResize`'s width, the server
-/// rail plus 1 px plus the channel column (clamped to 264..432 px by the
-/// handle): `column_site` calls the width getter
-/// in the function returning the column's width (`width - rail - 1`), and
-/// `publish_site` in the one handing the whole width to other views. The width
-/// getter's third caller saves the width to settings and stays as it is.
-#[derive(Debug, Clone, Copy)]
-pub struct ChannelSidebar {
-   /// `call width(root, cx)` in the column width function.
-   pub column_site:  usize,
-   /// `call width(root, cx)` in the function publishing the sidebar's width.
-   pub publish_site: usize,
-   /// `f32 rail()`, the server rail's width.
-   pub rail:         usize,
-   /// `call covered(root)` in `Workspace::render`, whose `true` leaves out the
-   /// resize handle.
-   pub handle_site:  usize,
-}
-
-/// Finds [`ChannelSidebar`] from `SidebarResize`'s type name: the width getter
-/// is the only caller of its `Entity::read` that adds the entity's offset to
-/// its first argument and loads an `f32` from the result.
-pub fn channel_sidebar(image: &Image<'_>) -> Found<ChannelSidebar> {
-   let abi = Abi::of(image);
-   if abi != Abi::Win64 {
-      return Err("channel sidebar locator requires Win64".to_owned());
-   }
-   // Type names are pooled without a NUL, so `literal` misses them.
-   let reads = image
-      .find_bytes(SIDEBAR_RESIZE)
-      .into_iter()
-      .flat_map(|text| lea_refs(image, text))
-      .filter_map(|site| Some(image.function_bounds(site)?.0))
-      .collect::<HashSet<_>>();
-   if reads.is_empty() {
-      return Err("SidebarResize is never named in code".to_owned());
-   }
-   let (number, rex_b) = reg(abi.arg(0));
-   // `add arg0, imm32`, then the call, then `movss xmm0, [rax + disp8]`.
-   let add = [0x48 | rex_b, 0x81, 0xC0 | number];
-   let index = call_index(image);
-   let getters = reads
-      .iter()
-      .flat_map(|&read| index.sites(read))
-      .filter(|&site| {
-         image
-            .read(site.wrapping_sub(7), 7 + 5 + 5)
-            .is_some_and(|code| code[..3] == add && code[12..16] == [0xF3, 0x0F, 0x10, 0x40])
-      })
-      .filter_map(|site| Some(image.function_bounds(site)?.0))
-      .collect::<HashSet<_>>()
-      .into_iter()
-      .collect::<Vec<_>>();
-   let width = one("sidebar width getter", &getters)?;
-
-   let (mut columns, mut publishes) = (Vec::new(), Vec::new());
-   for site in index.sites(width) {
-      let Some(after) = image.read(site + 5, 0x18) else {
-         continue;
-      };
-      // Column: `movaps` the width aside, `call rail`, then `subss` it.
-      if let Some(at) = (0..8).find(|&at| after[at] == 0xE8)
-         && after[at + 5..].starts_with(&[0xF3, 0x0F, 0x5C])
-         && let Some(rail) = rel32_target(image, site + 5 + at + 1)
-      {
-         columns.push((site, rail));
-      // Publish: `lea r8, [rsp + disp8]` and `movss [r8], xmm0`.
-      } else if after.starts_with(&[0x4C, 0x8D, 0x44, 0x24])
-         && after[5..].starts_with(&[0xF3, 0x41, 0x0F, 0x11, 0x00])
-      {
-         publishes.push(site);
-      }
-   }
-   let (column_site, rail) = one("sidebar column width", &columns)?;
-   let publish_site = one("sidebar width publish", &publishes)?;
-   match image.function_bounds(rail) {
-      Some((start, end)) if start == rail && end - start <= 0x80 => {},
-      _ => return Err(format!("sidebar rail width {rail:#x} is no small function")),
-   }
-   Ok(ChannelSidebar {
-      column_site,
-      publish_site,
-      rail,
-      handle_site: sidebar_handle_gate(image)?,
-   })
-}
-
-/// The call whose `true` skips the resize handle: before the handle's id,
-/// `Workspace::render` tests it, stores it, and on `true` stores `None` for
-/// the handle and jumps past it:
-/// `test al, al; mov [rbp + disp32], al; je; and qword [rbp + disp32], 0; jmp`.
-fn sidebar_handle_gate(image: &Image<'_>) -> Found<usize> {
-   const GATE: Pattern =
-      Pattern::new("84 C0 88 85 ?? ?? ?? ?? 74 ?? 48 83 A5 ?? ?? ?? ?? 00 E9 ?? ?? ?? ??");
-   const BEFORE: usize = 0x400;
-   let id = id_lea(image, SIDEBAR_HANDLE_ID)?;
-   let start = id.saturating_sub(BEFORE);
-   let code = image
-      .read(start, id - start)
-      .ok_or("sidebar handle is unmapped")?;
-   let at = GATE
-      .find_in(code)
-      .last()
-      .copied()
-      .ok_or("no test skips the sidebar handle")?;
-   let gate = start + at;
-   let skip = rel32_target(image, gate + 19).ok_or("sidebar handle skip does not decode")?;
-   if skip <= id {
-      return Err(format!(
-         "sidebar handle skip {skip:#x} lands before its id at {id:#x}"
-      ));
-   }
-   // Win64 builds put a `nop` after calls inside an unwind scope.
-   [gate.wrapping_sub(6), gate.wrapping_sub(5)]
-      .into_iter()
-      .find(|&site| {
-         image.read(site, 1) == Some(&[0xE8][..])
-            && (site + 5 == gate || image.read(site + 5, 1) == Some(&[0x90][..]))
-            && rel32_target(image, site + 1).is_some_and(|callee| image.is_function(callee))
-      })
-      .ok_or_else(|| format!("no call feeds the sidebar handle test at {gate:#x}"))
-}
-
-/// The channel header toolbar's member list button id.
-const TOOLBAR_MEMBERS_ID: &[u8] = b"tb-members";
-
-/// Where the channel header toolbar builds and adds its member list button,
-/// which plugin header buttons follow.
-#[derive(Debug, Clone, Copy)]
-pub struct ChannelToolbar {
-   /// `call button(out, id, id_len, icon: u16, tooltip: &mut SharedString,
-   /// selected, _, cx)`, the toolbar icon button builder.
-   pub button_site:  usize,
-   /// `call append(out, &mut toolbar, &mut button)`, which pushes the button
-   /// into the toolbar in place and then moves the toolbar to `out`.
-   pub append_site:  usize,
-   /// The button's bytes.
-   pub button_size:  usize,
-   /// Bytes moved from the toolbar to the return slot by `append`.
-   pub toolbar_size: usize,
-   /// Its `Option<Rc<dyn Fn>>` click handler: data, then vtable.
-   pub on_click:     usize,
-}
-
-/// Finds [`ChannelToolbar`] from the member list button's id.
-///
-/// The first call after the id builds the button, the call setting its click
-/// handler gives the handler's offset and the button's size. The append must
-/// take the resulting button, consume the toolbar, and return it via `out`.
-pub fn channel_toolbar(image: &Image<'_>) -> Found<ChannelToolbar> {
-   // `mov [rsi + on_click], rax; lea rax, [vtable]; mov [rsi + on_click + 8],
-   // rax; mov ecx, size`, then the copy to `out`.
-   const SET_CLICK: Pattern =
-      Pattern::new("48 89 86 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 48 89 86 ?? ?? ?? ?? B9 ?? ?? ?? ??");
-   if Abi::of(image) != Abi::Win64 {
-      return Err("channel toolbar locator requires Win64".to_owned());
-   }
-   let id = id_lea(image, TOOLBAR_MEMBERS_ID)?;
-   let (button_site, builder) = calls_in(image, id, 0x20)
-      .first()
-      .copied()
-      .ok_or("no call builds the members toolbar button")?;
-   let func = image
-      .function_bounds(id)
-      .ok_or("members toolbar has no unwind entry")?
-      .0;
-   let calls = straight_calls(image, func);
-   let after = calls
-      .iter()
-      .copied()
-      .filter(|&(site, _)| site > button_site)
-      .collect::<Vec<_>>();
-   let (setter, on_click, size) = after
-      .iter()
-      .find_map(|&(site, callee)| {
-         let code = function_code(image, callee, "").ok()?;
-         let at = SET_CLICK.find_in(code).first().copied()?;
-         let field = |offset: usize| {
-            code
-               .get(at + offset..at + offset + 4)
-               .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
-         };
-         let (data, vtable, size) = (field(3)?, field(17)?, field(22)?);
-         (vtable == data + 8).then_some((site, data, size))
-      })
-      .ok_or("no call sets the members button's click handler")?;
-   let setter_args = image
-      .read(setter.wrapping_sub(11), 11)
-      .ok_or("no toolbar setter arguments")?;
-   if !setter_args.starts_with(&[0x48, 0x8D, 0x8D]) {
-      return Err("toolbar setter has no stack return slot".to_owned());
-   }
-   let appends = after
-      .windows(2)
-      .filter(|pair| pair[0].0 > setter && pair[1].1 != builder)
-      .filter_map(|pair| {
-         let bytes = toolbar_append(image, pair[0], pair[1], &setter_args[3..7], size)?;
-         Some((pair[1].0, bytes))
-      })
-      .collect::<Vec<_>>();
-   let (append_site, toolbar_size) = one("members toolbar append", &appends)?;
-   Ok(ChannelToolbar {
-      button_site,
-      append_site,
-      button_size: fits("toolbar button", size, layout::SCRATCH_CAP)?,
-      toolbar_size: fits("toolbar append return", toolbar_size, layout::SCRATCH_CAP)?,
-      on_click: fits("toolbar button click", on_click + 16, size)? - 16,
-   })
-}
-
-fn toolbar_append(
-   image: &Image<'_>,
-   (finish, finish_fn): (usize, usize),
-   (append, append_fn): (usize, usize),
-   setter_slot: &[u8],
-   button_size: usize,
-) -> Option<usize> {
-   // The finish call takes the setter's output and returns the final button.
-   const FINISH_CALL: Pattern =
-      Pattern::new("48 8D 4D ?? 48 8D 95 ?? ?? ?? ?? 4C 8D 85 ?? ?? ?? ??");
-   const FINISH_COPY: Pattern =
-      Pattern::new("41 B8 ?? ?? ?? ?? 48 89 F1 48 8B 55 ?? E8 ?? ?? ?? ?? 48 89 F0");
-   // Append takes distinct toolbar and button slots, and returns the toolbar.
-   const APPEND_CALL: Pattern =
-      Pattern::new("48 8D 95 ?? ?? ?? ?? 4C 8D 45 ?? 4C 89 F1 E8 ?? ?? ?? ?? 90 4C 89 F0");
-   const APPEND_BODY: Pattern = Pattern::new(
-      "4C 89 C0 48 89 55 ?? 48 89 CB 4C 8D 05 ?? ?? ?? ?? 48 8D 4D ?? 48 89 C2 E8 ?? ?? ?? ?? 90 \
-       0F 10 45 ?? 0F 10 4D ?? 48 8D 55 ?? 0F 29 4A ?? 0F 29 02 48 8B 4D ?? E8 ?? ?? ?? ?? 90 B9 \
-       ?? ?? ?? ?? 48 89 DF 48 8B 75 ?? F3 A4 48 89 D8",
-   );
-   let finish_args = image.read(finish.checked_sub(18)?, 18)?;
-   let append_args = image.read(append.checked_sub(14)?, 23)?;
-   if FINISH_CALL.find_in(finish_args).first() != Some(&0)
-      || &finish_args[7..11] != setter_slot
-      || APPEND_CALL.find_in(append_args).first() != Some(&0)
-      || append_args[10] != finish_args[3]
-   {
-      return None;
-   }
-   let code = function_code(image, finish_fn, "toolbar button finish").ok()?;
-   let at = *FINISH_COPY.find_in(code).first()?;
-   if imm32(image, finish_fn + at + 2)? != button_size {
-      return None;
-   }
-   let code = function_code(image, append_fn, "toolbar append").ok()?;
-   let at = *APPEND_BODY.find_in(code).first()?;
-   // All three reads of the consumed toolbar use the same saved argument.
-   if code[at + 6] != code[at + 52] || code[at + 6] != code[at + 70] {
-      return None;
-   }
-   imm32(image, append_fn + at + 60)
-}
-
-/// `serde_json::from_slice::<Ready>`, `fn(out, &mut SliceRead)`, the first
-/// call of the `READY` handler. Phoenix's session parses READY with it too,
-/// past the registry, so a hook here sees every READY.
-pub fn ready_parse(image: &Image<'_>, ready: usize) -> Found<usize> {
-   let prologue = prologues(image)
-      .ready_parse
-      .ok_or("READY's parse is only known on Win64")?;
-   let &(_, parse) = calls_in(image, ready, 0x80)
-      .first()
-      .ok_or_else(|| format!("READY handler at {ready:#x} makes no call"))?;
-   if prologue.at(image, parse) {
-      Ok(parse)
-   } else {
-      Err(format!(
-         "READY's first call at {parse:#x} opens unlike its parse"
-      ))
-   }
-}
-
-/// The session's READY parse for text under 2 MB, `fn(out, ptr, len) -> out`:
-/// the caller of [`ready_parse`] that builds its reader from the text it takes.
-///
-/// ```text
-/// push r14; push rsi; push rdi; push rbx; sub rsp, imm32; mov rdi, r8
-/// ...
-/// mov [rsp + 0x20], rdx; mov [rsp + 0x28], r8
-/// ```
-pub fn ready_text(image: &Image<'_>, parse: usize) -> Found<usize> {
-   const READER: Pattern = Pattern::new("48 89 54 24 20 4C 89 44 24 28");
-   let prologue = prologues(image)
-      .ready_text
-      .ok_or("READY's text parse is only known on Win64")?;
-   let mut callers = call_sites(image, |callee| callee == parse)
-      .into_iter()
-      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
-      .filter(|&func| {
-         prologue.at(image, func)
-            && image
-               .read(func, 0x40)
-               .is_some_and(|head| !READER.find_in(head).is_empty())
-      })
-      .collect::<Vec<_>>();
-   callers.sort_unstable();
-   callers.dedup();
-   one("READY text parse", &callers)
-}
-
-/// Phoenix's session READY handler, `fn(out, payload)`, which owns the gateway
-/// payload and parses READY itself, past the registry.
-#[derive(Clone, Copy, Debug)]
-pub struct ReadySession {
-   pub func:     usize,
-   /// The payload's kind byte, and the kind whose READY is parsed from the raw
-   /// text. Other kinds carry the gateway's own parse of it.
-   pub kind:     usize,
-   pub raw_kind: u8,
-   /// The raw text's pointer and length.
-   pub raw:      usize,
-   pub raw_len:  usize,
-}
-
-/// The caller of [`ready_parse`] that opens by checking the payload's kind:
-///
-/// ```text
-/// cmp byte ptr [rdx + kind], raw_kind ; 80 BA <kind> <raw_kind>
-/// jne value                           ; 0F 85 <rel32>
-/// mov rdi, [rdx + raw]                ; 48 8B BA <raw>
-/// mov rbx, [rdx + raw_len]            ; 48 8B 9A <raw_len>
-/// ```
-pub fn ready_session(image: &Image<'_>, parse: usize) -> Found<ReadySession> {
-   const CHECK: Pattern = Pattern::new(
-      "80 BA ?? ?? ?? ?? ?? 0F 85 ?? ?? ?? ?? 48 8B BA ?? ?? ?? ?? 48 8B 9A ?? ?? ?? ??",
-   );
-   let disp = |bytes: &[u8], at: usize| {
-      bytes
-         .get(at..at + 4)
-         .and_then(|word| Some(u32::from_le_bytes(word.try_into().ok()?) as usize))
-   };
-   let mut callers = call_sites(image, |callee| callee == parse)
-      .into_iter()
-      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
-      .collect::<Vec<_>>();
-   callers.sort_unstable();
-   callers.dedup();
-   let mut found = Vec::new();
-   for func in callers {
-      if !prologues(image).row.at(image, func) {
-         continue;
-      }
-      let Some(head) = image.read(func, 0x100) else {
-         continue;
-      };
-      let Some(&at) = CHECK.find_in(head).first() else {
-         continue;
-      };
-      let check = &head[at..];
-      if let (Some(kind), Some(raw), Some(raw_len)) =
-         (disp(check, 2), disp(check, 16), disp(check, 23))
-      {
-         found.push(ReadySession {
-            func,
-            kind,
-            raw_kind: check[6],
-            raw,
-            raw_len,
-         });
-      }
-   }
-   match found.as_slice() {
-      [session] if session.raw_len == session.raw + 8 => Ok(*session),
-      [session] => {
-         Err(format!(
-            "READY session at {:#x} reads no &str",
-            session.func
-         ))
-      },
-      _ => Err(format!("{} READY sessions", found.len())),
-   }
 }
 
 /// `MessageContextMenu` builder and native `MenuItem` helpers for injecting
@@ -3665,11 +2899,6 @@ pub struct LinuxPrimaryDisplay {
    pub primary_display: usize,
    pub displays:        usize,
 }
-
-pub const LINUX_PRIMARY_DISPLAY_PROLOGUE: Prologue = Prologue {
-   pattern: Pattern::new("41 57 41 56 53 48 83 EC ?? 48 B8 FF FF FF FF FF FF FF 7F"),
-   len:     19,
-};
 
 pub fn linux_primary_display(image: &Image<'_>) -> Found<LinuxPrimaryDisplay> {
    const PRIMARY: Pattern = Pattern::new(
@@ -4909,7 +4138,7 @@ pub fn message_json(image: &Image<'_>) -> Found<MessageJson> {
 
 /// Each `lea r64, [rip + disp32]` in `code` mapped at `addr`, as (instruction,
 /// target).
-fn rip_leas(code: &[u8], addr: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+pub(crate) fn rip_leas(code: &[u8], addr: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
    memchr::memchr_iter(0x8D, code).filter_map(move |pos| {
       let rex = *code.get(pos.checked_sub(1)?)?;
       let modrm = *code.get(pos + 1)?;
@@ -4927,44 +4156,24 @@ fn rip_leas(code: &[u8], addr: usize) -> impl Iterator<Item = (usize, usize)> + 
 /// Mana's icon names in id order: a `MenuItem`'s icon is the index of its
 /// name in this list.
 ///
-/// The icon table pairs each name with `icons/<Name>.svg`; the paths are read
-/// in a run from `icons/A.svg`, and the ids are their names sorted, which
-/// Discord's own menu icons (`Copy` 0x99, `Id` 0x15b, `Link` 0x177, `Trash`
-/// 0x280 on 2026-11 builds) confirm.
+/// The icon table pairs each name with `icons/<Name>.svg`, and the ids are
+/// the names sorted, which Discord's own menu icons (`Copy` 0x99, `Id` 0x15b,
+/// `Link` 0x177, `Trash` 0x280 on 2026-11 builds) confirm. Linux builds share
+/// 46 of the paths with other strings outside the table's run, so every path
+/// in the image counts.
 pub fn icon_names(image: &Image<'_>) -> Found<Vec<String>> {
-   /// How far apart two paths in the table may sit, a name between them.
-   const GAP: usize = 128;
-   let start = image
-      .find_bytes_iter(b"icons/A.svg")
-      .next()
-      .ok_or("icon table not found")?;
-   let mut names = Vec::new();
-   let mut at = start;
-   while let Some(window) = image.read(at, GAP) {
-      let Some(path) = window.windows(6).position(|w| w == b"icons/") else {
-         break;
-      };
-      let Some(rest) = image.read(at + path + 6, GAP) else {
-         break;
-      };
-      let Some(end) = rest.windows(4).position(|w| w == b".svg") else {
-         break;
-      };
-      let Ok(name) = std::str::from_utf8(&rest[..end]) else {
-         break;
-      };
-      at += path + 6 + end + 4;
-      // `Name.secondary.svg` is a second layer of `Name`, with no id.
-      if name.contains('.') {
-         continue;
-      }
-      if !name.bytes().all(|byte| byte.is_ascii_alphanumeric())
-         || (name == "A" && !names.is_empty())
-      {
-         break;
-      }
-      names.push(name.to_owned());
-   }
+   /// The longest name read.
+   const NAME: usize = 128;
+   let mut names = image
+      .find_bytes_iter(b"icons/")
+      .filter_map(|at| {
+         let rest = image.read(at + 6, NAME)?;
+         let end = rest.iter().position(|byte| !byte.is_ascii_alphanumeric())?;
+         // `Name.secondary.svg` is a second layer of `Name`, with no id.
+         (end > 0 && rest[end..].starts_with(b".svg"))
+            .then(|| String::from_utf8_lossy(&rest[..end]).into_owned())
+      })
+      .collect::<Vec<_>>();
    names.sort_unstable();
    names.dedup();
    let has = |name: &str| {

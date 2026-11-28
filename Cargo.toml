@@ -12,6 +12,7 @@ members  = [
   "crates/sigscan",
   "crates/stand-in",
   "crates/stand-in-demo",
+  "crates/themes",
   "crates/ui-desktop",
   "crates/ui-mobile",
   "crates/wire",
@@ -21,16 +22,14 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "EUPL-1.2"
-version = "0.2.0"
+version = "0.4.0"
 
 [workspace.dependencies]
 android_logger          = { default-features = false, version = "0.15" }
 crc32fast               = "1"
 flub                    = "0.1"
 iced-x86                = { default-features = false, features = [
-  "block_encoder",
   "decoder",
-  "encoder",
   "instr_info",
   "intel",
   "std"
@@ -47,6 +46,7 @@ phoenix-runtime         = { path = "crates/runtime" }
 phoenix-runtime-desktop = { path = "crates/runtime-desktop" }
 phoenix-runtime-mobile  = { path = "crates/runtime-mobile" }
 phoenix-sigs            = { path = "crates/sigs" }
+phoenix-themes          = { path = "crates/themes" }
 phoenix-ui-desktop      = { path = "crates/ui-desktop" }
 phoenix-ui-mobile       = { path = "crates/ui-mobile" }
 phoenix-wire            = { path = "crates/wire" }

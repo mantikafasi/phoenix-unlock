@@ -53,19 +53,19 @@ use phoenix_runtime::{
       Response,
    },
 };
-use phoenix_sigs::{
-   desktop,
-   http::{
-      self,
-      DesktopHttpTransport,
-   },
+use phoenix_sigs::http::{
+   self,
+   DesktopHttpTransport,
 };
 use serde::Deserialize;
 
-use crate::modal::{
-   self,
-   ChoiceOption,
-   ModalSection,
+use crate::{
+   commands,
+   modal::{
+      self,
+      ChoiceOption,
+      ModalSection,
+   },
 };
 
 /// Standard HTTP/1.x `http::header::StandardHeader` names in discriminant
@@ -495,21 +495,14 @@ pub fn install(image: &Image<'static>) {
    // It opens with the same register saves and `sub rsp` as a render frame.
    // SAFETY: runs from `prepare` before Discord's own code, and `send_detour`
    // matches `send`'s Rust ABI.
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
-   let trampoline = match unsafe {
-      image.hook_entry(
-         found.send_fn,
-         pro.pattern,
-         pro.len,
-         send_detour as *const () as usize,
-      )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("discord desktop: HTTP send not hooked: {err}");
-         return;
-      },
-   };
+   let trampoline =
+      match unsafe { image.hook_entry(found.send_fn, send_detour as *const () as usize) } {
+         Ok(trampoline) => trampoline,
+         Err(err) => {
+            log::warn!("discord desktop: HTTP send not hooked: {err}");
+            return;
+         },
+      };
    // SAFETY: `DesktopHttpTransport::locate` verified every target against
    // `.pdata`, and the trampoline replays `send`'s prologue.
    let poll = match found.response {
@@ -709,7 +702,8 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
          }
 
          if installed.poll.is_some() {
-            watched = watch_response(&method, &url);
+            watched =
+               commands::watch(&method, &url).or_else(|| watch_response(&method, &url));
          }
       }))
       .is_err()
@@ -1057,6 +1051,11 @@ pub fn send_channel_id(path: &str) -> Option<&str> {
 /// Desktop has no composer hook, so `phoenix.messages.onSend` runs on the
 /// request that posts a message, before the shared request hooks.
 fn observe(method: &str, url: &str, headers: &[(String, String)], body: &[u8]) -> RequestAction {
+   if let Some(action) =
+      api_path(url).and_then(|path| commands::intercept(method, path, body))
+   {
+      return action;
+   }
    let channel = api_path(url)
       .filter(|_| method.eq_ignore_ascii_case("POST"))
       .and_then(send_channel_id);

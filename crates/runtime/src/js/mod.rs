@@ -147,6 +147,19 @@ impl SeenUrls {
 /// take, since grants are looked up by name.
 const CONSOLE: &str = "console";
 
+/// `phoenix.platform`, the client the runtime is built into.
+const PLATFORM: &str = if cfg!(target_os = "android") {
+   "android"
+} else if cfg!(target_os = "ios") {
+   "ios"
+} else if cfg!(windows) {
+   "windows"
+} else if cfg!(target_os = "macos") {
+   "macos"
+} else {
+   "linux"
+};
+
 pub struct Engine {
    runtime:  Runtime,
    context:  Context,
@@ -183,12 +196,14 @@ impl Budget {
    }
 }
 
+#[derive(Clone)]
 struct Loaded {
    source: String,
    origin: Origin,
    state:  PluginState,
 }
 
+#[derive(Clone)]
 enum Origin {
    Bundled,
    /// Read from `home/plugins`, so the user can delete it.
@@ -266,9 +281,9 @@ pub struct Registry<'js> {
    /// `phoenix.onUnload` callbacks, run when the plugin is turned off,
    /// reloaded or removed.
    unloads:            RefCell<HashMap<String, Vec<Function<'js>>>>,
-   /// The resolve and reject of each promise a worker thread will settle, by
-   /// id.
-   pending:            RefCell<HashMap<u64, (Function<'js>, Function<'js>)>>,
+   /// The plugin, resolve and reject of each promise a worker thread will
+   /// settle, by id.
+   pending:            RefCell<HashMap<u64, (String, Function<'js>, Function<'js>)>>,
    /// `phoenix.discord.onRequest` interceptors, by id.
    request_hooks:      RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.discord.onResponse` interceptors, by id.
@@ -414,12 +429,14 @@ impl Engine {
       self.plugins.get(name).map(|loaded| loaded.source.clone())
    }
 
-   /// The bundled copy an installed one replaced.
+   /// The bundled copy, whether it runs or an installed one replaced it.
    #[must_use]
    pub fn bundled(&self, name: &str) -> Option<String> {
-      match &self.plugins.get(name)?.origin {
+      let loaded = self.plugins.get(name)?;
+      match &loaded.origin {
+         Origin::Bundled => Some(loaded.source.clone()),
          Origin::Replacing(bundled) => Some(bundled.clone()),
-         Origin::Bundled | Origin::Installed => None,
+         Origin::Installed => None,
       }
    }
 
@@ -531,6 +548,10 @@ impl Engine {
          registry.defined.borrow_mut().remove(name);
          registry.granted.borrow_mut().remove(name);
          registry
+            .pending
+            .borrow_mut()
+            .retain(|_, (plugin, ..)| plugin != name);
+         registry
             .request_hooks
             .borrow_mut()
             .retain(|_, (plugin, _)| plugin != name);
@@ -581,7 +602,12 @@ impl Engine {
 
    /// Adds `name` or replaces its source, then runs it unless the user turned
    /// it off.
-   pub fn install(&mut self, name: &str, source: String) {
+   ///
+   /// New code that throws while starting is dropped and its error returned.
+   /// The version that ran before runs again, and a new plugin is not added.
+   /// Over a version that already failed, the new code stays.
+   pub fn install(&mut self, name: &str, source: String) -> Result<(), String> {
+      let previous = self.plugins.get(name).cloned();
       let enabled = if let Some(loaded) = self.plugins.get_mut(name) {
          loaded.install(source);
          loaded.state.is_on()
@@ -591,9 +617,32 @@ impl Engine {
          self.plugins.insert(name.to_owned(), loaded);
          true
       };
-      if enabled {
-         self.unload(name);
-         self.eval(name);
+      if !enabled {
+         return Ok(());
+      }
+      self.unload(name);
+      self.eval(name);
+      let Some(error) = self
+         .plugins
+         .get(name)
+         .and_then(|loaded| loaded.state.error())
+         .map(str::to_owned)
+      else {
+         return Ok(());
+      };
+      match previous {
+         Some(previous) if matches!(previous.state, PluginState::On) => {
+            self.unload(name);
+            self.plugins.insert(name.to_owned(), previous);
+            self.eval(name);
+            Err(error)
+         },
+         Some(_) => Ok(()),
+         None => {
+            self.unload(name);
+            self.plugins.remove(name);
+            Err(error)
+         },
       }
    }
 
@@ -873,6 +922,7 @@ fn api<'js>(
    if permissions.allows(Permission::Messages) {
       api.set("messages", messages)?;
    }
+   api.set("platform", PLATFORM)?;
    api.set("log", log_object(ctx, plugin)?)?;
    api.set("storage", storage(ctx, plugin)?)?;
    api.set("settings", settings_object(ctx, plugin)?)?;
@@ -891,10 +941,11 @@ fn api<'js>(
       })?,
    )?;
    if permissions.allows(Permission::Gateway) {
-      api.set("stores", stores_object(ctx)?)?;
+      api.set("stores", stores_object(ctx, plugin)?)?;
    }
    api.set("discord", discord_object(ctx, plugin, permissions)?)?;
    let granted = Arc::clone(permissions);
+   let owner = plugin.to_owned();
    api.set(
       "fetch",
       Function::new(
@@ -909,7 +960,7 @@ fn api<'js>(
                   ),
                ));
             }
-            start_fetch(&ctx, url, init.0)
+            start_fetch(&ctx, &owner, url, init.0)
          },
       )?,
    )?;
@@ -1077,5 +1128,26 @@ mod tests {
    fn a_missing_directory_has_no_plugins() {
       let dir = std::env::temp_dir().join("phoenix-installed-missing-directory");
       assert_eq!(installed(&dir).unwrap(), Vec::<(String, String)>::new());
+   }
+
+   fn loaded(state: PluginState) -> Loaded {
+      let mut loaded = Loaded::new("const works = 1;".to_owned(), Origin::Installed);
+      loaded.state = state;
+      loaded
+   }
+
+   #[test]
+   fn code_for_a_plugin_that_is_off_is_saved_without_running() {
+      let mut engine = Engine::new(&GatewayRegistry::default()).expect("engine initializes");
+      engine
+         .plugins
+         .insert("p".to_owned(), loaded(PluginState::Off));
+      let broken = "throw new Error('boom');";
+      assert!(engine.install("p", broken.to_owned()).is_ok());
+      assert_eq!(engine.source("p").as_deref(), Some(broken));
+      assert!(matches!(
+         engine.plugins.get("p").map(|loaded| &loaded.state),
+         Some(PluginState::Off)
+      ));
    }
 }

@@ -10,10 +10,11 @@
 
 mod accessories;
 mod badges;
+mod call_idle;
+mod commands;
 mod composer;
 mod config;
 mod context_menu;
-#[cfg(target_arch = "x86_64")]
 mod counts;
 mod discord;
 mod discord_version;
@@ -22,11 +23,13 @@ mod emoji;
 mod fetch;
 mod gateway_send;
 mod gpui;
+mod gpui_font;
 mod gpui_theme;
 mod headers;
 mod health;
 mod icons;
 mod js;
+pub mod mana_theme;
 mod members;
 mod message;
 mod modal;
@@ -42,8 +45,9 @@ mod restart;
 mod settings;
 mod shortcuts;
 mod sidebar;
+mod spotify;
 mod staff;
-mod theme_css;
+mod sticker;
 mod toolbar;
 
 use std::{
@@ -60,10 +64,7 @@ use std::{
    time::Duration,
 };
 
-use phoenix_hook::{
-   image::Image,
-   x86::Abi,
-};
+use phoenix_hook::image::Image;
 use phoenix_runtime::{
    Error,
    Notice,
@@ -90,10 +91,6 @@ use phoenix_runtime::{
    },
 };
 use phoenix_sigs::{
-   desktop::{
-      Prologue,
-      Prologues,
-   },
    index::{
       Index,
       Isa,
@@ -149,8 +146,8 @@ struct HealthReply {
 /// what they locate stays off.
 pub(crate) const X86_CODE: bool = cfg!(all(target_arch = "x86_64", not(target_os = "macos")));
 
-/// Hooks `target` with `detour` past the prologue `pick` chooses, and returns
-/// the trampoline as `F`, or logs the error after `what`.
+/// Hooks `target` with `detour` and returns the trampoline as `F`, or logs the
+/// error after `what`.
 ///
 /// # Safety
 ///
@@ -158,15 +155,13 @@ pub(crate) const X86_CODE: bool = cfg!(all(target_arch = "x86_64", not(target_os
 /// is its function pointer type.
 pub(crate) unsafe fn hook<F: Copy>(
    image: &Image<'static>,
-   pick: impl FnOnce(Prologues) -> Prologue,
    target: usize,
    detour: usize,
    what: &str,
 ) -> Option<F> {
    const { assert!(size_of::<F>() == size_of::<usize>()) };
-   let prologue = pick(Prologues::of(Abi::of(image)));
    // SAFETY: forwarded from the caller.
-   match unsafe { image.hook_entry(target, prologue.pattern, prologue.len, detour) } {
+   match unsafe { image.hook_entry(target, detour) } {
       // SAFETY: the trampoline runs `target`'s displaced instructions, so it
       // has `F`'s ABI.
       Ok(trampoline) => Some(unsafe { std::mem::transmute_copy::<usize, F>(&trampoline) }),
@@ -187,19 +182,17 @@ pub(crate) unsafe fn hook<F: Copy>(
 /// sret ABI, and `F` is its function pointer type.
 pub(crate) unsafe fn hook_sret<F: Copy>(
    image: &Image<'static>,
-   pick: impl FnOnce(Prologues) -> Prologue,
    target: usize,
    detour: usize,
    what: &str,
 ) -> Option<F> {
    const { assert!(size_of::<F>() == size_of::<usize>()) };
-   let prologue = pick(Prologues::of(Abi::of(image)));
    // SAFETY: forwarded from the caller.
    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-   let hooked = unsafe { image.hook_sret_entry(target, prologue.pattern, prologue.len, detour) };
+   let hooked = unsafe { image.hook_sret_entry(target, detour) };
    // SAFETY: forwarded from the caller.
    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-   let hooked = unsafe { image.hook_entry(target, prologue.pattern, prologue.len, detour) };
+   let hooked = unsafe { image.hook_entry(target, detour) };
    let orig = match hooked {
       Ok(orig) => orig,
       Err(err) => {
@@ -239,13 +232,10 @@ pub fn prepare() -> Result<(), Error> {
       log::error!("screen share: startup panicked");
    }
    settings::install(&image, &ix);
-   // macOS falls back to a settings window and AppKit panels without them.
-   if X86_CODE {
-      critical(
-         "gpui",
-         require(gpui::located(), "GPUI builders did not decode"),
-      );
-   }
+   critical(
+      "gpui",
+      require(gpui::located(), "GPUI builders did not decode"),
+   );
    critical(
       "settings",
       require(
@@ -259,12 +249,8 @@ pub fn prepare() -> Result<(), Error> {
    modal::install(&image);
    let modal = require(modal::hooked(), "Workspace::render_overlays is not hooked");
    health::record("notices", health::Kind::Feature, modal.clone());
-   if X86_CODE {
-      critical("modal", modal);
-   } else {
-      health::record("modal", health::Kind::Feature, modal);
-   }
-   feature("context_menu", || context_menu::install(&image));
+   critical("modal", modal);
+   feature("context_menu", || context_menu::install(&image, &ix));
    // Before accessories hooks `MessageRow::render`, whose prologue the header
    // locators check.
    let header = X86_CODE.then(|| headers::locate(&image, &ix));
@@ -273,21 +259,28 @@ pub fn prepare() -> Result<(), Error> {
    if let Some(header) = header {
       feature("headers", || headers::install(&image, header));
       feature("message", || message::install(&image));
-      #[cfg(target_arch = "x86_64")]
-      feature("counts", || counts::install(&image));
    } else {
       #[cfg(target_os = "macos")]
       feature("headers", || headers::arm64::install(&image));
    }
+   feature("counts", || counts::install(&image, &ix));
    feature("icons", || icons::install(&image));
    feature("composer", || composer::install(&image));
-   feature("sidebar", || sidebar::install(&image));
-   feature("toolbar", || toolbar::install(&image));
+   feature("composer_buttons", || composer::buttons::install(&image, &ix));
+   feature("spotify", || spotify::install(&ix));
+   feature("sidebar", || sidebar::install(&image, &ix));
+   feature("toolbar", || toolbar::install(&image, &ix));
    feature("badges", || badges::install(&image, &ix));
    feature("emoji", || emoji::install(&image, &ix));
-   #[cfg(windows)]
-   feature("gpui_theme", || gpui_theme::install(&image));
+   feature("sticker", || sticker::install(&image, &ix));
+   feature("call_idle_dm", || call_idle::install_dm(&image, &ix));
+   feature("call_idle_afk", || call_idle::install_guild_afk(&image, &ix));
+   feature("gpui_font", || gpui_font::install(&image, &ix));
+   feature("mana_theme", || mana_theme::install(&image, &ix));
+   feature("gpui_theme", || gpui_theme::install(&image, &ix));
    feature("os_redraw", || <os::Os as os::DesktopOs>::install(&image));
+   #[cfg(target_os = "linux")]
+   feature("shortcuts", shortcuts::linux::install);
    let registry = phoenix_runtime::hook(&image);
    critical(
       "gateway",
@@ -305,7 +298,7 @@ pub fn prepare() -> Result<(), Error> {
       feature("optimistic_delete", || {
          accessories::install_optimistic_delete(&image, &ix);
       });
-      feature("ready", || ready::install(&image));
+      feature("ready", || ready::install(&image, &ix));
    }
    #[cfg(target_os = "macos")]
    feature("message_writer", || message::writer::install(&image));
@@ -333,6 +326,7 @@ pub fn open_gate_only() -> Result<(), Error> {
 
 /// Starts phoenix inside Desktop Phoenix, on what [`prepare`] hooked.
 pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
+   mana_theme::load_persisted(&home);
    // `recovery` stages plugins for the loader it installs on every OS.
    phoenix_runtime::update::adopt_staged(&home, &home.join("plugins"));
    let prepared = PREPARED
@@ -656,12 +650,224 @@ impl Platform for Desktop {
                modal_rendered: modal::rendered(),
             }))
          },
+         ("GET", "/themes/tokens") => {
+            let names = remote::query_param(&request.query, "names").and_then(|raw| {
+               let list: Vec<String> = raw
+                  .split(',')
+                  .map(|part| part.trim().to_owned())
+                  .filter(|part| !part.is_empty())
+                  .collect();
+               (!list.is_empty()).then_some(list)
+            });
+            Some(remote::ok_json(&mana_theme::debug_tokens(names.as_deref())))
+         },
+         ("POST", "/themes/reload") => {
+            #[derive(serde::Serialize)]
+            struct ReloadReply {
+               reloaded: bool,
+               active:   bool,
+            }
+            if mana_theme::is_supported() {
+               match mana_theme::reload_active() {
+                  Ok(reloaded) => {
+                     Some(remote::ok_json(&ReloadReply {
+                        reloaded: reloaded.is_some(),
+                        active:   reloaded.unwrap_or(false),
+                     }))
+                  },
+                  Err(err) => Some(remote::err("400 Bad Request", &err)),
+               }
+            } else {
+               Some(remote::err(
+                  "503 Service Unavailable",
+                  "themes are not supported on this build",
+               ))
+            }
+         },
+         ("GET", "/themes/quick-css") => {
+            #[derive(serde::Serialize)]
+            struct QuickCssReply {
+               quick_css: String,
+            }
+            Some(remote::ok_json(&QuickCssReply {
+               quick_css: mana_theme::quick_css(),
+            }))
+         },
+         ("POST", "/themes/quick-css") => {
+            #[derive(serde::Deserialize)]
+            struct QuickCssBody {
+               css: String,
+            }
+            #[derive(serde::Serialize)]
+            struct QuickCssSaved {
+               saved: bool,
+            }
+            if !mana_theme::is_supported() {
+               return Some(remote::err(
+                  "503 Service Unavailable",
+                  "themes are not supported on this build",
+               ));
+            }
+            let Ok(parsed) = serde_json::from_slice::<QuickCssBody>(&request.body) else {
+               return Some(remote::err(
+                  "400 Bad Request",
+                  "expected JSON body {\"css\": \"...\"}",
+               ));
+            };
+            match mana_theme::set_quick_css(&parsed.css) {
+               Ok(()) => Some(remote::ok_json(&QuickCssSaved { saved: true })),
+               Err(err) => Some(remote::err("409 Conflict", &err)),
+            }
+         },
+         #[cfg(all(target_os = "macos", debug_assertions))]
+         ("GET", "/ui/screen") => Some(screen()),
+         #[cfg(all(target_os = "macos", debug_assertions))]
+         ("POST", "/ui/input") => Some(input(&request.body)),
          _ => None,
       }
    }
 
    fn routes(&self) -> &'static str {
-      ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health"
+      if cfg!(all(target_os = "macos", debug_assertions)) {
+         ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health, GET /themes/tokens, \
+          POST /themes/reload, GET /themes/quick-css, POST /themes/quick-css, GET /ui/screen, \
+          POST /ui/input"
+      } else {
+         ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health, GET /themes/tokens, \
+          POST /themes/reload, GET /themes/quick-css, POST /themes/quick-css"
+      }
+   }
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn screen() -> remote::Reply {
+   phoenix_ui_desktop::input::screenshot().map_or_else(
+      || remote::err("503 Service Unavailable", "no window to capture"),
+      |png| ("200 OK", "image/png", png),
+   )
+}
+
+/// One input for `POST /ui/input`, in points from the window's top left.
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum Input {
+   Click {
+      x:     f64,
+      y:     f64,
+      #[serde(default)]
+      count: u8,
+      #[serde(default)]
+      right: bool,
+   },
+   Scroll {
+      x:  f64,
+      y:  f64,
+      #[serde(default)]
+      dx: i32,
+      dy: i32,
+   },
+   Text {
+      text: String,
+   },
+   Key {
+      key:  KeyName,
+      #[serde(default)]
+      mods: Vec<Modifier>,
+   },
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Modifier {
+   Shift,
+   Control,
+   Option,
+   Command,
+}
+
+/// A named key, or one character like `"k"`.
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum KeyName {
+   Named(NamedKey),
+   Char(char),
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum NamedKey {
+   Return,
+   Tab,
+   Escape,
+   Backspace,
+   Delete,
+   Left,
+   Right,
+   Down,
+   Up,
+   Home,
+   End,
+   PageUp,
+   PageDown,
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn input(body: &[u8]) -> remote::Reply {
+   use phoenix_ui_desktop::input::{
+      Key,
+      modifier,
+   };
+   let Ok(input) = serde_json::from_slice::<Input>(body) else {
+      return remote::err(
+         "400 Bad Request",
+         "expected a click, scroll, text or key input",
+      );
+   };
+   let done = match input {
+      Input::Click { x, y, count, right } => phoenix_ui_desktop::input::click(x, y, count, right),
+      Input::Scroll { x, y, dx, dy } => phoenix_ui_desktop::input::scroll(x, y, dx, dy),
+      Input::Text { text } => phoenix_ui_desktop::input::type_text(&text),
+      Input::Key { key, mods } => {
+         let key = match key {
+            KeyName::Char(char) => Key::Char(char),
+            KeyName::Named(named) => {
+               match named {
+                  NamedKey::Return => Key::Return,
+                  NamedKey::Tab => Key::Tab,
+                  NamedKey::Escape => Key::Escape,
+                  NamedKey::Backspace => Key::Backspace,
+                  NamedKey::Delete => Key::Delete,
+                  NamedKey::Left => Key::Left,
+                  NamedKey::Right => Key::Right,
+                  NamedKey::Down => Key::Down,
+                  NamedKey::Up => Key::Up,
+                  NamedKey::Home => Key::Home,
+                  NamedKey::End => Key::End,
+                  NamedKey::PageUp => Key::PageUp,
+                  NamedKey::PageDown => Key::PageDown,
+               }
+            },
+         };
+         let flags = mods.into_iter().fold(0, |flags, held| {
+            flags
+               | match held {
+                  Modifier::Shift => modifier::SHIFT,
+                  Modifier::Control => modifier::CONTROL,
+                  Modifier::Option => modifier::OPTION,
+                  Modifier::Command => modifier::COMMAND,
+               }
+         });
+         phoenix_ui_desktop::input::press(key, flags)
+      },
+   };
+   if done {
+      remote::ok_json(&Done::Started)
+   } else {
+      remote::err("503 Service Unavailable", "no window to send input to")
    }
 }
 

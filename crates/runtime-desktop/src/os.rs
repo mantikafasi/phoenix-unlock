@@ -16,13 +16,6 @@ pub trait DesktopOs {
    fn force_redraw(validation_offset: usize);
 
    /// The calling thread's id as the OS and debuggers show it.
-   #[cfg_attr(
-      not(any(windows, target_os = "linux")),
-      expect(
-         dead_code,
-         reason = "phoenix.native.hook, its one reader, runs on Windows and Linux"
-      )
-   )]
    fn current_thread_id() -> u32;
 
    /// Where `image` is mapped, so addresses print as the offsets `sigscan`
@@ -384,13 +377,10 @@ mod linux {
             return;
          },
       };
-      let prologue = desktop::LINUX_PRIMARY_DISPLAY_PROLOGUE;
       // SAFETY: from `prepare`, before Discord's threads run.
       let trampoline = match unsafe {
          image.hook_entry(
             found.primary_display,
-            prologue.pattern,
-            prologue.len,
             primary_display_detour as *const () as usize,
          )
       } {
@@ -426,23 +416,16 @@ mod linux {
                return;
             },
          };
-         let prologue = desktop::Prologues::of(x86::Abi::of(image)).frame;
          // SAFETY: from `prepare`, before Discord's threads run; the detour
          // has `frame`'s signature.
-         let trampoline = match unsafe {
-            image.hook_entry(
-               found.frame,
-               prologue.pattern,
-               prologue.len,
-               frame_detour as *const () as usize,
-            )
-         } {
-            Ok(trampoline) => trampoline,
-            Err(err) => {
-               log::warn!("desktop redraw: {err}");
-               return;
-            },
-         };
+         let trampoline =
+            match unsafe { image.hook_entry(found.frame, frame_detour as *const () as usize) } {
+               Ok(trampoline) => trampoline,
+               Err(err) => {
+                  log::warn!("desktop redraw: {err}");
+                  return;
+               },
+            };
          // SAFETY: both are functions of these signatures, located by sigs.
          let _ = FRAME.set(unsafe {
             Frame {
