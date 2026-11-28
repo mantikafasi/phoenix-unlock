@@ -235,7 +235,7 @@ pub fn invalidate_discord_windows() {
 }
 
 /// The message id currently being rendered on this thread on macOS arm64.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 pub fn current_rendering_message_id() -> u64 {
    arm64::current_rendering_message_id()
 }
@@ -248,7 +248,7 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    }
 
    if !crate::X86_CODE {
-      #[cfg(target_os = "macos")]
+      #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
       arm64::install(image, ix);
       return;
    }
@@ -534,7 +534,7 @@ mod tests {
 /// the 0x20-byte `AnyElement` through `x8`, which a Rust `extern "C"` function
 /// returning [`RawAnyElement`] does too, so the detour is native. Extra stack
 /// words are read from the caller's frame and passed back unchanged.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 mod arm64 {
    use std::sync::{
       OnceLock,
