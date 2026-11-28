@@ -6,6 +6,8 @@ mod lockdown;
 pub mod messages;
 mod settings;
 mod storage;
+mod timers;
+pub mod web;
 
 use std::{
    borrow::Cow,
@@ -282,6 +284,8 @@ pub struct Registry<'js> {
    seen:               RefCell<SeenUrls>,
    /// `phoenix.messages.onSend` interceptors in registration order, by id.
    pub interceptors:   RefCell<Vec<(u64, String, Function<'js>)>>,
+   /// `setTimeout` and `setInterval` timers, by id.
+   timers:             RefCell<HashMap<u64, timers::Timer<'js>>>,
 }
 
 // SAFETY: every field is bound to 'js, and Changed swaps exactly that lifetime.
@@ -289,15 +293,48 @@ unsafe impl<'js> JsLifetime<'js> for Registry<'js> {
    type Changed<'to> = Registry<'to>;
 }
 
-/// A plugin's source as the body of a function of its `phoenix` object.
+/// The web names each plugin gets as parameters of its own, in the order
+/// [`compile`] declares them: code ported from other client mods calls
+/// `setTimeout` or `console.log` as it would in a browser.
+const WEB_NAMES: [&str; 8] = [
+   "setTimeout",
+   "clearTimeout",
+   "setInterval",
+   "clearInterval",
+   "TextEncoder",
+   "TextDecoder",
+   "crypto",
+   "console",
+];
+
+/// A plugin's source as the body of a function of its `phoenix` object and
+/// the [`WEB_NAMES`].
 ///
 /// The realm's `Function` constructor parses it as a function body, so the
 /// source cannot close the function early and declare script-level bindings
-/// every other plugin's free names would resolve to.
+/// every other plugin's free names would resolve to. The source sits in a
+/// function of its own inside that one, so a plugin declaring its own
+/// `console` or `crypto` shadows the web name instead of failing to parse.
 pub fn compile<'js>(ctx: &Ctx<'js>, source: &str) -> rquickjs::Result<Function<'js>> {
+   let mut args = vec!["phoenix".to_owned()];
+   args.extend(WEB_NAMES.map(str::to_owned));
+   args.push(format!("return (function (phoenix) {{\n{source}\n}})(phoenix);"));
    ctx.globals()
-      .get::<_, Function<'js>>("Function")?
-      .call(("phoenix", source))
+      .get::<_, rquickjs::function::Constructor<'js>>("Function")?
+      .construct((Rest(args),))
+}
+
+/// The values of the [`WEB_NAMES`] for `plugin`, whose `console` writes
+/// through `phoenix.log`.
+fn web_names<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   phoenix: &Object<'js>,
+) -> rquickjs::Result<Vec<Value<'js>>> {
+   let names = Object::new(ctx.clone())?;
+   timers::add_timers(ctx, plugin, &names)?;
+   web::add_web(ctx, &names, &phoenix.get::<_, Object<'js>>("log")?)?;
+   WEB_NAMES.iter().map(|name| names.get(*name)).collect()
 }
 
 #[expect(clippy::needless_pass_by_value, reason = "used as a map_err callback")]
@@ -495,7 +532,8 @@ impl Engine {
             self.with(|ctx| {
                let run = || -> rquickjs::Result<()> {
                   let phoenix = api(&ctx, name, &permissions)?;
-                  compile(&ctx, source)?.call((phoenix,))
+                  let names = web_names(&ctx, name, &phoenix)?;
+                  compile(&ctx, source)?.call((phoenix, Rest(names)))
                };
                run().catch(&ctx).map_err(js_error)
             })
@@ -534,6 +572,7 @@ impl Engine {
          }
          registry.defined.borrow_mut().remove(name);
          registry.granted.borrow_mut().remove(name);
+         timers::forget(&ctx, name);
          registry
             .request_hooks
             .borrow_mut()
@@ -716,6 +755,9 @@ impl Engine {
                if let Some(platform) = crate::platform() {
                   platform.console(&ctx, &phoenix)?;
                }
+               for (name, value) in WEB_NAMES.iter().zip(web_names(&ctx, CONSOLE, &phoenix)?) {
+                  ctx.globals().set(*name, value)?;
+               }
                ctx.globals().set("phoenix", phoenix)?;
             }
             let result = ctx.eval::<Value<'_>, _>(code)?;
@@ -862,6 +904,7 @@ fn registry<'js>(
       granted: RefCell::default(),
       seen: RefCell::default(),
       interceptors: RefCell::default(),
+      timers: RefCell::default(),
    })
 }
 
@@ -1115,6 +1158,201 @@ mod tests {
       let mut loaded = Loaded::new("const works = 1;".to_owned(), Origin::Installed);
       loaded.state = state;
       loaded
+   }
+
+   /// Runs `code` as plugin `plugin` and keeps its `phoenix` object, so later
+   /// calls can read what its callbacks did through `phoenix.seen()`.
+   fn run_as(
+      engine: &Engine,
+      plugin: &str,
+      code: &str,
+   ) -> Result<(String, rquickjs::Persistent<Object<'static>>), String> {
+      engine.with(|ctx| {
+         let run = || -> rquickjs::Result<_> {
+            // `api` reads the started runtime's state, which tests have none of.
+            let phoenix = Object::new(ctx.clone())?;
+            phoenix.set("log", log_object(&ctx, plugin)?)?;
+            let names = web_names(&ctx, plugin, &phoenix)?;
+            let value: Value<'_> = compile(&ctx, code)?.call((phoenix.clone(), Rest(names)))?;
+            let text = match value.as_string() {
+               Some(text) => text.to_string()?,
+               None => {
+                  ctx.json_stringify(value)?
+                     .map(|json| json.to_string())
+                     .transpose()?
+                     .unwrap_or_default()
+               },
+            };
+            Ok((text, rquickjs::Persistent::save(&ctx, phoenix)))
+         };
+         run().catch(&ctx).map_err(|err| err.to_string())
+      })
+   }
+
+   fn seen(engine: &Engine, phoenix: &rquickjs::Persistent<Object<'static>>) -> String {
+      engine.with(|ctx| {
+         phoenix
+            .clone()
+            .restore(&ctx)
+            .and_then(|phoenix| phoenix.get::<_, Function<'_>>("seen"))
+            .and_then(|seen| seen.call::<_, String>(()))
+            .catch(&ctx)
+            .map_err(|err| err.to_string())
+            .unwrap()
+      })
+   }
+
+   /// The deadline queue is process-wide, so a test taking due ids could take
+   /// another test's.
+   static TIMERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+   fn fire_due(engine: &Engine) {
+      for id in timers::due_now() {
+         engine.fire(id);
+      }
+   }
+
+   const RECORDER: &str = "const log = []; phoenix.seen = () => log.join(',');";
+
+   #[test]
+   fn timers_run_once_repeat_and_clear() {
+      let _serial = TIMERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      let engine = Engine::new(&GatewayRegistry::default()).expect("engine initializes");
+      let (_, phoenix) = run_as(&engine, "timers", &format!(
+         "{RECORDER}
+         setTimeout((a, b) => log.push(`once:${{a}}${{b}}`), 0, 'x', 'y');
+         const cleared = setTimeout(() => log.push('cleared'), 0);
+         clearTimeout(cleared);
+         let runs = 0;
+         const every = setInterval(() => {{ log.push('every'); if (++runs === 2) clearInterval(every); }}, 0);
+         return typeof every;"
+      ))
+      .unwrap();
+      fire_due(&engine);
+      assert_eq!(seen(&engine, &phoenix), "once:xy");
+      for _ in 0..4 {
+         std::thread::sleep(Duration::from_millis(5));
+         fire_due(&engine);
+      }
+      assert_eq!(seen(&engine, &phoenix), "once:xy,every,every");
+   }
+
+   #[test]
+   fn timers_belong_to_their_plugin() {
+      let _serial = TIMERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      let engine = Engine::new(&GatewayRegistry::default()).expect("engine initializes");
+      let (id, owner) = run_as(&engine, "owner", &format!(
+         "{RECORDER} setTimeout(() => log.push('ran'), 0); \
+          phoenix.later = setTimeout(() => log.push('unloaded'), 0); \
+          return String(phoenix.later);"
+      ))
+      .unwrap();
+      run_as(&engine, "other", &format!("clearTimeout({id}); clearInterval({id});")).unwrap();
+      engine.unload("owner");
+      fire_due(&engine);
+      assert_eq!(seen(&engine, &owner), "");
+      let (_, again) = run_as(&engine, "owner2", &format!(
+         "{RECORDER} const id = setTimeout(() => log.push('ran'), 0); return id;"
+      ))
+      .unwrap();
+      let (id, _) = run_as(&engine, "owner2", "return String(setTimeout(() => {}, 0));").unwrap();
+      run_as(&engine, "other", &format!("clearTimeout({id});")).unwrap();
+      fire_due(&engine);
+      assert_eq!(seen(&engine, &again), "ran");
+      assert!(run_as(&engine, "t", "setTimeout('log.push(1)', 0);").is_err());
+   }
+
+   #[test]
+   fn text_encoding_round_trips_utf8() {
+      let engine = Engine::new(&GatewayRegistry::default()).expect("engine initializes");
+      let run = |code: &str| run_as(&engine, "text", code).map(|(text, _)| text);
+      assert_eq!(
+         run("return Array.from(new TextEncoder().encode('é🔐')).join(',');").unwrap(),
+         "195,169,240,159,148,144"
+      );
+      assert_eq!(
+         run("return new TextDecoder().decode(new TextEncoder().encode('ä ü 🔐'));").unwrap(),
+         "ä ü 🔐"
+      );
+      assert_eq!(
+         run("return new TextDecoder().decode(new Uint8Array([0xEF, 0xBB, 0xBF, 0x61]));").unwrap(),
+         "a"
+      );
+      assert_eq!(
+         run("const b = new Uint8Array([0, 0x68, 0x69, 0]); \
+              return new TextDecoder('utf8').decode(new DataView(b.buffer, 1, 2));")
+         .unwrap(),
+         "hi"
+      );
+      assert!(run("new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array([0xFF]));").is_err());
+      assert!(run("new TextDecoder('latin1');").is_err());
+   }
+
+   #[test]
+   fn crypto_fills_integer_views_and_makes_uuids() {
+      let engine = Engine::new(&GatewayRegistry::default()).expect("engine initializes");
+      let run = |code: &str| run_as(&engine, "crypto", code).map(|(text, _)| text);
+      assert_eq!(
+         run("const a = crypto.getRandomValues(new Uint32Array(64)); \
+              return String(a.length === 64 && a.some(x => x !== 0));")
+         .unwrap(),
+         "true"
+      );
+      assert!(run("crypto.getRandomValues(new Float32Array(4));").is_err());
+      assert!(run("crypto.getRandomValues(new Uint8Array(65537));").is_err());
+      let uuid = run("return crypto.randomUUID();").unwrap();
+      assert_eq!(uuid.len(), 36);
+      assert_eq!(&uuid[14..15], "4");
+      assert!(matches!(&uuid[19..20], "8" | "9" | "a" | "b"));
+      assert_ne!(uuid, run("return crypto.randomUUID();").unwrap());
+   }
+
+   #[test]
+   fn console_and_free_names_reach_plugins() {
+      let engine = Engine::new(&GatewayRegistry::default()).expect("engine initializes");
+      assert_eq!(
+         run_as(&engine, "c", "console.log('hi', { a: 1 }); \
+              return [typeof setTimeout, typeof console.warn, typeof crypto.randomUUID].join();")
+         .map(|(text, _)| text)
+         .unwrap(),
+         "function,function,function"
+      );
+   }
+
+   #[test]
+   fn plugins_may_declare_the_web_names_themselves() {
+      let engine = Engine::new(&GatewayRegistry::default()).expect("engine initializes");
+      assert_eq!(
+         run_as(&engine, "own", "const console = { log: () => 'own' }; let crypto = 1; \
+                return console.log() + crypto;")
+         .map(|(text, _)| text)
+         .unwrap(),
+         "own1"
+      );
+      assert_eq!(
+         run_as(&engine, "strict", "'use strict'; return typeof this;").map(|(text, _)| text).unwrap(),
+         "undefined"
+      );
+   }
+
+   #[test]
+   fn responses_hand_out_their_bytes() {
+      let engine = Engine::new(&GatewayRegistry::default()).expect("engine initializes");
+      let text = engine.with(|ctx| {
+         let response = http::response_object(&ctx, &crate::fetch::Response {
+            status: 200,
+            body:   vec![0, 255, 104, 105],
+         })
+         .unwrap();
+         let check: Function<'_> = ctx
+            .eval(
+               "(r) => [r.arrayBuffer().byteLength, Array.from(r.bytes()).join(' '), \
+                r.text().slice(2)].join('|')",
+            )
+            .unwrap();
+         check.call::<_, String>((response,)).unwrap()
+      });
+      assert_eq!(text, "4|0 255 104 105|hi");
    }
 
    #[test]
