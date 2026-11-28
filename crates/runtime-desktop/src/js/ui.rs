@@ -1561,6 +1561,8 @@ pub fn desktop_patch_api<'js>(
    api: &Object<'js>,
    messages: &Object<'js>,
 ) -> rquickjs::Result<()> {
+   #[cfg(windows)]
+   super::message_hooks::register(ctx, plugin, messages)?;
    let name = plugin.to_owned();
    messages.set(
       "onSend",

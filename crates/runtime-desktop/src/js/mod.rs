@@ -2,6 +2,7 @@
 //! accessories, and `phoenix.native` for the console.
 
 pub mod fonts;
+#[cfg(windows)] pub mod message_hooks;
 pub mod native;
 pub mod themes;
 pub mod ui;
@@ -82,6 +83,8 @@ pub struct Desktop<'js> {
    pub hidden_counts:  RefCell<Vec<(u64, String, Count)>>,
    /// `phoenix.ui.disableCallIdle` holds by id and plugin.
    pub idle_off:       RefCell<Vec<(u64, String, Timer)>>,
+   #[cfg(windows)]
+   message_hooks:      RefCell<message_hooks::Hooks<'js>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -107,6 +110,8 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
    };
+   #[cfg(windows)]
+   registry.message_hooks.borrow_mut().remove(|hook| hook.plugin == name);
    let mut list = registry.accessories.borrow_mut();
    let before = list.len();
    list.retain(|entry| entry.plugin != name);

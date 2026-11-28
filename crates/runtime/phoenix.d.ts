@@ -1243,6 +1243,16 @@ declare namespace Phoenix {
     [key: string]: unknown;
   }
 
+  interface PreSendContext {
+    channelId: string;
+  }
+
+  interface PreEditContext extends PreSendContext {
+    messageId: string;
+  }
+
+  type MessageHookResult = false | void | Promise<false | void>;
+
   /// Messages shown only on this device. Nothing reaches Discord, and they land just before the
   /// next gateway event Phoenix handles.
   interface Messages {
@@ -1253,6 +1263,13 @@ declare namespace Phoenix {
     /// Runs before a message from the message box is sent, after any slash command. Return a
     /// string to send that instead, `false` to cancel, or nothing to leave it.
     onSend(interceptor: (text: string, ctx: UiContext) => string | false | void): Remover;
+    /// Windows. Mutate the message payload or return false to cancel sending. Runs after onSend
+    /// and before discord.onRequest. Hooks run in registration order and await promises on the
+    /// transport worker. Supports JSON and multipart payload_json. An unsupported body, a failure,
+    /// a promise requiring a GUI thread to wait, or a 60-second timeout cancels the request.
+    onPreSend?(handler: (message: SendPayload, ctx: PreSendContext) => MessageHookResult): Remover;
+    /// Windows. Like onPreSend, for edits of existing channel messages.
+    onPreEdit?(handler: (message: SendPayload, ctx: PreEditContext) => MessageHookResult): Remover;
     /// Runs when a custom emoji is pressed in the emoji picker under the message box (not the
     /// reaction picker), with its id. Return text to add to the end of the message box instead of
     /// what Phoenix would do (insert it, or show a Nitro ad for a locked one), or nothing to leave

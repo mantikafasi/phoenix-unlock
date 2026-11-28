@@ -276,6 +276,14 @@ pub fn engine() -> Option<std::sync::MutexGuard<'static, js::Engine>> {
    )
 }
 
+pub fn try_engine() -> Option<std::sync::MutexGuard<'static, js::Engine>> {
+   match STATE.get()?.js.try_lock() {
+      Ok(engine) => Some(engine),
+      Err(std::sync::TryLockError::Poisoned(err)) => Some(err.into_inner()),
+      Err(std::sync::TryLockError::WouldBlock) => None,
+   }
+}
+
 /// Runs matching `phoenix.discord.onRequest` hooks on an outgoing Discord API
 /// request.
 #[must_use]
