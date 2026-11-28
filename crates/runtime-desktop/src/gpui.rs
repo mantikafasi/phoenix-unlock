@@ -1057,12 +1057,28 @@ impl Builder {
    }
 
    fn text_line(&self, text: &str, color_hsla: [f32; 4], font_px: f32) -> Option<RawDiv> {
+      self.text_line_weighted(text, color_hsla, font_px, None)
+   }
+
+   /// [`Self::text_line`] with a font weight, like 600 for semibold, where the
+   /// build's style has one.
+   fn text_line_weighted(
+      &self,
+      text: &str,
+      color_hsla: [f32; 4],
+      font_px: f32,
+      weight: Option<f32>,
+   ) -> Option<RawDiv> {
       let str_into_any = self.sym.str_into_any?;
       let mut line_div = self.raw_div();
       self.style_div(&mut line_div, |s| {
          s.length(s.at.font_size, gpui_px(font_px));
          s.length(s.at.line_height, gpui_px(font_px + 4.0));
          s.hsla(s.at.text_color, color_hsla);
+         if let (Some(field), Some(weight)) = (s.at.font_weight, weight) {
+            // `Some(FontWeight(weight))`, laid out as `Some(f32)`.
+            s.float(field, weight);
+         }
       });
       let mut ss = SharedString::from_str(text);
       // SAFETY: moves the `SharedString` into a 32-byte `AnyElement` and
@@ -1556,6 +1572,11 @@ fn svg_icon(
 /// `pieces` side by side in a row: each piece's icons when it has any and
 /// they can be drawn, else its text.
 fn inline_row(b: &Builder, pieces: &[Piece], font_px: f32) -> RawDiv {
+   inline_row_weighted(b, pieces, font_px, None)
+}
+
+/// [`inline_row`] with its text at `weight`.
+fn inline_row_weighted(b: &Builder, pieces: &[Piece], font_px: f32, weight: Option<f32>) -> RawDiv {
    let mut row = b.h_row(4.0, false);
    for piece in pieces {
       let hsla = piece.color.map_or_else(accessory_muted, argb_to_hsla);
@@ -1573,7 +1594,7 @@ fn inline_row(b: &Builder, pieces: &[Piece], font_px: f32) -> RawDiv {
          }
          row = b.push_div(row, icons);
       } else if !piece.text.is_empty()
-         && let Some(line) = b.text_line(&piece.text, hsla, font_px)
+         && let Some(line) = b.text_line_weighted(&piece.text, hsla, font_px, weight)
       {
          row = b.push_div(row, line);
       }
@@ -1610,6 +1631,42 @@ pub fn append_pieces(div: *mut c_void, pieces: &[Piece], lead: f32) -> bool {
          .cast::<c_void>();
       push(children, any.as_mut_ptr());
    }
+   true
+}
+
+/// Wraps a rendered `RawAnyElement` in place with `rows` of pieces under it,
+/// each row its pieces side by side, like Vencord's lines at the bottom of a
+/// tooltip, their text at `weight`. Without `drawn`, `sret` holds no element
+/// yet and gets the rows alone.
+pub fn wrap_with_rows(
+   sret: *mut RawAnyElement,
+   drawn: bool,
+   rows: &[Vec<Piece>],
+   font_px: f32,
+   weight: Option<f32>,
+) -> bool {
+   let Some(sym) = SYMBOLS.get() else {
+      return false;
+   };
+   if sym.div_push_any.is_none() || sym.str_into_any.is_none() || rows.is_empty() {
+      return false;
+   }
+   let b = Builder { sym };
+   let mut outer = b.v_stack(6.0);
+   if drawn {
+      // SAFETY: takes the rendered element out of `sret`; a replacement or
+      // the element itself goes back before returning.
+      let mut orig = unsafe { ptr::read(sret) };
+      if !b.push_any(&mut outer, &mut orig) {
+         // SAFETY: puts the element back where it was taken from.
+         unsafe { ptr::write(sret, orig) };
+         return false;
+      }
+   }
+   for pieces in rows {
+      outer = b.push_div(outer, inline_row_weighted(&b, pieces, font_px, weight));
+   }
+   b.write_any(outer, sret);
    true
 }
 

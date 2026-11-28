@@ -1506,6 +1506,14 @@ declare namespace Phoenix {
       priority?: number;
       render(ctx: { userId: string }): Rendered;
     }): Remover;
+    /// A row at the bottom of a server's tooltip in the server list, each piece side by side:
+    /// colored text, a little larger and bolder than the tooltip's own, or icons. Desktop only,
+    /// and absent on runtimes from before it. It runs once per server, off Discord's UI thread,
+    /// and what it returns is kept until `update(guildId)`. Return nothing to add no row.
+    addServerTooltip?(options: {
+      priority?: number;
+      render(ctx: { guildId: string }): Rendered | Rendered[];
+    }): Remover;
     /// A row in the message long-press menu, above Delete. The menu closes on press.
     addMessageAction(options: {
       label: string;

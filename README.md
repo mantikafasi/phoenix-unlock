@@ -169,7 +169,7 @@ Run `node web/tools/bundle-plugins.ts --out <dir> my-plugin` to bundle one plugi
 | API | Use it for |
 |---|---|
 | `phoenix.gateway`, `phoenix.on`, `phoenix.hook` | Watching or changing gateway events as Phoenix handles them. |
-| `phoenix.ui` | Buttons, message accessories and actions, decorations, profile content, dialogs, pages, notifications, clipboard, and toasts. |
+| `phoenix.ui` | Buttons, message accessories and actions, decorations, server tooltips, profile content, dialogs, pages, notifications, clipboard, and toasts. |
 | `phoenix.commands` | Slash commands in the message box. |
 | `phoenix.messages` | Local-only messages and interceptors for text you send. |
 | `phoenix.settings`, `phoenix.storage`, `phoenix.log` | Settings controls, per-plugin JSON storage, and log lines. |

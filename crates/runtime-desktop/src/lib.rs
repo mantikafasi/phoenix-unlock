@@ -39,6 +39,7 @@ mod ready;
 mod recovery;
 #[cfg(windows)]
 mod restart;
+mod server_tooltip;
 mod settings;
 mod shortcuts;
 mod sidebar;
@@ -257,6 +258,7 @@ pub fn prepare() -> Result<(), Error> {
       feature("headers", || headers::arm64::install(&image));
    }
    feature("counts", || counts::install(&image, &ix));
+   feature("server_tooltip", || server_tooltip::install(&image, &ix));
    feature("icons", || icons::install(&image));
    feature("composer", || composer::install(&image));
    feature("composer_buttons", || composer::buttons::install(&image, &ix));
