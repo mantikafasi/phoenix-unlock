@@ -151,10 +151,12 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 
 /// A request whose response `onResponse` hooks wait for.
 pub struct InFlight {
-   method: String,
-   path:   String,
-   hooks:  Vec<u64>,
-   at:     Instant,
+   method:  String,
+   path:    String,
+   hooks:   Vec<u64>,
+   /// The platform's own change to the body, made before the hooks run.
+   rewrite: Option<fn(Vec<u8>) -> Vec<u8>>,
+   at:      Instant,
 }
 
 /// By the platform's id for the request.
@@ -225,8 +227,27 @@ pub fn watch_response(method: &str, url: &str) -> Option<InFlight> {
          method: method.to_owned(),
          path: path.to_owned(),
          hooks,
+         rewrite: None,
          at: Instant::now(),
       }
+   })
+}
+
+/// Like [`watch_response`], with `rewrite` changing the body before any hook
+/// sees it.
+#[must_use]
+pub fn watch_rewritten(
+   method: &str,
+   url: &str,
+   rewrite: fn(Vec<u8>) -> Vec<u8>,
+) -> Option<InFlight> {
+   let path = api_path(url)?;
+   Some(InFlight {
+      method: method.to_owned(),
+      path: path.to_owned(),
+      hooks: matching_response_hooks(method, path),
+      rewrite: Some(rewrite),
+      at: Instant::now(),
    })
 }
 
@@ -260,6 +281,13 @@ pub fn take_response(id: u64) -> Option<InFlight> {
 /// body to deliver, the originals when they take longer than 4 seconds. Blocks.
 #[must_use]
 pub fn run_response_hooks(in_flight: InFlight, status: i32, body: Vec<u8>) -> (i32, Vec<u8>) {
+   let body = match in_flight.rewrite {
+      Some(rewrite) => rewrite(body),
+      None => body,
+   };
+   if in_flight.hooks.is_empty() {
+      return (status, body);
+   }
    let original = body.clone();
    let (sender, receiver) = mpsc::channel::<(i32, Vec<u8>)>();
    crate::intercept_response(

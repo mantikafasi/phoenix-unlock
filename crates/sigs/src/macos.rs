@@ -1636,11 +1636,56 @@ pub fn pages_under_frame(image: &Image<'_>) -> Found<usize> {
 /// `Ok(())` niche tag on macOS arm64.
 pub fn gateway_send(image: &Image<'_>) -> Found<crate::gateway_send::DesktopGatewaySend> {
    use crate::gateway_send::{
-      ADOPT_ANCHOR,
       DesktopGatewaySend,
-      START_SEND_PANIC,
       START_SEND_SLOT_OFFSET,
       find_sink_slots,
+   };
+
+   let (vtable, start_send_fn, ok_tag) = gateway_sink(image)?;
+   let mut start_send_slots = find_sink_slots(image, start_send_fn);
+   let direct = vtable + START_SEND_SLOT_OFFSET;
+   if !start_send_slots.contains(&direct) {
+      start_send_slots.push(direct);
+   }
+   start_send_slots.sort_unstable();
+
+   Ok(DesktopGatewaySend {
+      start_send_slots,
+      start_send_fn,
+      ok_tag,
+   })
+}
+
+/// [`crate::gateway_send::DesktopGatewayRecv`] on macOS arm64: each function
+/// boxing the `SocketSink` loads the stream's vtable next.
+pub fn gateway_recv(image: &Image<'_>) -> Found<crate::gateway_send::DesktopGatewayRecv> {
+   use crate::gateway_send::{
+      stream_vtable_poll_next,
+      streams,
+   };
+
+   let (sink, ..) = gateway_sink(image)?;
+   let polls = refs_to(image, &[sink])
+      .into_iter()
+      .filter_map(|(site, _)| {
+         let (_, code) = arm64::function(image, site)?;
+         let (_, target) = code
+            .iter()
+            .zip(loaded(&code))
+            .filter(|&(&(at, _), _)| at > site)
+            .find_map(|(_, load)| load.filter(|&(_, target)| target != sink))?;
+         stream_vtable_poll_next(image, target)
+      })
+      .collect();
+   streams(image, polls)
+}
+
+/// `(vtable, start_send, ok_tag)` of the `SocketSink` the gateway connect
+/// function boxes.
+fn gateway_sink(image: &Image<'_>) -> Found<(usize, usize, u64)> {
+   use crate::gateway_send::{
+      ADOPT_ANCHOR,
+      START_SEND_PANIC,
       sink_vtable_start_send,
    };
 
@@ -1679,20 +1724,7 @@ pub fn gateway_send(image: &Image<'_>) -> Found<crate::gateway_send::DesktopGate
    }
    matches.sort_unstable();
    matches.dedup_by_key(|&mut (_, start_send, _)| start_send);
-   let (vtable, start_send_fn, ok_tag) = one("SocketSink vtable", &matches)?;
-
-   let mut start_send_slots = find_sink_slots(image, start_send_fn);
-   let direct = vtable + START_SEND_SLOT_OFFSET;
-   if !start_send_slots.contains(&direct) {
-      start_send_slots.push(direct);
-   }
-   start_send_slots.sort_unstable();
-
-   Ok(DesktopGatewaySend {
-      start_send_slots,
-      start_send_fn,
-      ok_tag,
-   })
+   one("SocketSink vtable", &matches)
 }
 
 /// Decodes the `Ok(())` niche discriminant (`u64::MAX - 1` or `u64::MAX`) that

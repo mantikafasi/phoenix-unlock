@@ -41,7 +41,10 @@ use phoenix_sigs::{
       BinaryFile,
       Machine,
    },
-   gateway_send::DesktopGatewaySend,
+   gateway_send::{
+      DesktopGatewayRecv,
+      DesktopGatewaySend,
+   },
    http::DesktopHttpTransport,
    index::{
       Index,
@@ -309,6 +312,17 @@ fn check(
             }),
          );
          report(
+            "gateway receive",
+            DesktopGatewayRecv::locate(image).map(|recv| {
+               recv
+                  .streams
+                  .iter()
+                  .map(|stream| format!("{} ({} slots)", at(stream.poll_next), stream.slots.len()))
+                  .collect::<Vec<_>>()
+                  .join(", ")
+            }),
+         );
+         report(
             "host allocator",
             match http
                .as_ref()
@@ -562,6 +576,17 @@ fn check(
                   gw.start_send_slots.len(),
                   gw.ok_tag
                )
+            }),
+         );
+         report(
+            "gateway receive",
+            phoenix_sigs::macos::gateway_recv(image).map(|recv| {
+               recv
+                  .streams
+                  .iter()
+                  .map(|stream| format!("{} ({} slots)", at(stream.poll_next), stream.slots.len()))
+                  .collect::<Vec<_>>()
+                  .join(", ")
             }),
          );
          report(

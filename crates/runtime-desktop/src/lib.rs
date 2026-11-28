@@ -11,6 +11,7 @@
 mod accessories;
 mod badges;
 mod call_idle;
+mod commands;
 mod composer;
 mod config;
 mod context_menu;
