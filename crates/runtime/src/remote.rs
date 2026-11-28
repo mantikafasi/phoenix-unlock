@@ -25,6 +25,10 @@ use std::{
       MutexGuard,
       OnceLock,
       PoisonError,
+      atomic::{
+         AtomicBool,
+         Ordering,
+      },
    },
    thread,
    time::Duration,
@@ -53,6 +57,8 @@ const MAX_BODY: usize = 4 << 20;
 const MAX_EVENTS_LOG: usize = 256;
 
 static SHELL: Mutex<Shell> = Mutex::new(Shell::Off);
+/// Trace producers read this on every event, so keep the disabled path lock-free.
+static ENABLED: AtomicBool = AtomicBool::new(false);
 
 static EVENTS: Ring = Ring::new(MAX_EVENTS_LOG);
 
@@ -170,7 +176,7 @@ fn shell() -> MutexGuard<'static, Shell> {
 
 #[must_use]
 pub fn enabled() -> bool {
-   matches!(*shell(), Shell::Armed | Shell::Listening(_))
+   ENABLED.load(Ordering::Relaxed)
 }
 
 /// Flips the switch without starting a listener.
@@ -182,6 +188,7 @@ pub fn set_flag(on: bool) {
       (false, Shell::Off | Shell::Armed) => Shell::Off,
       (false, Shell::Listening(addr) | Shell::Stopping(addr)) => Shell::Stopping(*addr),
    };
+   ENABLED.store(on, Ordering::Relaxed);
 }
 
 pub fn set_enabled(on: bool) {
@@ -344,6 +351,7 @@ pub fn ensure_started() {
          let mut state = shell();
          if matches!(*state, Shell::Stopping(_)) {
             *state = Shell::Off;
+            ENABLED.store(false, Ordering::Relaxed);
             break;
          }
          drop(state);
