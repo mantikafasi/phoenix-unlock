@@ -603,7 +603,14 @@ pub fn host_allocator(image: &Image<'_>, alloc_or_oom: usize) -> Found<(usize, u
       .read(dealloc, dealloc_end - dealloc)
       .ok_or("__rust_dealloc is unmapped")?;
    let negates = words(code).any(|word| word & 0xFFE0_FFE0 == 0xCB00_03E0);
-   let counts = words(code).any(|word| word & 0xFF20_FC00 == 0xF820_0000);
+   let ldadd = |code: &[u8]| words(code).any(|word| word & 0xFF20_FC00 == 0xF820_0000);
+   // Linux builds use outline atomics: the `ldadd` sits in an
+   // `__aarch64_ldadd8_*` helper the dealloc reaches through a stub.
+   let counts = ldadd(code)
+      || flattened_at(image, dealloc).into_iter().any(|(_, insn)| {
+         matches!(insn, Insn::Bl { target } | Insn::B { target }
+            if image.read(target, 12 * 4).is_some_and(ldadd))
+      });
    if dealloc != end || !negates || !counts {
       return Err(format!(
          "no __rust_dealloc after __rust_alloc {alloc:#x} (next {dealloc:#x})"
@@ -884,7 +891,20 @@ pub fn flattened_at(image: &Image<'_>, func: usize) -> Vec<(usize, Insn)> {
       return Vec::new();
    };
    let mut out = Vec::with_capacity(body.len());
+   let span = body.first().map_or(0, |&(pc, _)| pc)..body.last().map_or(0, |&(pc, _)| pc + 4);
+   // Linux builds also leave a function through a tail `b` into an outlined
+   // epilogue (`mov w2, #size; add sp, ..; b memcpy`).
+   let elf = image.function_starts.is_none();
    for (pc, insn) in body {
+      if elf
+         && let Insn::B { target } = insn
+         && !span.contains(&target)
+         && let Some((prefix, tail)) = stub(image, target)
+      {
+         out.extend(prefix.into_iter().map(|insn| (pc, insn)));
+         out.push((pc, tail.map_or(Insn::Ret, |tail| Insn::B { target: tail })));
+         continue;
+      }
       let Some((prefix, tail)) = calls(&[insn]).next().and_then(|target| stub(image, target))
       else {
          out.push((pc, insn));
@@ -898,10 +918,23 @@ pub fn flattened_at(image: &Image<'_>, func: usize) -> Vec<(usize, Insn)> {
 
 /// A stub's instructions before its `b T` (with `T`) or `ret` (without).
 fn stub(image: &Image<'_>, at: usize) -> Option<(Vec<Insn>, Option<usize>)> {
-   const MOST: usize = 6;
+   // Linux arm64 builds (ELF, no `LC_FUNCTION_STARTS`) outline longer runs,
+   // such as a handler setter's stores, epilogue and `mov w2, #size; b memcpy`
+   // in one 9-instruction stub.
+   let most = if image.function_starts.is_none() {
+      12
+   } else {
+      6
+   };
    let mut prefix = Vec::new();
-   for (_, insn) in arm64::decode_all(image.read(at, MOST * 4)?, at) {
+   let code = image.read(at, most * 4).or_else(|| image.read(at, 6 * 4))?;
+   for (_, insn) in arm64::decode_all(code, at) {
       match insn {
+         // A lone `b` is a linker veneer, which ELF builds past the 128 MB
+         // `bl` reach put in front of far stubs.
+         Insn::B { target } if prefix.is_empty() && target != at && most > 6 => {
+            return stub_behind_veneer(image, target).or(Some((prefix, Some(target))));
+         },
          Insn::B { target } => return Some((prefix, Some(target))),
          Insn::Ret => return Some((prefix, None)),
          Insn::Bl { .. }
@@ -915,6 +948,15 @@ fn stub(image: &Image<'_>, at: usize) -> Option<(Vec<Insn>, Option<usize>)> {
       }
    }
    None
+}
+
+/// The stub a veneer jumps to, unless that is itself another veneer.
+fn stub_behind_veneer(image: &Image<'_>, at: usize) -> Option<(Vec<Insn>, Option<usize>)> {
+   let first = arm64::decode_all(image.read(at, 4)?, at).next()?.1;
+   if matches!(first, Insn::B { .. }) {
+      return None;
+   }
+   stub(image, at)
 }
 
 /// `stp`/`ldp` of 64-bit registers at a signed offset: `(load, rt, rt2, rn,

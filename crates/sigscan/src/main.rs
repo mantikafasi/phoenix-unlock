@@ -92,7 +92,7 @@ fn main() -> misstep::Result<()> {
       Some("check") => {
          let macho = matches!(parsed, BinaryFile::MachO(_));
          let family = if parsed.machine() == Machine::X86_64
-            || macho && !image.find_bytes(MACOS_DESKTOP).is_empty()
+            || parsed.machine() == Machine::Aarch64 && !image.find_bytes(MACOS_DESKTOP).is_empty()
          {
             Family::Desktop
          } else {
@@ -529,7 +529,7 @@ fn check(
          );
       },
       // macOS Phoenix, the desktop client built for arm64.
-      Machine::Aarch64 if macho && !image.find_bytes(MACOS_DESKTOP).is_empty() => {
+      Machine::Aarch64 if !image.find_bytes(MACOS_DESKTOP).is_empty() => {
          report(
             "malloc re-exec",
             image
