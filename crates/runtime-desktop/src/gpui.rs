@@ -1554,6 +1554,7 @@ const DESKTOP_FULL: &[&str] = &[
    "clear-urls",
    "fix-embeds",
    "platform-indicators",
+   "screen-share",
 ];
 
 const DESKTOP_PARTIAL: &[&str] = &["fakenitro"];
