@@ -446,7 +446,7 @@ function handleStreamAttempt(
   return { modified, nextPayload };
 }
 
-const streamFilters: RequestFilter[] = [
+const streamFilters: Phoenix.RequestFilter[] = [
   { pathIncludes: "/streams" },
   { pathIncludes: "/voice" },
   { pathIncludes: "/call" },
