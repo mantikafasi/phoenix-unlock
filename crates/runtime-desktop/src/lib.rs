@@ -45,6 +45,7 @@ mod shortcuts;
 mod sidebar;
 mod spotify;
 mod staff;
+mod sticker;
 mod toolbar;
 #[cfg(windows)] mod surfaces;
 
@@ -268,6 +269,7 @@ pub fn prepare() -> Result<(), Error> {
    feature("toolbar", || toolbar::install(&image, &ix));
    feature("badges", || badges::install(&image, &ix));
    feature("emoji", || emoji::install(&image, &ix));
+   feature("sticker", || sticker::install(&image, &ix));
    feature("call_idle_dm", || call_idle::install_dm(&image, &ix));
    feature("call_idle_afk", || call_idle::install_guild_afk(&image, &ix));
    feature("gpui_font", || gpui_font::install(&image, &ix));

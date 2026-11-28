@@ -19,6 +19,8 @@ pub mod settings;
 pub mod spotify;
 pub mod staff;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod sticker;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod surfaces;
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
@@ -35,6 +37,36 @@ use crate::{
       Step,
    },
 };
+
+/// One instruction's bytes as Discord ships them and as patched. An x86 patch
+/// is one byte and an arm64 one a whole aligned instruction, so a thread at
+/// `site` runs the old or the new instruction whole.
+#[derive(Clone, Copy, Debug)]
+pub struct CodePatch {
+   pub site:    usize,
+   pub len:     usize,
+   pub shipped: [u8; 4],
+   pub patched: [u8; 4],
+}
+
+impl CodePatch {
+   pub(crate) fn at(ix: &Index<'_>, site: usize, patched: &[u8]) -> Found<Self> {
+      let len = patched.len();
+      let shipped = ix
+         .image
+         .read(site, len)
+         .ok_or_else(|| format!("{site:#x} is unmapped"))?;
+      let mut patch = Self {
+         site,
+         len,
+         shipped: [0; 4],
+         patched: [0; 4],
+      };
+      patch.shipped[..len].copy_from_slice(shipped);
+      patch.patched[..len].copy_from_slice(patched);
+      Ok(patch)
+   }
+}
 
 /// Binaries built from one Rust tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +121,18 @@ pub const LOCATORS: &[Locator] = &[
       name:     "composer buttons",
       families: DESKTOP,
       run:      |ix| composer::composer_buttons(ix).map(|func| format!("{func:#x}")),
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "sticker send",
+      families: DESKTOP,
+      run:      |ix| sticker::sticker_send(ix).and_then(|func| hookable(ix, func)),
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "sticker gates",
+      families: DESKTOP,
+      run:      |ix| sticker::locked_gates(ix).map(|patches| format!("{patches:x?}")),
    },
    Locator {
       name:     "menu submenu",

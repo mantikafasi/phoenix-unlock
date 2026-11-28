@@ -46,6 +46,7 @@ use crate::{
       self,
       Tweak,
    },
+   sticker,
    toolbar,
 };
 
@@ -68,6 +69,8 @@ pub struct Desktop<'js> {
    /// `phoenix.messages.onEmojiPick` handlers by id and plugin. Desktop has
    /// no picker presses to give them, only the unlock they turn on.
    pub emoji_pickers:    RefCell<Vec<(u64, String)>>,
+   /// `phoenix.messages.onStickerPick` handlers by id and plugin.
+   pub sticker_pickers:  RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.onEvent("rowDoubleTap")` handlers by id and plugin.
    pub double_taps:      RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.hide` holds by id and plugin.
@@ -107,10 +110,13 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
    type Changed<'to> = Desktop<'to>;
 }
 
-#[cfg(windows)]
 fn unload_ui_extensions(registry: &Desktop<'_>, plugin: &str) {
-   surfaces::unload(registry, plugin);
-   navigation_menus::unload(registry, plugin);
+   ui::unload_composer_buttons(registry, plugin);
+   #[cfg(windows)]
+   {
+      surfaces::unload(registry, plugin);
+      navigation_menus::unload(registry, plugin);
+   }
 }
 
 /// Drops the accessories, member decorations, context menu actions, open page
@@ -121,8 +127,6 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
    };
-   #[cfg(windows)]
-   unload_ui_extensions(&registry, name);
    let mut list = registry.accessories.borrow_mut();
    let before = list.len();
    list.retain(|entry| entry.plugin != name);
@@ -168,6 +172,9 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    emoji::unlock(!pickers.is_empty());
    drop(pickers);
 
+   registry.sticker_pickers.borrow_mut().retain(|(_, plugin, _)| plugin != name);
+   sticker::set_active(!registry.sticker_pickers.borrow().is_empty());
+
    let mut taps = registry.double_taps.borrow_mut();
    taps.retain(|(_, plugin, _)| plugin != name);
    double_click::set_active(!taps.is_empty());
@@ -208,7 +215,7 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
          !held
       });
 
-   ui::unload_composer_buttons(&registry, name);
+   unload_ui_extensions(&registry, name);
 
    registry
       .shortcuts

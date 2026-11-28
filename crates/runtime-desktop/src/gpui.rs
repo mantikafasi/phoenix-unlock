@@ -1706,11 +1706,12 @@ const DESKTOP_FULL: &[&str] = &[
    "font-changer",
    "collapse-channels",
    "desktop-themes",
+   "fakenitro",
 ];
 
-const DESKTOP_PARTIAL: &[&str] = &["fakenitro"];
+const DESKTOP_PARTIAL: &[&str] = &["hide-composer-buttons", "reviewdb"];
 
-const MOBILE_ONLY: &[&str] = &["hide-composer-buttons", "reviewdb", "taptap", "example"];
+const MOBILE_ONLY: &[&str] = &["taptap", "example"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DesktopCompat {

@@ -92,6 +92,7 @@ use crate::{
       self,
       Tweak,
    },
+   sticker,
    toolbar,
 };
 
@@ -1693,11 +1694,13 @@ pub fn desktop_patch_api<'js>(
          move |ctx: Ctx<'js>, _function: Opt<Value<'js>>| on_emoji_pick(&ctx, &name),
       )?,
    )?;
+   let name = plugin.to_owned();
    messages.set(
       "onStickerPick",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, _function: Opt<Value<'js>>| {
-         noop_handle(&ctx)
-      })?,
+      Function::new(
+         ctx.clone(),
+         move |ctx: Ctx<'js>, function: Function<'js>| on_sticker_pick(&ctx, &name, function),
+      )?,
    )?;
    let commands = Object::new(ctx.clone())?;
    commands.set(
@@ -2076,6 +2079,69 @@ fn on_emoji_pick<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function
          pickers.retain(|(existing, _)| *existing != id);
          emoji::unlock(!pickers.is_empty());
       }
+   })
+}
+
+fn on_sticker_pick<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   function: Function<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT: AtomicU64 = AtomicU64::new(0);
+
+   let id = NEXT.fetch_add(1, Ordering::Relaxed);
+   let registry = ctx
+      .userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .sticker_pickers
+      .borrow_mut()
+      .push((id, plugin.to_owned(), function));
+   sticker::set_active(true);
+   drop(registry);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut pickers = registry.sticker_pickers.borrow_mut();
+         pickers.retain(|(existing, ..)| *existing != id);
+         sticker::set_active(!pickers.is_empty());
+      }
+   })
+}
+
+/// Offers sticker `sticker_id`, chosen in `channel_id`, to the
+/// `onStickerPick` handlers, and whether one took it.
+pub fn pick_sticker(engine: &Engine, sticker_id: u64, channel_id: u64) -> bool {
+   engine.with(|ctx| {
+      let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+         return false;
+      };
+      let handlers = registry
+         .sticker_pickers
+         .borrow()
+         .iter()
+         .map(|(_, plugin, handler)| (plugin.clone(), handler.clone()))
+         .collect::<Vec<_>>();
+      drop(registry);
+      let Ok(context) = Object::new(ctx.clone()) else {
+         return false;
+      };
+      let _ = context.set("channelId", channel_id.to_string());
+      if let Ok(reply) = Function::new(ctx.clone(), String::new) {
+         let _ = context.set("reply", reply);
+      }
+      let id = sticker_id.to_string();
+      for (plugin, handler) in handlers {
+         restart_budget(&ctx);
+         match handler
+            .call::<_, Value<'_>>((id.as_str(), context.clone()))
+            .catch(&ctx)
+         {
+            Ok(taken) if taken.as_bool() == Some(true) => return true,
+            Ok(_) => {},
+            Err(err) => log::error!("[{plugin}] onStickerPick: {err}"),
+         }
+      }
+      false
    })
 }
 

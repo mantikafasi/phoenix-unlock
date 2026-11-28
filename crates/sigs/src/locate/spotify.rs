@@ -12,39 +12,10 @@ use crate::{
       Op,
       Reg,
    },
+   locate::CodePatch,
 };
 
 const NO_THUMB: &str = "Desktop Phoenix has no Thumb-2 build";
-
-/// One instruction's bytes as Discord ships them and as patched. An x86 patch
-/// is one byte and an arm64 one a whole aligned instruction, so a thread at
-/// `site` runs the old or the new instruction whole.
-#[derive(Clone, Copy, Debug)]
-pub struct CodePatch {
-   pub site:    usize,
-   pub len:     usize,
-   pub shipped: [u8; 4],
-   pub patched: [u8; 4],
-}
-
-impl CodePatch {
-   fn at(ix: &Index<'_>, site: usize, patched: &[u8]) -> Found<Self> {
-      let len = patched.len();
-      let shipped = ix
-         .image
-         .read(site, len)
-         .ok_or_else(|| format!("{site:#x} is unmapped"))?;
-      let mut patch = Self {
-         site,
-         len,
-         shipped: [0; 4],
-         patched: [0; 4],
-      };
-      patch.shipped[..len].copy_from_slice(shipped);
-      patch.patched[..len].copy_from_slice(patched);
-      Ok(patch)
-   }
-}
 
 /// The entry of the function that pauses Spotify after 30 s of talking in
 /// voice, which logs `spotify: playback auto paused`, made to return at once.
