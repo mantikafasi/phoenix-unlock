@@ -71,7 +71,6 @@ pub struct Index<'img> {
 }
 
 impl<'img> Index<'img> {
-
    /// The arm64 outlined stub at `target`: its steps before its tail `b T`
    /// (with `T`) or `ret` (without). A stub is a few frameless instructions
    /// with no calls, branches or stack moves. Mach-O builds keep them to 6
@@ -91,7 +90,9 @@ impl<'img> Index<'img> {
       for step in op::decode_head(self.image, self.isa, target, target + most * 4, most) {
          match step.op {
             Op::Jump(tail) if prefix.is_empty() && elf && veneer && tail != target => {
-               return self.outlined_from(tail, false).or(Some((prefix, Some(tail))));
+               return self
+                  .outlined_from(tail, false)
+                  .or(Some((prefix, Some(tail))));
             },
             Op::Jump(tail) => return Some((prefix, Some(tail))),
             Op::Ret => return Some((prefix, None)),
@@ -666,10 +667,25 @@ impl<'ix> Func<'ix> {
             out.push(step);
             continue;
          };
-         out.extend(prefix.into_iter().map(|inner| Step { at: step.at, ..inner }));
+         out.extend(prefix.into_iter().map(|inner| {
+            Step {
+               at: step.at,
+               ..inner
+            }
+         }));
          match tail {
-            Some(tail) => out.push(Step { op: tail_op(tail), ..step }),
-            None if matches!(step.op, Op::Jump(_)) => out.push(Step { op: Op::Ret, ..step }),
+            Some(tail) => {
+               out.push(Step {
+                  op: tail_op(tail),
+                  ..step
+               });
+            },
+            None if matches!(step.op, Op::Jump(_)) => {
+               out.push(Step {
+                  op: Op::Ret,
+                  ..step
+               });
+            },
             None => {},
          }
       }

@@ -106,7 +106,9 @@ fn loaders(image: &Image<'_>, anchors: &[usize]) -> Vec<usize> {
       // ELF builds outline a template load with its call (`adrp x0; add x0;
       // .. b format`), so the stub's callers are the loaders.
       let outlined = elf
-         && image.function_bounds(func).is_some_and(|(start, end)| end - start <= 12 * 4)
+         && image
+            .function_bounds(func)
+            .is_some_and(|(start, end)| end - start <= 12 * 4)
          && stub(image, func).is_some();
       if outlined {
          found.extend(
@@ -1662,20 +1664,27 @@ pub fn elf_access_enforced(image: &Image<'_>) -> Found<usize> {
       .into_iter()
       .filter(|&at| {
          let call = at + ELF_ENFORCED_CALL;
-         let Some(Insn::Bl { target }) =
-            image.read(call, 4).and_then(|code| arm64::decode_all(code, call).next()).map(|(_, i)| i)
+         let Some(Insn::Bl { target }) = image
+            .read(call, 4)
+            .and_then(|code| arm64::decode_all(code, call).next())
+            .map(|(_, i)| i)
          else {
             return false;
          };
          // `add x0, x8, #state; b read`, through one veneer at most.
          let insns = |at: usize| {
-            image
-               .read(at, 8)
-               .map(|code| arm64::decode_all(code, at).map(|(_, i)| i).collect::<Vec<_>>())
-               .unwrap_or_default()
+            image.read(at, 8).map_or_else(Vec::new, |code| {
+               arm64::decode_all(code, at)
+                  .map(|(_, i)| i)
+                  .collect::<Vec<_>>()
+            })
          };
-         let is_state =
-            |at: usize| matches!(insns(at)[..], [Insn::AddImm { rd: 0, rn: 8, .. }, Insn::B { .. }]);
+         let is_state = |at: usize| {
+            matches!(insns(at)[..], [
+               Insn::AddImm { rd: 0, rn: 8, .. },
+               Insn::B { .. }
+            ])
+         };
          is_state(target)
             || matches!(insns(target).first(), Some(&Insn::B { target: tail }) if is_state(tail))
       })
@@ -2307,7 +2316,11 @@ pub fn message_header(image: &Image<'_>) -> Found<MessageHeader> {
    // least two builders call, and only builders call.
    let elf = image.function_starts.is_none();
    let callees = if elf {
-      builder_callees.iter().flatten().copied().collect::<std::collections::HashSet<_>>()
+      builder_callees
+         .iter()
+         .flatten()
+         .copied()
+         .collect::<std::collections::HashSet<_>>()
    } else {
       builder_callees[0].clone()
    };
@@ -2322,17 +2335,17 @@ pub fn message_header(image: &Image<'_>) -> Found<MessageHeader> {
       if code.len() < 32 {
          continue;
       }
-      let callers = loaders(image, &[callee]);
+      let producer_callers = loaders(image, &[callee]);
       let feeds = |builder: &usize| feeds_child_node(image, *builder, callee, child_node);
       // On ELF the compact builder hands the name on in a way
       // feeds_child_node doesn't follow, so one builder feeding child_node is
       // enough there.
       let fed = if elf {
-         callers.len() >= 2 && callers.iter().any(feeds)
+         producer_callers.len() >= 2 && producer_callers.iter().any(feeds)
       } else {
-         !callers.is_empty() && builders.iter().all(feeds)
+         !producer_callers.is_empty() && builders.iter().all(feeds)
       };
-      if fed && callers.iter().all(|c| all.contains(c)) {
+      if fed && producer_callers.iter().all(|c| all.contains(c)) {
          producers.push(callee);
       }
    }
@@ -2689,14 +2702,20 @@ pub fn member_row(image: &Image<'_>) -> Found<MemberRow> {
                rn: 31,
                imm: env_base,
             } => {
-               // An outlined stub's moves can sit before the call on ELF builds.
-               let Some(closure) = window[i + 1..].iter().take(4).find_map(|&(_, next)| {
-                  match next {
-                     Insn::Bl { target } => Some(Some(target)),
-                     Insn::MovReg { rd: 1, .. } | Insn::AddImm { rd: 1, .. } => Some(None),
-                     _ => None,
-                  }
-               }).flatten() else {
+               // An outlined stub's moves can sit before the call on ELF
+               // builds.
+               let Some(closure) = window[i + 1..]
+                  .iter()
+                  .take(4)
+                  .find_map(|&(_, next)| {
+                     match next {
+                        Insn::Bl { target } => Some(Some(target)),
+                        Insn::MovReg { rd: 1, .. } | Insn::AddImm { rd: 1, .. } => Some(None),
+                        _ => None,
+                     }
+                  })
+                  .flatten()
+               else {
                   continue;
                };
                for &field in &stored_at {
@@ -2768,7 +2787,9 @@ fn closure_reads_env_user(image: &Image<'_>, closure: usize, env_off: usize) -> 
                size: 8,
                ..
             } if deref == ptr_reg => return true,
-            Insn::Load { rt, .. } | Insn::MovReg { rd: rt, .. } | Insn::AddImm { rd: rt, .. }
+            Insn::Load { rt, .. }
+            | Insn::MovReg { rd: rt, .. }
+            | Insn::AddImm { rd: rt, .. }
             | Insn::MovZ { rd: rt, .. }
                if rt == ptr_reg =>
             {
@@ -2937,12 +2958,16 @@ fn arm64_into_any(image: &Image<'_>, type_name: &[u8]) -> Found<(usize, usize)> 
             else {
                return None;
             };
-            let call = match code.get(at + 1..at + 3)? {
-               [(_, Insn::Bl { .. } | Insn::B { .. }), _] => true,
-               [(_, Insn::Store { .. }), (_, Insn::Bl { .. } | Insn::B { .. })] => true,
-               _ => false,
-            };
-            call.then(|| usize::try_from(imm).ok())
+            let call = matches!(
+               code.get(at + 1..at + 3)?,
+               [(_, Insn::Bl { .. } | Insn::B { .. }), _]
+                  | [
+                     (_, Insn::Store { .. }),
+                     (_, Insn::Bl { .. } | Insn::B { .. }),
+                  ]
+            );
+            call
+               .then(|| usize::try_from(imm).ok())
                .flatten()
                .filter(|&s| (0x40..0x2000).contains(&s))
          })
@@ -3106,10 +3131,10 @@ pub fn modal(
       let flat = flattened_at(image, start);
       // Read the call off the raw body too: on ELF builds `div_into_any` is
       // short enough that flattening inlines it like a stub.
-      let raw = arm64::function(image, start).map(|(_, body)| body).unwrap_or_default();
-      let calls_div_any = flat.iter().chain(&raw).any(|&(_, insn)| {
-         matches!(insn, Insn::Bl { target } if div_any_targets.contains(&target))
-      });
+      let raw = arm64::function(image, start).map_or_else(Vec::new, |(_, body)| body);
+      let calls_div_any = flat.iter().chain(&raw).any(
+         |&(_, insn)| matches!(insn, Insn::Bl { target } if div_any_targets.contains(&target)),
+      );
       if !calls_div_any {
          continue;
       }
@@ -3129,7 +3154,9 @@ pub fn modal(
    let div_id_after = |carousel_site: usize| -> Option<usize> {
       let (carousel_fn, _) = image.function_bounds(carousel_site)?;
       let carousel_flat = flattened_at(image, carousel_fn);
-      let at = carousel_flat.iter().position(|&(pc, _)| pc == carousel_site)?;
+      let at = carousel_flat
+         .iter()
+         .position(|&(pc, _)| pc == carousel_site)?;
       carousel_flat[at + 1..(at + 20).min(carousel_flat.len())]
          .windows(2)
          .find_map(|pair| {
