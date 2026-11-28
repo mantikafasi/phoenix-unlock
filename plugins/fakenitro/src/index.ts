@@ -25,6 +25,11 @@ const settings = phoenix.settings.define({
     description: "{{NAME}} is replaced with the emoji's name",
     default: "{{NAME}}",
   },
+  stickerSize: {
+    type: "select",
+    title: "Sticker size",
+    options: [{ value: "160" }, { value: "80" }, { value: "320" }, { value: "512" }],
+  },
   renderFakeEmojis: {
     type: "switch",
     title: "Render fake emojis",
@@ -69,6 +74,8 @@ interface CachedSticker {
   id: string;
   name: string;
   format_type: number;
+  available: boolean;
+  guild: string;
 }
 
 const emojis = new Map<string, Emoji>();
@@ -95,10 +102,10 @@ const addEmojis = (guild: string, list: Phoenix.Emoji[] | undefined) => {
   }
 };
 
-const addStickers = (list: Phoenix.Sticker[] | undefined) => {
+const addStickers = (guild: string, list: Phoenix.Sticker[] | undefined) => {
   for (const s of list ?? []) {
     if (!s.id || !s.name) continue;
-    stickers.set(s.id, { id: s.id, name: s.name, format_type: s.format_type });
+    stickers.set(s.id, { id: s.id, name: s.name, format_type: s.format_type, available: s.available !== false, guild });
   }
 };
 
@@ -123,7 +130,7 @@ const load = async () => {
     guildCount = guilds.length;
     for (const { g, e, s } of guilds) {
       if (e) addEmojis(unpad(g), JSON.parse(e));
-      if (s) addStickers(JSON.parse(s));
+      if (s) addStickers(unpad(g), JSON.parse(s));
     }
   } catch {
     // Older Android SQLite builds lack json_extract, so parse the rows in JS.
@@ -136,7 +143,7 @@ const load = async () => {
       try {
         const parsed = JSON.parse(v) as { emojis?: Phoenix.Emoji[]; stickers?: Phoenix.Sticker[] };
         addEmojis(unpad(g), parsed.emojis);
-        addStickers(parsed.stickers);
+        addStickers(unpad(g), parsed.stickers);
       } catch {}
     }
   }
@@ -170,7 +177,7 @@ reload();
 if (gateway.guildCreate) {
   phoenix.on(gateway.guildCreate, (guild) => {
     addEmojis(guild.id, guild.emojis);
-    addStickers((guild as Phoenix.GatewayGuild & { stickers?: Phoenix.Sticker[] }).stickers);
+    addStickers(guild.id, (guild as Phoenix.GatewayGuild & { stickers?: Phoenix.Sticker[] }).stickers);
     for (const channel of guild.channels ?? []) channelGuild.set(channel.id, guild.id);
   });
 }
@@ -185,8 +192,8 @@ if (gateway.guildEmojisUpdate) {
 }
 if (gateway.guildStickersUpdate) {
   phoenix.on(gateway.guildStickersUpdate, (update) => {
-    const payload = update as { stickers?: Phoenix.Sticker[] };
-    addStickers(payload.stickers);
+    const payload = update as { guild_id?: string; stickers?: Phoenix.Sticker[] };
+    if (payload.guild_id) addStickers(payload.guild_id, payload.stickers);
   });
 }
 
@@ -300,6 +307,36 @@ phoenix.messages.onEmojiPick((id, ctx) => {
   if (!emoji || usable(emoji, guildOf(ctx))) return;
   picked.set(emoji.name, emoji);
   return `:${emoji.name}: `;
+});
+
+// Lottie stickers have no image a link could show.
+const LOTTIE = 3;
+
+// A server's stickers work in that server without Nitro, and anywhere with it.
+const usableSticker = (sticker: CachedSticker, guild: string | undefined) =>
+  sticker.available && ((premiumType ?? 1) > 0 || sticker.guild === guild);
+
+// A link shows an animated PNG sticker's first frame only.
+const stickerLink = (sticker: CachedSticker) => {
+  const ext = sticker.format_type === 4 ? "gif" : "png";
+  const name = encodeURIComponent(sticker.name);
+  const url = `https://media.discordapp.net/stickers/${sticker.id}.${ext}?size=${settings.stickerSize}&name=${name}`;
+  if (!settings.useHyperLinks) return url;
+  return `[${settings.hyperLinkText.replaceAll("{{NAME}}", sticker.name)}](${url})`;
+};
+
+// Phoenix answers a press on a sticker it won't send with a Nitro ad.
+phoenix.messages.onStickerPick?.((id, ctx) => {
+  const sticker = stickers.get(id);
+  const channelId = ctx.channelId;
+  if (!sticker || !channelId || sticker.format_type === LOTTIE || usableSticker(sticker, guildOf(ctx))) return;
+  phoenix.discord
+    .post(`/channels/${channelId}/messages`, { content: stickerLink(sticker) })
+    .then((res) => {
+      if (!res.ok) phoenix.ui.toast(`Couldn't send ${sticker.name}: Discord answered ${res.status}`);
+    })
+    .catch((err) => phoenix.log.warn(`sending sticker ${id}: ${err}`));
+  return true;
 });
 
 // ponytail: the tier and account are re-read for the next send, so the first
