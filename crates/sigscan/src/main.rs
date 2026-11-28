@@ -263,6 +263,14 @@ fn check(
          .map(|registry| format!("{} events", registry.iter().count()))
          .map_err(Clone::clone),
    );
+   report(
+      "handler ok word",
+      registry
+         .as_ref()
+         .map_err(Clone::clone)
+         .and_then(|registry| registry.ok_word(image, ix.isa))
+         .map(|word| format!("{word:#x}")),
+   );
    match machine {
       Machine::X86_64 => {
          let abi = x86::Abi::of(image);
@@ -402,6 +410,10 @@ fn check(
             desktop::svg_builders(image).map(|svg| format!("{svg:x?}")),
          );
          report("asset loader", desktop::asset_load(image).map(at));
+         report(
+            "icon names",
+            desktop::icon_names(image).map(|names| format!("{} names", names.len())),
+         );
          let row = locate::message::message_row(ix);
          report(
             "message context menu",
@@ -461,34 +473,6 @@ fn check(
             }),
          );
          report("composer gift", desktop::composer_gift(image).map(at));
-         report("resolve font", desktop::resolve_font(image).map(at));
-         if abi == x86::Abi::Win64 {
-            report(
-               "channel toolbar",
-               desktop::channel_toolbar(image).map(|toolbar| {
-                  format!(
-                     "button {}, append {}, sizes {:#x}/{:#x}, click +{:#x}",
-                     at(toolbar.button_site),
-                     at(toolbar.append_site),
-                     toolbar.button_size,
-                     toolbar.toolbar_size,
-                     toolbar.on_click,
-                  )
-               }),
-            );
-            report(
-               "channel sidebar",
-               desktop::channel_sidebar(image).map(|sidebar| {
-                  format!(
-                     "column {}, publish {}, rail {}, handle {}",
-                     at(sidebar.column_site),
-                     at(sidebar.publish_site),
-                     at(sidebar.rail),
-                     at(sidebar.handle_site),
-                  )
-               }),
-            );
-         }
          let json = desktop::message_json(image);
          report(
             "message json",

@@ -200,6 +200,30 @@ fn expand_text_and_borders(
       ] {
          tokens.insert(name.to_owned(), color);
       }
+
+      // Discord's dark table keeps these white over surfaces themes recolor.
+      if mode == ThemeMode::Light || normal.to_hsla().l < 0.5 {
+         for (name, color) in [
+            ("control-secondary-text-default", normal),
+            ("control-secondary-text-hover", strong),
+            ("control-secondary-text-active", strong),
+            ("control-secondary-icon-default", normal),
+            ("control-secondary-icon-hover", strong),
+            ("control-secondary-icon-active", strong),
+            ("button-outline-primary-text", normal),
+            ("control-icon-only-icon-hover", strong),
+            ("control-icon-only-icon-active", strong),
+            ("interactive-text-hover", strong),
+            ("interactive-icon-hover", strong),
+            ("interactive-icon-active", strong),
+            ("tab-label-text-focused", strong),
+            ("redesign-channel-name-text", strong),
+            ("badge-secondary-text", normal),
+            ("badge-common-text", normal),
+         ] {
+            tokens.insert(name.to_owned(), color);
+         }
+      }
    }
 
    if let Some(muted) = pick(vars, &[

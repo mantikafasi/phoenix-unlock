@@ -22,15 +22,9 @@ use std::{
 
 #[cfg(target_os = "linux")] use linux::Host as Os;
 #[cfg(target_os = "macos")] use macos::Host as Os;
-#[cfg(target_os = "macos")]
-pub use macos::{
-   PanelAction,
-   PanelButton,
-   PanelSection,
-   close_panel,
-   redraw_windows,
-   show_panel,
-};
+#[cfg(all(target_os = "macos", debug_assertions))]
+pub use macos::input;
+#[cfg(target_os = "macos")] pub use macos::redraw_windows;
 #[cfg(windows)] use windows::Host as Os;
 
 /// Self-contained HTML/JS/CSS companion dashboard for Desktop settings,
@@ -221,9 +215,6 @@ pub struct Shortcut {
    pub alt:   bool,
 }
 
-/// Whether this OS reports [`Shortcut`]s.
-pub const SHORTCUTS: bool = cfg!(windows);
-
 static SHORTCUT_HANDLER: OnceLock<fn(Shortcut) -> bool> = OnceLock::new();
 
 /// Sends [`Shortcut`]s to `handler`, which returns whether it took the key so
@@ -233,7 +224,7 @@ pub fn set_shortcut_handler(handler: fn(Shortcut) -> bool) {
    let _ = SHORTCUT_HANDLER.set(handler);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn take_shortcut(shortcut: Shortcut) -> bool {
    SHORTCUT_HANDLER
       .get()

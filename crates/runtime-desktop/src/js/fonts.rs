@@ -33,11 +33,7 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
       "supported",
       Function::new(ctx.clone(), gpui_font::is_supported)?,
    )?;
-   #[cfg(windows)]
-   fonts.set(
-      "list",
-      Function::new(ctx.clone(), gpui_font::dwrite::families)?,
-   )?;
+   fonts.set("list", Function::new(ctx.clone(), gpui_font::families)?)?;
    let owner = plugin.to_owned();
    fonts.set(
       "set",

@@ -782,17 +782,6 @@ pub fn notification_gate(image: &Image<'_>) -> Found<usize> {
    }
 }
 
-/// The one `lea` of the UI id `id`.
-fn id_lea(image: &Image<'_>, id: &[u8]) -> Found<usize> {
-   // The ids are packed back to back without a NUL, so `literal` misses them.
-   let leas = image
-      .find_bytes(id)
-      .into_iter()
-      .flat_map(|at| lea_refs(image, at))
-      .collect::<Vec<_>>();
-   one(&format!("{} lea", String::from_utf8_lossy(id)), &leas)
-}
-
 /// How many bytes of `func`'s opening `Image::hook_entry` moves to a
 /// trampoline, or why it cannot.
 pub fn entry_moved(image: &Image<'_>, func: usize) -> Found<usize> {
@@ -2165,27 +2154,6 @@ pub fn svg_builders(image: &Image<'_>) -> Found<SvgBuilders> {
    })
 }
 
-/// GPUI's `TextSystem::resolve_font(&self, font: &Font) -> FontId`, the one
-/// caller of the cold path that panics with `"failed to resolve font"`. Every
-/// font passes through it before GPUI's caches.
-pub fn resolve_font(image: &Image<'_>) -> Found<usize> {
-   // The message starts with a length byte, so the load can point before it.
-   let mut panics = image
-      .find_bytes(b"failed to resolve font")
-      .into_iter()
-      .flat_map(|text| [text - 1, text])
-      .flat_map(|at| lea_refs(image, at))
-      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
-      .collect::<Vec<_>>();
-   panics.sort_unstable();
-   panics.dedup();
-   let panic = one("resolve_font panic", &panics)?;
-   one(
-      "resolve_font",
-      &callers(image, panic).into_iter().collect::<Vec<_>>(),
-   )
-}
-
 /// Discord's asset loader, `(sret, path ptr, path len) -> Option<Vec<u8>>`.
 ///
 /// It ends at the bundle holding [`BUNDLED_SVG`]. The bundle sorts records
@@ -2291,267 +2259,6 @@ pub fn composer_gift(image: &Image<'_>) -> Found<usize> {
       .map(|at| start + at)
       .filter(|&jne| jne % 8 != 7)
       .ok_or_else(|| format!("no jne skips the gift button before {none:#x}"))
-}
-
-/// The type name `Entity::read` panics with for the channel sidebar's width
-/// state, `discord_desktop::ui::sidebar_resize::SidebarResize`.
-const SIDEBAR_RESIZE: &[u8] = b"discord_desktop::ui::sidebar_resize::SidebarResize";
-/// The workspace's id for the channel sidebar's resize handle.
-const SIDEBAR_HANDLE_ID: &[u8] = b"channel-sidebar-resize";
-
-/// What collapses the channel sidebar.
-///
-/// The workspace sizes the sidebar from `SidebarResize`'s width, the server
-/// rail plus 1 px plus the channel column (clamped to 264..432 px by the
-/// handle): `column_site` calls the width getter
-/// in the function returning the column's width (`width - rail - 1`), and
-/// `publish_site` in the one handing the whole width to other views. The width
-/// getter's third caller saves the width to settings and stays as it is.
-#[derive(Debug, Clone, Copy)]
-pub struct ChannelSidebar {
-   /// `call width(root, cx)` in the column width function.
-   pub column_site:  usize,
-   /// `call width(root, cx)` in the function publishing the sidebar's width.
-   pub publish_site: usize,
-   /// `f32 rail()`, the server rail's width.
-   pub rail:         usize,
-   /// `call covered(root)` in `Workspace::render`, whose `true` leaves out the
-   /// resize handle.
-   pub handle_site:  usize,
-}
-
-/// Finds [`ChannelSidebar`] from `SidebarResize`'s type name: the width getter
-/// is the only caller of its `Entity::read` that adds the entity's offset to
-/// its first argument and loads an `f32` from the result.
-pub fn channel_sidebar(image: &Image<'_>) -> Found<ChannelSidebar> {
-   let abi = Abi::of(image);
-   if abi != Abi::Win64 {
-      return Err("channel sidebar locator requires Win64".to_owned());
-   }
-   // Type names are pooled without a NUL, so `literal` misses them.
-   let reads = image
-      .find_bytes(SIDEBAR_RESIZE)
-      .into_iter()
-      .flat_map(|text| lea_refs(image, text))
-      .filter_map(|site| Some(image.function_bounds(site)?.0))
-      .collect::<HashSet<_>>();
-   if reads.is_empty() {
-      return Err("SidebarResize is never named in code".to_owned());
-   }
-   let (number, rex_b) = reg(abi.arg(0));
-   // `add arg0, imm32`, then the call, then `movss xmm0, [rax + disp8]`.
-   let add = [0x48 | rex_b, 0x81, 0xC0 | number];
-   let index = call_index(image);
-   let getters = reads
-      .iter()
-      .flat_map(|&read| index.sites(read))
-      .filter(|&site| {
-         image
-            .read(site.wrapping_sub(7), 7 + 5 + 5)
-            .is_some_and(|code| code[..3] == add && code[12..16] == [0xF3, 0x0F, 0x10, 0x40])
-      })
-      .filter_map(|site| Some(image.function_bounds(site)?.0))
-      .collect::<HashSet<_>>()
-      .into_iter()
-      .collect::<Vec<_>>();
-   let width = one("sidebar width getter", &getters)?;
-
-   let (mut columns, mut publishes) = (Vec::new(), Vec::new());
-   for site in index.sites(width) {
-      let Some(after) = image.read(site + 5, 0x18) else {
-         continue;
-      };
-      // Column: `movaps` the width aside, `call rail`, then `subss` it.
-      if let Some(at) = (0..8).find(|&at| after[at] == 0xE8)
-         && after[at + 5..].starts_with(&[0xF3, 0x0F, 0x5C])
-         && let Some(rail) = rel32_target(image, site + 5 + at + 1)
-      {
-         columns.push((site, rail));
-      // Publish: `lea r8, [rsp + disp8]` and `movss [r8], xmm0`.
-      } else if after.starts_with(&[0x4C, 0x8D, 0x44, 0x24])
-         && after[5..].starts_with(&[0xF3, 0x41, 0x0F, 0x11, 0x00])
-      {
-         publishes.push(site);
-      }
-   }
-   let (column_site, rail) = one("sidebar column width", &columns)?;
-   let publish_site = one("sidebar width publish", &publishes)?;
-   match image.function_bounds(rail) {
-      Some((start, end)) if start == rail && end - start <= 0x80 => {},
-      _ => return Err(format!("sidebar rail width {rail:#x} is no small function")),
-   }
-   Ok(ChannelSidebar {
-      column_site,
-      publish_site,
-      rail,
-      handle_site: sidebar_handle_gate(image)?,
-   })
-}
-
-/// The call whose `true` skips the resize handle: before the handle's id,
-/// `Workspace::render` tests it, stores it, and on `true` stores `None` for
-/// the handle and jumps past it:
-/// `test al, al; mov [rbp + disp32], al; je; and qword [rbp + disp32], 0; jmp`.
-fn sidebar_handle_gate(image: &Image<'_>) -> Found<usize> {
-   const GATE: Pattern =
-      Pattern::new("84 C0 88 85 ?? ?? ?? ?? 74 ?? 48 83 A5 ?? ?? ?? ?? 00 E9 ?? ?? ?? ??");
-   const BEFORE: usize = 0x400;
-   let id = id_lea(image, SIDEBAR_HANDLE_ID)?;
-   let start = id.saturating_sub(BEFORE);
-   let code = image
-      .read(start, id - start)
-      .ok_or("sidebar handle is unmapped")?;
-   let at = GATE
-      .find_in(code)
-      .last()
-      .copied()
-      .ok_or("no test skips the sidebar handle")?;
-   let gate = start + at;
-   let skip = rel32_target(image, gate + 19).ok_or("sidebar handle skip does not decode")?;
-   if skip <= id {
-      return Err(format!(
-         "sidebar handle skip {skip:#x} lands before its id at {id:#x}"
-      ));
-   }
-   // Win64 builds put a `nop` after calls inside an unwind scope.
-   [gate.wrapping_sub(6), gate.wrapping_sub(5)]
-      .into_iter()
-      .find(|&site| {
-         image.read(site, 1) == Some(&[0xE8][..])
-            && (site + 5 == gate || image.read(site + 5, 1) == Some(&[0x90][..]))
-            && rel32_target(image, site + 1).is_some_and(|callee| image.is_function(callee))
-      })
-      .ok_or_else(|| format!("no call feeds the sidebar handle test at {gate:#x}"))
-}
-
-/// The channel header toolbar's member list button id.
-const TOOLBAR_MEMBERS_ID: &[u8] = b"tb-members";
-
-/// Where the channel header toolbar builds and adds its member list button,
-/// which plugin header buttons follow.
-#[derive(Debug, Clone, Copy)]
-pub struct ChannelToolbar {
-   /// `call button(out, id, id_len, icon: u16, tooltip: &mut SharedString,
-   /// selected, _, cx)`, the toolbar icon button builder.
-   pub button_site:  usize,
-   /// `call append(out, &mut toolbar, &mut button)`, which pushes the button
-   /// into the toolbar in place and then moves the toolbar to `out`.
-   pub append_site:  usize,
-   /// The button's bytes.
-   pub button_size:  usize,
-   /// Bytes moved from the toolbar to the return slot by `append`.
-   pub toolbar_size: usize,
-   /// Its `Option<Rc<dyn Fn>>` click handler: data, then vtable.
-   pub on_click:     usize,
-}
-
-/// Finds [`ChannelToolbar`] from the member list button's id.
-///
-/// The first call after the id builds the button, the call setting its click
-/// handler gives the handler's offset and the button's size. The append must
-/// take the resulting button, consume the toolbar, and return it via `out`.
-pub fn channel_toolbar(image: &Image<'_>) -> Found<ChannelToolbar> {
-   // `mov [rsi + on_click], rax; lea rax, [vtable]; mov [rsi + on_click + 8],
-   // rax; mov ecx, size`, then the copy to `out`.
-   const SET_CLICK: Pattern =
-      Pattern::new("48 89 86 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 48 89 86 ?? ?? ?? ?? B9 ?? ?? ?? ??");
-   if Abi::of(image) != Abi::Win64 {
-      return Err("channel toolbar locator requires Win64".to_owned());
-   }
-   let id = id_lea(image, TOOLBAR_MEMBERS_ID)?;
-   let (button_site, builder) = calls_in(image, id, 0x20)
-      .first()
-      .copied()
-      .ok_or("no call builds the members toolbar button")?;
-   let func = image
-      .function_bounds(id)
-      .ok_or("members toolbar has no unwind entry")?
-      .0;
-   let calls = straight_calls(image, func);
-   let after = calls
-      .iter()
-      .copied()
-      .filter(|&(site, _)| site > button_site)
-      .collect::<Vec<_>>();
-   let (setter, on_click, size) = after
-      .iter()
-      .find_map(|&(site, callee)| {
-         let code = function_code(image, callee, "").ok()?;
-         let at = SET_CLICK.find_in(code).first().copied()?;
-         let field = |offset: usize| {
-            code
-               .get(at + offset..at + offset + 4)
-               .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
-         };
-         let (data, vtable, size) = (field(3)?, field(17)?, field(22)?);
-         (vtable == data + 8).then_some((site, data, size))
-      })
-      .ok_or("no call sets the members button's click handler")?;
-   let setter_args = image
-      .read(setter.wrapping_sub(11), 11)
-      .ok_or("no toolbar setter arguments")?;
-   if !setter_args.starts_with(&[0x48, 0x8D, 0x8D]) {
-      return Err("toolbar setter has no stack return slot".to_owned());
-   }
-   let appends = after
-      .windows(2)
-      .filter(|pair| pair[0].0 > setter && pair[1].1 != builder)
-      .filter_map(|pair| {
-         let bytes = toolbar_append(image, pair[0], pair[1], &setter_args[3..7], size)?;
-         Some((pair[1].0, bytes))
-      })
-      .collect::<Vec<_>>();
-   let (append_site, toolbar_size) = one("members toolbar append", &appends)?;
-   Ok(ChannelToolbar {
-      button_site,
-      append_site,
-      button_size: fits("toolbar button", size, layout::SCRATCH_CAP)?,
-      toolbar_size: fits("toolbar append return", toolbar_size, layout::SCRATCH_CAP)?,
-      on_click: fits("toolbar button click", on_click + 16, size)? - 16,
-   })
-}
-
-fn toolbar_append(
-   image: &Image<'_>,
-   (finish, finish_fn): (usize, usize),
-   (append, append_fn): (usize, usize),
-   setter_slot: &[u8],
-   button_size: usize,
-) -> Option<usize> {
-   // The finish call takes the setter's output and returns the final button.
-   const FINISH_CALL: Pattern =
-      Pattern::new("48 8D 4D ?? 48 8D 95 ?? ?? ?? ?? 4C 8D 85 ?? ?? ?? ??");
-   const FINISH_COPY: Pattern =
-      Pattern::new("41 B8 ?? ?? ?? ?? 48 89 F1 48 8B 55 ?? E8 ?? ?? ?? ?? 48 89 F0");
-   // Append takes distinct toolbar and button slots, and returns the toolbar.
-   const APPEND_CALL: Pattern =
-      Pattern::new("48 8D 95 ?? ?? ?? ?? 4C 8D 45 ?? 4C 89 F1 E8 ?? ?? ?? ?? 90 4C 89 F0");
-   const APPEND_BODY: Pattern = Pattern::new(
-      "4C 89 C0 48 89 55 ?? 48 89 CB 4C 8D 05 ?? ?? ?? ?? 48 8D 4D ?? 48 89 C2 E8 ?? ?? ?? ?? 90 \
-       0F 10 45 ?? 0F 10 4D ?? 48 8D 55 ?? 0F 29 4A ?? 0F 29 02 48 8B 4D ?? E8 ?? ?? ?? ?? 90 B9 \
-       ?? ?? ?? ?? 48 89 DF 48 8B 75 ?? F3 A4 48 89 D8",
-   );
-   let finish_args = image.read(finish.checked_sub(18)?, 18)?;
-   let append_args = image.read(append.checked_sub(14)?, 23)?;
-   if FINISH_CALL.find_in(finish_args).first() != Some(&0)
-      || &finish_args[7..11] != setter_slot
-      || APPEND_CALL.find_in(append_args).first() != Some(&0)
-      || append_args[10] != finish_args[3]
-   {
-      return None;
-   }
-   let code = function_code(image, finish_fn, "toolbar button finish").ok()?;
-   let at = *FINISH_COPY.find_in(code).first()?;
-   if imm32(image, finish_fn + at + 2)? != button_size {
-      return None;
-   }
-   let code = function_code(image, append_fn, "toolbar append").ok()?;
-   let at = *APPEND_BODY.find_in(code).first()?;
-   // All three reads of the consumed toolbar use the same saved argument.
-   if code[at + 6] != code[at + 52] || code[at + 6] != code[at + 70] {
-      return None;
-   }
-   imm32(image, append_fn + at + 60)
 }
 
 /// `MessageContextMenu` builder and native `MenuItem` helpers for injecting
@@ -4449,44 +4156,24 @@ fn rip_leas(code: &[u8], addr: usize) -> impl Iterator<Item = (usize, usize)> + 
 /// Mana's icon names in id order: a `MenuItem`'s icon is the index of its
 /// name in this list.
 ///
-/// The icon table pairs each name with `icons/<Name>.svg`; the paths are read
-/// in a run from `icons/A.svg`, and the ids are their names sorted, which
-/// Discord's own menu icons (`Copy` 0x99, `Id` 0x15b, `Link` 0x177, `Trash`
-/// 0x280 on 2026-11 builds) confirm.
+/// The icon table pairs each name with `icons/<Name>.svg`, and the ids are
+/// the names sorted, which Discord's own menu icons (`Copy` 0x99, `Id` 0x15b,
+/// `Link` 0x177, `Trash` 0x280 on 2026-11 builds) confirm. Linux builds share
+/// 46 of the paths with other strings outside the table's run, so every path
+/// in the image counts.
 pub fn icon_names(image: &Image<'_>) -> Found<Vec<String>> {
-   /// How far apart two paths in the table may sit, a name between them.
-   const GAP: usize = 128;
-   let start = image
-      .find_bytes_iter(b"icons/A.svg")
-      .next()
-      .ok_or("icon table not found")?;
-   let mut names = Vec::new();
-   let mut at = start;
-   while let Some(window) = image.read(at, GAP) {
-      let Some(path) = window.windows(6).position(|w| w == b"icons/") else {
-         break;
-      };
-      let Some(rest) = image.read(at + path + 6, GAP) else {
-         break;
-      };
-      let Some(end) = rest.windows(4).position(|w| w == b".svg") else {
-         break;
-      };
-      let Ok(name) = std::str::from_utf8(&rest[..end]) else {
-         break;
-      };
-      at += path + 6 + end + 4;
-      // `Name.secondary.svg` is a second layer of `Name`, with no id.
-      if name.contains('.') {
-         continue;
-      }
-      if !name.bytes().all(|byte| byte.is_ascii_alphanumeric())
-         || (name == "A" && !names.is_empty())
-      {
-         break;
-      }
-      names.push(name.to_owned());
-   }
+   /// The longest name read.
+   const NAME: usize = 128;
+   let mut names = image
+      .find_bytes_iter(b"icons/")
+      .filter_map(|at| {
+         let rest = image.read(at + 6, NAME)?;
+         let end = rest.iter().position(|byte| !byte.is_ascii_alphanumeric())?;
+         // `Name.secondary.svg` is a second layer of `Name`, with no id.
+         (end > 0 && rest[end..].starts_with(b".svg"))
+            .then(|| String::from_utf8_lossy(&rest[..end]).into_owned())
+      })
+      .collect::<Vec<_>>();
    names.sort_unstable();
    names.dedup();
    let has = |name: &str| {

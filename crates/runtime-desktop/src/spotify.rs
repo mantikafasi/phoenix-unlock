@@ -6,9 +6,9 @@ use std::sync::{
 
 use phoenix_sigs::{
    index::Index,
-   locate::spotify::{
-      self,
+   locate::{
       CodePatch,
+      spotify,
    },
 };
 

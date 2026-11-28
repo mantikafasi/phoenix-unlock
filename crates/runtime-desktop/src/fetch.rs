@@ -2,7 +2,7 @@
 //! instead of a bundled TLS library. `WinHTTP` follows the system proxy,
 //! libcurl (the system's own on macOS) the `*_proxy` environment variables.
 
-#[cfg(unix)] mod curl;
+#[cfg(unix)] pub mod curl;
 #[cfg(windows)] mod winhttp;
 
 use phoenix_runtime::fetch::{

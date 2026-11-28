@@ -232,7 +232,7 @@ struct ThemeState {
    /// Monotonic commit counter advanced under `STATE` on every theme/watch
    /// mutation so stale reloads or overlapping applies cannot win out of order.
    generation:        u64,
-   /// Whether an ephemeral JS override (`setCss` / `apply_file_ephemeral`) is
+   /// Whether an ephemeral JS override (`setCss`) is
    /// currently displayed on screen instead of the persisted `themes.json`
    /// stack.
    ephemeral_active:  bool,
@@ -703,25 +703,57 @@ pub fn set_css(css: &str) -> bool {
    active
 }
 
-/// Applies a theme file from `themes_dir` live without mutating persisted
-/// `themes.json` (used by JS `phoenix.themes.apply`).
-pub fn apply_file_ephemeral(themes_dir: &Path, file: &str) -> Result<bool, String> {
+/// Applies a theme file from `themes_dir` and saves it as the active theme in
+/// `themes.json`, so [`load_persisted`] brings it back at startup (used by JS
+/// `phoenix.themes.apply`).
+pub fn apply_file(themes_dir: &Path, file: &str) -> Result<bool, String> {
    let (parsed, stamp) = read_theme_file_stamped(themes_dir, file)?;
-   let Some(cached) = CachedSpec::from_spec(&parsed) else {
+   if !parsed.is_active() {
       return Err(format!("theme {file} sets no supported tokens"));
+   }
+   let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+   let combined = if state.config.quick_css.trim().is_empty() {
+      parsed
+   } else {
+      parsed.merge(&ThemeSpec::parse_css(&state.config.quick_css))
    };
-   let gen_id = {
-      let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-      let gen_id = commit_generation(&mut state);
-      state.ephemeral_active = true;
-      sync_radius_scale_for_state(&state, Some(&cached));
-      state.active_spec = Some(cached);
-      gen_id
-   };
-   let watch = make_watch(themes_dir.to_owned(), file, false, gen_id, stamp);
+   let cached = CachedSpec::from_spec(&combined);
+   let gen_id = commit_generation(&mut state);
+   state.ephemeral_active = false;
+   state.config.active = Some(file.to_owned());
+   sync_radius_scale_for_state(&state, cached.as_ref());
+   state.active_spec = cached;
+   let save = state
+      .home
+      .as_ref()
+      .map(|home| (home.join("themes.json"), state.config.clone()));
+   drop(state);
+   let watch = make_watch(themes_dir.to_owned(), file, true, gen_id, stamp);
    publish_watch(gen_id, watch);
    request_apply();
+   if let Some((path, config)) = save {
+      save_config(&path, &config).map_err(|err| format!("saving themes.json: {err}"))?;
+   }
    Ok(true)
+}
+
+/// Drops the saved active theme from `themes.json`, keeping quick CSS, so a
+/// theme a plugin replaced or cleared stays off at the next startup.
+pub fn forget_saved() {
+   let save = {
+      let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+      let had = state.config.active.take().is_some();
+      state
+         .home
+         .as_ref()
+         .filter(|_| had)
+         .map(|home| (home.join("themes.json"), state.config.clone()))
+   };
+   if let Some((path, config)) = save
+      && let Err(err) = save_config(&path, &config)
+   {
+      log::warn!("mana theme: saving themes.json: {err}");
+   }
 }
 
 /// Drops a plugin's ephemeral override and restores whatever `themes.json` has
@@ -1567,7 +1599,7 @@ mod tests {
    use super::{
       STATE,
       WATCH_STATE,
-      apply_file_ephemeral,
+      apply_file,
       commit_generation,
       load_persisted,
       poll_watched_once,
@@ -1613,7 +1645,7 @@ mod tests {
       )
       .expect("write initial json");
 
-      assert!(apply_file_ephemeral(&themes_dir, "live.theme.json").expect("apply initial"));
+      assert!(apply_file(&themes_dir, "live.theme.json").expect("apply initial"));
       assert_eq!(radius_scale(), Some(1.25));
 
       std::fs::write(
@@ -1633,7 +1665,7 @@ mod tests {
       // Same protection for an empty `.theme.css` mid-save write.
       let css_path = themes_dir.join("live.theme.css");
       std::fs::write(&css_path, ":root { --radius-scale: 1.3; }").expect("write css");
-      assert!(apply_file_ephemeral(&themes_dir, "live.theme.css").expect("apply css"));
+      assert!(apply_file(&themes_dir, "live.theme.css").expect("apply css"));
       assert_eq!(radius_scale(), Some(1.3));
       std::fs::write(&css_path, "").expect("write empty css");
       assert!(reload_active().is_err());
@@ -1660,7 +1692,7 @@ mod tests {
 
       let path = themes_dir.join("auto.theme.css");
       std::fs::write(&path, ":root { --radius-scale: 1.1; }").expect("write initial css");
-      assert!(apply_file_ephemeral(&themes_dir, "auto.theme.css").expect("apply initial"));
+      assert!(apply_file(&themes_dir, "auto.theme.css").expect("apply initial"));
       assert_eq!(radius_scale(), Some(1.1));
 
       let watched = || {

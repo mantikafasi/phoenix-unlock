@@ -20,8 +20,8 @@
 //! Sunbird is open, the sidebar's selected-page map answers no page during the
 //! sidebar's render instead, so the last page's row deselects.
 //!
-//! A build where the sidebar's rows or the handler don't decode, and arm64,
-//! fall back to taking page 24 over, relabeled `Sunbird` in place.
+//! A build where the sidebar's rows or the handler don't decode falls back to
+//! taking page 24 over, relabeled `Sunbird` in place.
 
 use std::{
    ffi::c_void,
@@ -30,6 +30,7 @@ use std::{
       OnceLock,
       atomic::{
          AtomicBool,
+         AtomicU16,
          AtomicUsize,
          Ordering,
       },
@@ -39,8 +40,14 @@ use std::{
 use phoenix_hook::image::Image;
 use phoenix_sigs::{
    Found,
-   index::Index,
-   locate::settings as locate,
+   index::{
+      Index,
+      Isa,
+   },
+   locate::{
+      hookable,
+      settings as locate,
+   },
 };
 
 use crate::gpui::{
@@ -74,8 +81,79 @@ type PageChangedFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
 /// The sidebar's selected-page map, `fn(page) -> page`.
 type SelectedFn = unsafe extern "C" fn(u8) -> u8;
 
+/// The page-name function, `fn(page) -> Text`, see
+/// [`locate::SettingsTitle::name`].
+type NameFn = unsafe extern "C" fn(sret: *mut c_void, page: u8) -> *mut c_void;
+
+/// Discord's translate, see [`locate::SettingsTitle::translate`].
+type TranslateFn = unsafe extern "C" fn(
+   sret: *mut c_void,
+   key: *const u8,
+   key_len: usize,
+   hash: u64,
+   default: *const Untranslated,
+) -> *mut c_void;
+
+/// The English text translate falls back to when no translation has the
+/// key's hash, laid out as the page-name function builds it.
+#[repr(C)]
+struct Untranslated {
+   text: *const u8,
+   len:  usize,
+   one:  usize,
+   zero: usize,
+}
+
+/// The settings header's render on macOS, see
+/// [`locate::SettingsTitle::header`].
+type HeaderFn = unsafe extern "C" fn(
+   sret: *mut c_void,
+   state: *mut c_void,
+   arg1: usize,
+   arg2: usize,
+) -> *mut c_void;
+
+/// What names the active page in the pane's title while Sunbird is open.
+struct Title {
+   /// The page-name function.
+   name:      NameFn,
+   translate: TranslateFn,
+}
+
+/// Past every page byte.
+const UNTITLED: u16 = 0x100;
+
 /// Past every page id, which the sidebar only compares with its rows' pages.
 const NO_PAGE: u8 = u8::MAX;
+
+/// The sidebar's `bl` to the selected-page map where the map is too short to
+/// hook and is called directly (macOS), swapped for `mov w0, #NO_PAGE` while
+/// Sunbird is open.
+struct SelectedCall {
+   at:        usize,
+   call:      u32,
+   rewritten: AtomicBool,
+}
+
+impl SelectedCall {
+   const UNSELECTED: u32 = 0x5280_0000 | ((NO_PAGE as u32) << 5);
+
+   /// Runs on the GPUI thread, the only one that runs the sidebar render.
+   fn show(&self, open: bool) {
+      if self.rewritten.swap(open, Ordering::AcqRel) == open {
+         return;
+      }
+      let Some(state) = phoenix_runtime::state() else {
+         return;
+      };
+      let word = if open { Self::UNSELECTED } else { self.call };
+      // SAFETY: one aligned instruction in the sidebar render, written on the
+      // thread that runs it while that thread is outside the render.
+      if let Err(err) = unsafe { state.image.write_code(self.at, &word.to_le_bytes()) } {
+         log::warn!("desktop settings: selected-page call rewrite failed: {err}");
+      }
+   }
+}
 
 /// The sidebar's `fn(&mut Vec<Entry>, &mut Entry)`.
 type PushFn = unsafe extern "C" fn(*mut c_void, *mut u8);
@@ -119,14 +197,16 @@ static ORIG_SECTION: OnceLock<RenderFn> = OnceLock::new();
 static ORIG_PUSH: OnceLock<PushFn> = OnceLock::new();
 static ORIG_SIDEBAR: OnceLock<RenderFn> = OnceLock::new();
 static ORIG_SELECTED: OnceLock<SelectedFn> = OnceLock::new();
+static TITLE: OnceLock<Title> = OnceLock::new();
+static ORIG_HEADER: OnceLock<HeaderFn> = OnceLock::new();
+/// The page the header is naming with Sunbird open, [`UNTITLED`] otherwise.
+static TITLE_PAGE: AtomicU16 = AtomicU16::new(UNTITLED);
 /// Set while the sidebar renders with Sunbird open.
 static UNSELECT: AtomicBool = AtomicBool::new(false);
+static SELECTED_CALL: OnceLock<SelectedCall> = OnceLock::new();
 static ROWS: OnceLock<Rows> = OnceLock::new();
 static ORIG_PAGE_CHANGED: OnceLock<PageChangedFn> = OnceLock::new();
 static PAGE_OFFSET: AtomicUsize = AtomicUsize::new(0);
-/// The page the last section render showed, so the arm64 fallback opens the
-/// settings window once per visit rather than once per frame.
-static LAST_PAGE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Whether [`install`] hooked the section render that draws Sunbird's page.
 pub fn hooked() -> bool {
@@ -136,11 +216,6 @@ pub fn hooked() -> bool {
 /// Shows page 24, hooks `host::section`, and adds the Sunbird entry, or takes
 /// page 24 over where the entry can't be added.
 pub fn install(image: &Image<'static>, ix: &Index<'_>) {
-   if !crate::X86_CODE {
-      #[cfg(target_os = "macos")]
-      install_arm64(image, ix);
-      return;
-   }
    patch_page_visibility(image, ix);
    if !gpui::locate(image, ix) {
       return;
@@ -154,71 +229,6 @@ pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    } else {
       relabel(image, ix);
    }
-}
-
-/// macOS Phoenix, arm64: page 24 taken over, drawn with
-/// Discord's own builders ([`gpui::locate`]) or opening Sunbird's settings
-/// window when they don't decode. Nothing is written unless the visibility
-/// guards and `host::section` both decode.
-#[cfg(target_os = "macos")]
-fn install_arm64(image: &Image<'static>, ix: &Index<'_>) {
-   use phoenix_sigs::macos;
-
-   // Locate GPUI symbols and Discord's allocator up front so early exits below
-   // cannot silently disable icons, modals, or other native GPUI features.
-   let native = gpui::locate(image, ix);
-
-   let (limits, section) = match (
-      locate::settings_visibility(ix),
-      locate::settings_section(ix),
-   ) {
-      (Ok(limits), Ok(section)) => (limits, section),
-      (limits, section) => {
-         let err = [limits.err(), section.err()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("; ");
-         log::warn!("desktop settings: {err}, leaving the sidebar");
-         return;
-      },
-   };
-   let Some(guards) = limits
-      .iter()
-      .map(|guard| {
-         image
-            .read_u32(guard.cmp)
-            .map(|cmp| (guard.cmp, macos::lowered_guard(cmp)))
-      })
-      .collect::<Option<Vec<_>>>()
-   else {
-      log::warn!("desktop settings: visibility guard unmapped");
-      return;
-   };
-   if hook_section(image, Ok(section)).is_none() {
-      return;
-   }
-   // SAFETY: one-instruction patches from `prepare`, before Discord's threads
-   // run.
-   let shown = unsafe {
-      guards
-         .iter()
-         .try_for_each(|&(limit, lowered)| image.write_code(limit, &lowered.to_le_bytes()))
-   };
-   if let Err(err) = shown {
-      log::warn!("desktop settings: {err}");
-      return;
-   }
-   relabel(image, ix);
-   log::info!(
-      "desktop settings: shown by {} visibility checks{}",
-      guards.len(),
-      if native {
-         ""
-      } else {
-         ", opening the settings window"
-      }
-   );
 }
 
 /// The value, or logs why this build has none.
@@ -263,8 +273,24 @@ fn patch_page_visibility(image: &Image<'static>, ix: &Index<'_>) {
    // Tightening `cmp r8d, 0xf` -> `0x0e` excludes page 24 (`24 - 9 = 15`) from
    // the gated switch so `is_page_visible(24)` returns `true` unconditionally.
    for guard in guards {
-      // SAFETY: single-byte immediate patch in `.text` executed from `DllMain`.
-      match unsafe { image.write_code(guard.imm8(), &[0x0E]) } {
+      let written = if let Isa::X86_64 { .. } = ix.isa {
+         // SAFETY: single-byte immediate patch in `.text` executed from
+         // `DllMain`.
+         unsafe { image.write_code(guard.imm8(), &[0x0E]) }
+      } else {
+         let Some(cmp) = image.read_u32(guard.cmp) else {
+            log::warn!(
+               "desktop settings: visibility guard {:#x} unmapped",
+               guard.cmp
+            );
+            continue;
+         };
+         let lowered = phoenix_sigs::macos::lowered_guard(cmp).to_le_bytes();
+         // SAFETY: one-instruction patch from `prepare`, before Discord's
+         // threads run.
+         unsafe { image.write_code(guard.cmp, &lowered) }
+      };
+      match written {
          Ok(()) => log::info!("desktop settings: page 24 visible @ {:#x}", guard.cmp),
          Err(err) => log::warn!("desktop settings: visibility patch failed: {err}"),
       }
@@ -298,9 +324,6 @@ fn hook_section(image: &Image<'static>, section: Found<locate::Section>) -> Opti
 /// handler's hook only closes Sunbird, so it is harmless if the push's then
 /// fails.
 fn install_entry(image: &Image<'static>, ix: &Index<'_>, page_offset: usize) -> bool {
-   if !crate::X86_CODE {
-      return false;
-   }
    let (Some(rows), Some(changed)) = (
       found(locate::settings_sidebar_rows(ix, page_offset)),
       found(locate::settings_page_changed(ix, page_offset)),
@@ -325,15 +348,17 @@ fn install_entry(image: &Image<'static>, ix: &Index<'_>, page_offset: usize) -> 
       log::warn!("desktop settings: Log Out's click captures {size:#x} bytes");
       return false;
    }
-   let (Some(_), Some(_)) = (
-      found(phoenix_sigs::desktop::entry_moved(image, rows.push)),
-      found(phoenix_sigs::desktop::entry_moved(image, changed)),
+   let (Some(_), Some(_), Some(row)) = (
+      found(hookable(ix, rows.push)),
+      found(hookable(ix, changed)),
+      found(crate::modal::sret_wrap(rows.row).map_err(str::to_owned)),
    ) else {
       return false;
    };
    let _ = ROWS.set(Rows {
-      // SAFETY: the constructor the locator decoded, with `RowFn`'s ABI.
-      row:          unsafe { std::mem::transmute::<usize, RowFn>(rows.row) },
+      // SAFETY: the constructor the locator decoded, called with its out
+      // pointer first as `RowFn` has it.
+      row:          unsafe { std::mem::transmute::<usize, RowFn>(row) },
       click_vtable: rows.click_vtable,
       click_offset: rows.click_offset,
       icon:         rows.gear,
@@ -376,22 +401,146 @@ fn install_entry(image: &Image<'static>, ix: &Index<'_>, page_offset: usize) -> 
       "desktop settings: hooked sidebar push @ {:#x}, page changes @ {changed:#x}",
       rows.push
    );
-   if !hook_unselect(image, &rows) {
+   if !hook_unselect(image, ix, &rows) {
       log::warn!("desktop settings: the active page stays selected beside Sunbird");
+   } else if !hook_title(image, ix, page_offset) {
+      log::warn!("desktop settings: the active page's title stays beside Sunbird");
    }
    true
 }
 
+/// Has the pane's title name Sunbird while it is open: x86 sends the header's
+/// one call of the page-name function through [`title_call_detour`], arm64,
+/// with no call-site hooks, marks the header's render for [`name_detour`].
+fn hook_title(image: &Image<'static>, ix: &Index<'_>, page_offset: usize) -> bool {
+   let Some(title) = found(locate::settings_title(ix, page_offset)) else {
+      return false;
+   };
+   let Some(translate) = found(crate::modal::sret_wrap(title.translate).map_err(str::to_owned))
+   else {
+      return false;
+   };
+   // SAFETY: the translate the locator decoded, called with its return slot
+   // first as `TranslateFn` has it.
+   let translate = unsafe { std::mem::transmute::<usize, TranslateFn>(translate) };
+   let name = if let Isa::X86_64 { .. } = ix.isa {
+      // SAFETY: runs from `prepare` before Discord's threads; the detour has
+      // the page-name function's ABI.
+      unsafe { image.hook_call(title.call, &[], title_call_detour as *const () as usize) }
+         .map_err(|err| log::warn!("desktop settings: title call hook failed: {err}"))
+         .ok()
+         // SAFETY: the call's target is the page-name function.
+         .map(|name| unsafe { std::mem::transmute::<usize, NameFn>(name) })
+   } else {
+      hook_header(image, ix, &title)
+   };
+   name.is_some_and(|name| TITLE.set(Title { name, translate }).is_ok())
+}
+
+/// Hooks the page-name function and the header's render, which marks the page
+/// it names while Sunbird is open.
+fn hook_header(
+   image: &Image<'static>,
+   ix: &Index<'_>,
+   title: &locate::SettingsTitle,
+) -> Option<NameFn> {
+   found(hookable(ix, title.name))?;
+   found(hookable(ix, title.header))?;
+   // SAFETY: runs from `prepare` before Discord's threads; the detour has the
+   // page-name function's sret ABI.
+   let name = unsafe {
+      crate::hook_sret::<NameFn>(
+         image,
+         title.name,
+         name_detour as *const () as usize,
+         "desktop settings: page-name hook failed",
+      )
+   }?;
+   // SAFETY: as above; the detour has the header render's sret ABI.
+   let header = unsafe {
+      crate::hook_sret::<HeaderFn>(
+         image,
+         title.header,
+         header_detour as *const () as usize,
+         "desktop settings: header hook failed",
+      )
+   }?;
+   let _ = ORIG_HEADER.set(header);
+   Some(name)
+}
+
+/// Sunbird's name, as Discord's own page names are built.
+fn sunbird_title(sret: *mut c_void, title: &Title) -> *mut c_void {
+   const KEY: &str = "SUNBIRD";
+   const NAME: &str = "Sunbird";
+   /// No translation has it, so translate falls back to [`NAME`].
+   const HASH: u64 = 0x5355_4E42_4952_4400;
+
+   let default = Untranslated {
+      text: NAME.as_ptr(),
+      len:  NAME.len(),
+      one:  1,
+      zero: 0,
+   };
+   // SAFETY: `sret` is the caller's slot for a page's name, which translate
+   // fills with the same type; the key and default are static.
+   unsafe { (title.translate)(sret, KEY.as_ptr(), KEY.len(), HASH, &raw const default) }
+}
+
+/// The header's call of the page-name function for its title.
+unsafe extern "C" fn title_call_detour(sret: *mut c_void, page: u8) -> *mut c_void {
+   let Some(title) = TITLE.get() else {
+      return sret;
+   };
+   if OPEN.load(Ordering::Acquire) {
+      return sunbird_title(sret, title);
+   }
+   // SAFETY: forwards the arguments to the page-name function.
+   unsafe { (title.name)(sret, page) }
+}
+
+/// Sunbird for the page the header names, its parent left alone.
+unsafe extern "C" fn name_detour(sret: *mut c_void, page: u8) -> *mut c_void {
+   let Some(title) = TITLE.get() else {
+      return sret;
+   };
+   if u16::from(page) == TITLE_PAGE.load(Ordering::Acquire) {
+      return sunbird_title(sret, title);
+   }
+   // SAFETY: forwards the arguments to the original function.
+   unsafe { (title.name)(sret, page) }
+}
+
+unsafe extern "C" fn header_detour(
+   sret: *mut c_void,
+   state: *mut c_void,
+   arg1: usize,
+   arg2: usize,
+) -> *mut c_void {
+   let Some(orig) = ORIG_HEADER.get().copied() else {
+      return sret;
+   };
+   if OPEN.load(Ordering::Acquire) && !state.is_null() {
+      // SAFETY: `state` is Discord's live settings state, which holds the
+      // active page byte at the offset `host::section` reads it at.
+      let page = unsafe { *state.cast::<u8>().add(PAGE_OFFSET.load(Ordering::Acquire)) };
+      TITLE_PAGE.store(u16::from(page), Ordering::Release);
+   }
+   // SAFETY: forwards all arguments verbatim to the original render.
+   let out = unsafe { orig(sret, state, arg1, arg2) };
+   TITLE_PAGE.store(UNTITLED, Ordering::Release);
+   out
+}
+
 /// Hooks the selected-page map, then the sidebar render that has it select no
 /// page row while Sunbird is open. The map's hook alone changes nothing.
-fn hook_unselect(image: &Image<'static>, rows: &locate::SidebarRows) -> bool {
-   let Some(_) = found(phoenix_sigs::desktop::entry_moved(image, rows.sidebar)) else {
+fn hook_unselect(image: &Image<'static>, ix: &Index<'_>, rows: &locate::SidebarRows) -> bool {
+   let Some(_) = found(hookable(ix, rows.sidebar)) else {
       return false;
    };
-   let Some(orig) = hook_selected(image, rows) else {
+   if !hook_selected(image, ix, rows) {
       return false;
-   };
-   let _ = ORIG_SELECTED.set(orig);
+   }
    // SAFETY: runs from `prepare` before Discord's threads; the sidebar render
    // has `host::section`'s ABI.
    let Some(orig) = (unsafe {
@@ -408,15 +557,15 @@ fn hook_unselect(image: &Image<'static>, rows: &locate::SidebarRows) -> bool {
    true
 }
 
-/// Hooks the selected-page map at its entry, or where it is too short (Linux),
-/// swaps the pointer the sidebar calls it through.
-fn hook_selected(image: &Image<'static>, rows: &locate::SidebarRows) -> Option<SelectedFn> {
+/// Hooks the selected-page map at its entry, or where it is too short, swaps
+/// the pointer the sidebar calls it through (Linux) or readies the sidebar's
+/// call of it for [`SelectedCall::show`] (macOS).
+fn hook_selected(image: &Image<'static>, ix: &Index<'_>, rows: &locate::SidebarRows) -> bool {
+   const BL: (u32, u32) = (0xFC00_0000, 0x9400_0000);
+
    let detour = selected_detour as *const () as usize;
-   match (
-      phoenix_sigs::desktop::entry_moved(image, rows.selected),
-      rows.selected_via,
-   ) {
-      (Ok(_), _) => {
+   let orig = match (hookable(ix, rows.selected), rows.selected_via, ix.isa) {
+      (Ok(_), ..) => {
          // SAFETY: runs from `prepare` before Discord's threads; the detour has
          // the map's `fn(u8) -> u8` ABI.
          unsafe {
@@ -428,21 +577,41 @@ fn hook_selected(image: &Image<'static>, rows: &locate::SidebarRows) -> Option<S
             )
          }
       },
-      (Err(_), Some(slot)) => {
+      (Err(_), Some(slot), _) => {
          // SAFETY: an aligned pointer slot in the image, swapped from `prepare`
          // before Discord's threads; the old value is the map, the detour has
          // its ABI.
-         let old = unsafe { image.swap_words(&[(slot, detour)]) }
+         unsafe { image.swap_words(&[(slot, detour)]) }
             .map_err(|err| log::warn!("desktop settings: selected-page swap failed: {err}"))
-            .ok()?;
-         // SAFETY: the slot held the map's address.
-         Some(unsafe { std::mem::transmute::<usize, SelectedFn>(*old.first()?) })
+            .ok()
+            .and_then(|old| old.first().copied())
+            // SAFETY: the slot held the map's address.
+            .map(|old| unsafe { std::mem::transmute::<usize, SelectedFn>(old) })
       },
-      (Err(err), None) => {
+      (Err(_), None, Isa::Aarch64) => {
+         let Some(call) = image
+            .read_u32(rows.selected_call)
+            .filter(|&word| word & BL.0 == BL.1)
+         else {
+            log::warn!(
+               "desktop settings: {:#x} is no call of the selected-page map",
+               rows.selected_call
+            );
+            return false;
+         };
+         let _ = SELECTED_CALL.set(SelectedCall {
+            at: rows.selected_call,
+            call,
+            rewritten: AtomicBool::new(false),
+         });
+         return true;
+      },
+      (Err(err), ..) => {
          log::warn!("desktop settings: {err}");
          None
       },
-   }
+   };
+   orig.is_some_and(|orig| ORIG_SELECTED.set(orig).is_ok())
 }
 
 /// The sidebar render, marked for [`selected_detour`] while Sunbird is open.
@@ -457,7 +626,11 @@ unsafe extern "C" fn sidebar_detour(
    let Some(orig) = ORIG_SIDEBAR.get().copied() else {
       return sret;
    };
-   UNSELECT.store(OPEN.load(Ordering::Acquire), Ordering::Release);
+   let open = OPEN.load(Ordering::Acquire);
+   if let Some(call) = SELECTED_CALL.get() {
+      call.show(open);
+   }
+   UNSELECT.store(open, Ordering::Release);
    // SAFETY: forwards all arguments verbatim to the original render.
    let out = unsafe { orig(sret, host_state, host_data, host_vtable, window, cx) };
    UNSELECT.store(false, Ordering::Release);
@@ -554,10 +727,14 @@ unsafe extern "C" fn section_detour(
    window: *mut c_void,
    cx: *mut c_void,
 ) -> *mut RawAnyElement {
-   if !cx.is_null() {
+   let app = if cx.is_null() {
+      ptr::null_mut()
+   } else {
       // SAFETY: `[cx]` is `*mut gpui::App` inside `Context<T>`.
-      let app = unsafe { *(cx.cast::<*mut c_void>()) };
-      // SAFETY: `app` is null or a live `&mut gpui::App` on the UI thread.
+      unsafe { *(cx.cast::<*mut c_void>()) }
+   };
+   if !app.is_null() {
+      // SAFETY: `app` is a live `&mut gpui::App` on the UI thread.
       unsafe { crate::mana_theme::flush_pending(app) };
    }
    if !host_state.is_null() && !sret.is_null() {
@@ -565,27 +742,14 @@ unsafe extern "C" fn section_detour(
       // SAFETY: `host_state` is Discord's live `&mut HostState` for this render
       // call.
       let page = unsafe { *host_state.cast::<u8>().add(offset) };
-      let last = LAST_PAGE.swap(usize::from(page), Ordering::AcqRel);
-      let mode = MODE.get().copied();
-      let show = match mode {
+      let show = match MODE.get().copied() {
          Some(Mode::Entry) => OPEN.load(Ordering::Acquire),
          Some(Mode::TakeOver) => page == PHOENIX_PAGE,
          None => false,
       };
-      if !crate::X86_CODE
-         && show
-         && mode == Some(Mode::TakeOver)
-         && last != usize::from(page)
-         && gpui::layout().is_none()
-      {
-         // Opening spawns a browser, which must not run on GPUI's thread.
-         let _ = std::thread::Builder::new()
-            .name("sunbird-settings".to_owned())
-            .spawn(phoenix_ui_desktop::open_devtools);
-      }
       if show {
-         let rendered =
-            std::panic::catch_unwind(|| gpui::render_sunbird_page(sret)).unwrap_or(false);
+         let rendered = std::panic::catch_unwind(|| gpui::render_sunbird_page(sret, window, app))
+            .unwrap_or(false);
          if rendered {
             return sret;
          }

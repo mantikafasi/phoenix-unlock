@@ -29,6 +29,7 @@ use phoenix_sigs::{
    HandlerResult,
    REST_WORDS,
    RawStr,
+   index::Isa,
    registry::{
       EventId,
       GatewayRegistry,
@@ -50,6 +51,8 @@ struct Gateway {
    /// itself is hooked too ([`call_handler_through`]).
    originals: Vec<AtomicUsize>,
    hooked:    Vec<AtomicBool>,
+   /// What this build's handlers return for success.
+   ok:        usize,
 }
 
 static GATEWAY: OnceLock<Gateway> = OnceLock::new();
@@ -238,12 +241,17 @@ pub fn swap(
       .map(|(_, entry)| AtomicUsize::new(entry.handler))
       .collect();
    let hooked = registry.iter().map(|_| AtomicBool::new(false)).collect();
+   let ok = registry
+      .ok_word(image, Isa::HOST)
+      .and_then(|word| usize::try_from(word).map_err(|err| err.to_string()))
+      .map_err(Error::OkWord)?;
 
    GATEWAY
       .set(Gateway {
          registry,
          originals,
          hooked,
+         ok,
       })
       .map_err(|_| Error::AlreadyStarted)?;
    let gateway = GATEWAY.get().expect("GATEWAY was set above");
@@ -292,7 +300,7 @@ pub fn dispatch(event: EventId, data: &str) -> Option<bool> {
    // thread's stack, and the event borrows strings that outlive the call.
    let original = gateway.original(event);
    let result = unsafe { original(handling.store, &raw const synthetic, handling.ctx) };
-   Some(result.is_ok())
+   Some(result.is(gateway.ok))
 }
 
 /// The live registry entry named `name`, like `MESSAGE_CREATE`.
@@ -388,7 +396,7 @@ fn flush(gateway: &Gateway, store: *mut c_void, ctx: *mut c_void, rest: [u64; RE
       // SAFETY: `store` and `ctx` are the arguments of the handler call this
       // runs inside, and the event borrows strings that outlive the call.
       let original = gateway.original(event);
-      if unsafe { original(store, &raw const synthetic, ctx) }.is_ok() {
+      if unsafe { original(store, &raw const synthetic, ctx) }.is(gateway.ok) {
          continue;
       }
       log::warn!("Phoenix rejected a queued {name}");
@@ -464,7 +472,7 @@ unsafe fn run_detour(
          return unsafe { fallback(store, event, ctx) };
       }
       log::error!("gateway event without a registry entry, dropped");
-      return HandlerResult::OK;
+      return HandlerResult::ok(gateway.ok);
    };
    crate::remote::record(&crate::remote::Trace::Gateway {
       event: name,
@@ -488,7 +496,7 @@ unsafe fn run_detour(
    let (result, data) = match &before {
       Before::Drop => {
          HANDLING.set(None);
-         return HandlerResult::OK;
+         return HandlerResult::ok(gateway.ok);
       },
       Before::Keep => (call(event), data),
       Before::Replace(json) => {
@@ -505,7 +513,7 @@ unsafe fn run_detour(
    if let (Before::Replace(json), "MESSAGE_CREATE" | "MESSAGE_UPDATE") = (&before, name) {
       remember_original(original_data, json);
    }
-   run_js(state, |engine| engine.after(id, name, data, result.is_ok()));
+   run_js(state, |engine| engine.after(id, name, data, result.is(gateway.ok)));
    HANDLING.set(None);
    result
 }

@@ -25,6 +25,9 @@ pub struct SettingsLabel {
    pub id:     usize,
    /// The `PHOENIX` that ends the id.
    pub suffix: usize,
+   /// `fn(page) -> Text` through the return slot, every page's translated
+   /// name.
+   pub func:   usize,
 }
 
 /// The function that loads both an id ending in `PHOENIX` and a `Phoenix`
@@ -48,14 +51,19 @@ pub fn settings_label(ix: &Index<'_>) -> Found<SettingsLabel> {
                .loads()
                .into_iter()
                .filter(|&name| ix.image.read(name, NAME.len()) == Some(NAME));
-            found.extend(names.map(|name| (name, id, suffix)));
+            found.extend(names.map(|name| (name, id, suffix, func.start)));
          }
       }
    }
    found.sort_unstable();
    found.dedup();
-   let (name, id, suffix) = one("settings label loader", &found)?;
-   Ok(SettingsLabel { name, id, suffix })
+   let (name, id, suffix, func) = one("settings label loader", &found)?;
+   Ok(SettingsLabel {
+      name,
+      id,
+      suffix,
+      func,
+   })
 }
 
 /// A `cmp page - 9, 15` that sends pages outside 9 to 24 to "visible".
@@ -202,25 +210,28 @@ pub fn settings_section(ix: &Index<'_>) -> Found<Section> {
 #[derive(Clone, Copy, Debug)]
 pub struct SidebarRows {
    /// The render, with [`settings_section`]'s arguments.
-   pub sidebar:      usize,
+   pub sidebar:       usize,
    /// `fn(page: u8) -> u8`, the page whose row is selected for the active one
    /// (a subpage's parent). The render only compares its result with its rows'
    /// pages.
-   pub selected:     usize,
+   pub selected:      usize,
    /// The pointer the render calls `selected` through, on Linux, where
    /// `selected` is too short for an entry hook.
-   pub selected_via: Option<usize>,
+   pub selected_via:  Option<usize>,
+   /// The render's call of `selected`, which macOS rewrites, calling it
+   /// directly with no room for an entry hook.
+   pub selected_call: usize,
    /// `fn(&mut Vec<Entry>, &mut Entry)`, moving the entry in.
-   pub push:         usize,
-   pub entry_size:   usize,
+   pub push:          usize,
+   pub entry_size:    usize,
    /// `fn(out, id_ptr, id_len, &SharedString, icon: u16, selected: bool,
    /// danger: bool, &closure)`, boxing the closure with Log Out's click.
-   pub row:          usize,
+   pub row:           usize,
    /// Log Out's click vtable, stored at `click_offset` after the box.
-   pub click_vtable: usize,
-   pub click_offset: usize,
+   pub click_vtable:  usize,
+   pub click_offset:  usize,
    /// Mana's gear icon, Sunbird's.
-   pub gear:         u16,
+   pub gear:          u16,
 }
 
 pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<SidebarRows> {
@@ -305,23 +316,111 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
       .filter_map(|(at, _)| {
          steps.get(at + 1..at + 3)?.iter().find_map(|step| {
             match step.op {
-               Op::Call(target) => Some((target, call_slot(ix, step))),
+               Op::Call(target) => Some((target, call_slot(ix, step), step.at)),
                _ => None,
             }
          })
       })
       .collect::<Vec<_>>();
-   let (selected, selected_via) = one("sidebar selected-page map", &selected)?;
+   let (selected, selected_via, selected_call) = one("sidebar selected-page map", &selected)?;
    Ok(SidebarRows {
       sidebar: sidebar.start,
       selected,
       selected_via,
+      selected_call,
       push,
       entry_size,
       row,
       click_vtable,
       click_offset,
       gear: mana_icon(ix, "Settings")?,
+   })
+}
+
+/// What the settings pane's title names the active page with.
+#[derive(Clone, Copy, Debug)]
+pub struct SettingsTitle {
+   /// The page-name function, `fn(page) -> Text` through the return slot,
+   /// [`SettingsLabel::func`].
+   pub name:      usize,
+   /// `fn(key, key_len, hash, &Default) -> Text` through the return slot,
+   /// which the page-name function ends in. `Default` is the English text,
+   /// `{ptr, len, 1, 0}`.
+   pub translate: usize,
+   /// The pane header's render, `fn(state, ..) -> Header` through the return
+   /// slot on Windows and macOS, a closure Linux inlines it into.
+   pub header:    usize,
+   /// The header's call of the page-name function for the title.
+   pub call:      usize,
+}
+
+/// The page-name function, the translate call each page's case shares (right
+/// after the key's hash is loaded), and the header that names the active
+/// page.
+///
+/// The header is the one caller besides the sidebar that reads the active
+/// page byte as it opens. It names the page's parent, then the page, so its
+/// last call of the page-name function is the title's.
+pub fn settings_title(ix: &Index<'_>, page_offset: usize) -> Found<SettingsTitle> {
+   const SETUP: usize = 8;
+   const HEAD: usize = 40;
+
+   let name = ix.func(settings_label(ix)?.func)?;
+   let hash = ix.isa.slot_arg(2).ok_or("no hash register")?;
+   let steps = name.steps();
+   let translate = steps
+      .iter()
+      .enumerate()
+      .filter_map(|(at, step)| {
+         let Op::Call(target) = step.op else {
+            return None;
+         };
+         steps[at.saturating_sub(SETUP)..at]
+            .iter()
+            .any(|step| matches!(step.op, Op::Imm { reg, .. } if reg == hash))
+            .then_some(target)
+      })
+      .next_back()
+      .ok_or("the page-name function translates nothing")?;
+
+   let sidebar = ix.literal(b"us-logout").one("us-logout load")?.start;
+   let page = isize::try_from(page_offset).map_err(|err| err.to_string())?;
+   // ELF builds call it through a pointer slot.
+   let through = ix
+      .image
+      .pointers_to(name.start)
+      .into_iter()
+      .flat_map(|slot| ix.loads_of(slot..slot + 1))
+      .map(|(site, _)| site);
+   let mut headers = ix
+      .call_sites(name.start)
+      .into_iter()
+      .chain(through)
+      .filter_map(|site| ix.function(site))
+      .filter(|func| func.start != sidebar)
+      .filter(|func| {
+         func
+            .head(HEAD)
+            .iter()
+            .any(|step| matches!(step.op, Op::Load { offset, size: 1, .. } if offset == page))
+      })
+      .map(|func| func.start)
+      .collect::<Vec<_>>();
+   headers.sort_unstable();
+   headers.dedup();
+   let header = ix.func(one("settings header", &headers)?)?;
+   let call = header
+      .steps()
+      .iter()
+      .filter(|step| step.op == Op::Call(name.start))
+      .map(|step| step.at)
+      .next_back()
+      .ok_or("the settings header never names its page")?;
+   Ok(SettingsTitle {
+      name: name.start,
+      translate,
+      header: header.start,
+      call,
    })
 }
 

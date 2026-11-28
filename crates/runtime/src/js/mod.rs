@@ -149,6 +149,19 @@ impl SeenUrls {
 /// take, since grants are looked up by name.
 const CONSOLE: &str = "console";
 
+/// `phoenix.platform`, the client the runtime is built into.
+const PLATFORM: &str = if cfg!(target_os = "android") {
+   "android"
+} else if cfg!(target_os = "ios") {
+   "ios"
+} else if cfg!(windows) {
+   "windows"
+} else if cfg!(target_os = "macos") {
+   "macos"
+} else {
+   "linux"
+};
+
 pub struct Engine {
    runtime:  Runtime,
    context:  Context,
@@ -270,9 +283,9 @@ pub struct Registry<'js> {
    /// `phoenix.onUnload` callbacks, run when the plugin is turned off,
    /// reloaded or removed.
    unloads:            RefCell<HashMap<String, Vec<Function<'js>>>>,
-   /// The resolve and reject of each promise a worker thread will settle, by
-   /// id.
-   pending:            RefCell<HashMap<u64, (Function<'js>, Function<'js>)>>,
+   /// The plugin, resolve and reject of each promise a worker thread will
+   /// settle, by id.
+   pending:            RefCell<HashMap<u64, (String, Function<'js>, Function<'js>)>>,
    /// `phoenix.discord.onRequest` interceptors, by id.
    request_hooks:      RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.discord.onResponse` interceptors, by id.
@@ -573,6 +586,10 @@ impl Engine {
          registry.defined.borrow_mut().remove(name);
          registry.granted.borrow_mut().remove(name);
          timers::forget(&ctx, name);
+         registry
+            .pending
+            .borrow_mut()
+            .retain(|_, (plugin, ..)| plugin != name);
          registry
             .request_hooks
             .borrow_mut()
@@ -948,6 +965,7 @@ fn api<'js>(
    if permissions.allows(Permission::Messages) {
       api.set("messages", messages)?;
    }
+   api.set("platform", PLATFORM)?;
    api.set("log", log_object(ctx, plugin)?)?;
    api.set("storage", storage(ctx, plugin)?)?;
    api.set("settings", settings_object(ctx, plugin)?)?;
@@ -966,10 +984,11 @@ fn api<'js>(
       })?,
    )?;
    if permissions.allows(Permission::Gateway) {
-      api.set("stores", stores_object(ctx)?)?;
+      api.set("stores", stores_object(ctx, plugin)?)?;
    }
    api.set("discord", discord_object(ctx, plugin, permissions)?)?;
    let granted = Arc::clone(permissions);
+   let owner = plugin.to_owned();
    api.set(
       "fetch",
       Function::new(
@@ -984,7 +1003,7 @@ fn api<'js>(
                   ),
                ));
             }
-            start_fetch(&ctx, url, init.0)
+            start_fetch(&ctx, &owner, url, init.0)
          },
       )?,
    )?;

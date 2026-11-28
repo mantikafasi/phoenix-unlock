@@ -19,10 +19,13 @@ use std::{
    ptr,
    sync::{
       Once,
+      atomic::{
+         AtomicUsize,
+         Ordering,
+      },
       mpsc,
    },
    thread,
-   time::Duration,
 };
 
 use crate::{
@@ -367,13 +370,6 @@ unsafe extern "C" {
       context: *mut c_void,
       work: extern "C" fn(*mut c_void),
    );
-   fn dispatch_time(when: u64, delta: i64) -> u64;
-   fn dispatch_after_f(
-      when: u64,
-      queue: *const c_void,
-      context: *mut c_void,
-      work: extern "C" fn(*mut c_void),
-   );
 }
 
 fn class(name: &CStr) -> Id {
@@ -389,10 +385,11 @@ fn sel(name: &CStr) -> Sel {
 /// `objc_msgSend` cast to one method's exact signature, which arm64 needs
 /// since it passes variadic arguments differently.
 macro_rules! msg_send {
-   ($name:ident ($($arg:ident: $ty:ty),*) -> $ret:ty) => {
+   ($name:ident ($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty) => {
       /// # Safety
       ///
       /// `object` is nil or responds to `selector` with this signature.
+      #[allow(clippy::too_many_arguments, reason = "one per argument of the method")]
       unsafe fn $name(object: Id, selector: Sel $(, $arg: $ty)*) -> $ret {
          // SAFETY: the caller matches the method's signature.
          unsafe {
@@ -423,15 +420,7 @@ msg_send!(send_symbol(name: Id, description: Id) -> Id);
 msg_send!(send_item(title: Id, action: Sel, key: Id) -> Id);
 msg_send!(send_tag() -> isize);
 
-mod panel;
-
-pub use panel::{
-   Action as PanelAction,
-   PanelButton,
-   PanelSection,
-   close_panel,
-   show_panel,
-};
+#[cfg(debug_assertions)] pub mod input;
 
 /// An autoreleased `NSString`, stripping interior NUL bytes so `AppKit` calls
 /// that reject `nil` never throw `NSInvalidArgumentException`.
@@ -468,30 +457,6 @@ fn on_main(work: impl FnOnce() + Send + 'static) {
    // back the box exactly once.
    unsafe {
       dispatch_async_f(&raw const _dispatch_main_q, Box::into_raw(work).cast(), run);
-   }
-}
-
-fn on_main_after(delay: Duration, work: impl FnOnce() + Send + 'static) {
-   const DISPATCH_TIME_NOW: u64 = 0;
-   type Work = Box<dyn FnOnce() + Send>;
-   extern "C" fn run(context: *mut c_void) {
-      // SAFETY: `context` is the `Box<Work>` `on_main_after` leaked, read back
-      // once.
-      let work = unsafe { Box::from_raw(context.cast::<Work>()) };
-      work();
-   }
-   let nanos = i64::try_from(delay.as_nanos()).unwrap_or(i64::MAX);
-   let work: Box<Work> = Box::new(Box::new(work));
-   // SAFETY: the main queue lives as long as the process, and `run` takes
-   // back the box once when the timer fires.
-   unsafe {
-      let when = dispatch_time(DISPATCH_TIME_NOW, nanos);
-      dispatch_after_f(
-         when,
-         &raw const _dispatch_main_q,
-         Box::into_raw(work).cast(),
-         run,
-      );
    }
 }
 
@@ -626,10 +591,14 @@ const SHORTCUTS: [Shortcut; 1] = [Shortcut {
    run:       crate::open_devtools,
 }];
 
+const SHIFT: usize = 1 << 17;
+const CONTROL: usize = 1 << 18;
+const OPTION: usize = 1 << 19;
+const COMMAND: usize = 1 << 20;
 /// `NSEventModifierFlagShift | NSEventModifierFlagCommand`, and the mask of
 /// Shift, Control, Option and Command (ignoring Caps Lock and Fn).
-const COMMAND_SHIFT: usize = (1 << 17) | (1 << 20);
-const MODIFIERS: usize = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+const COMMAND_SHIFT: usize = SHIFT | COMMAND;
+const MODIFIERS: usize = SHIFT | CONTROL | OPTION | COMMAND;
 
 /// An Objective-C block, laid out as the runtime reads one.
 #[repr(C)]
@@ -666,12 +635,52 @@ extern "C" fn key_down(_block: *const Block, event: Id) -> Id {
       .iter()
       .find(|shortcut| shortcut.modifiers == pressed && code == shortcut.code)
    else {
-      return event;
+      // SAFETY: as above.
+      let repeat = unsafe { send_get_bool(event, sel(c"isARepeat")) };
+      return if take_plugin_key(code, pressed, repeat) {
+         ptr::null_mut()
+      } else {
+         event
+      };
    };
    log::info!("shortcuts: key {}", shortcut.label);
    // Opening spawns a browser, which must not block the main thread.
    spawn("sunbird-shortcut", shortcut.run);
    ptr::null_mut()
+}
+
+/// Whether a plugin's `phoenix.ui.addShortcut` takes the key `code` pressed
+/// with `pressed`. Command stands in for Control, and Control itself is left
+/// to Discord. Repeats of a taken key are kept from Discord without running
+/// the plugin again.
+fn take_plugin_key(code: u16, pressed: usize, repeat: bool) -> bool {
+   /// `kVK_ANSI_*` key codes to their letter or digit, `?` for other keys.
+   const ANSI: &[u8] = b"ASDFHGZXCV?BQWERYT123465?97?80?OU?IP?LJ?K????NM";
+   static TAKEN: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+   let combo = usize::from(code) | pressed;
+   if repeat {
+      return TAKEN.load(Ordering::Relaxed) == combo;
+   }
+   let Some(&key) = ANSI
+      .get(usize::from(code))
+      .filter(|key| key.is_ascii_alphanumeric())
+   else {
+      return false;
+   };
+   let shortcut = crate::Shortcut {
+      key,
+      ctrl: pressed & COMMAND != 0,
+      shift: pressed & SHIFT != 0,
+      alt: pressed & OPTION != 0,
+   };
+   let taken = pressed & CONTROL == 0
+      && (shortcut.ctrl || shortcut.alt)
+      && crate::take_shortcut(shortcut);
+   if taken {
+      TAKEN.store(combo, Ordering::Relaxed);
+   }
+   taken
 }
 
 fn start_shortcuts() {

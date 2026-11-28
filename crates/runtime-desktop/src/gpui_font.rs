@@ -1,6 +1,6 @@
 //! Font overrides: Discord's own families swapped for installed ones.
 //!
-//! GPUI's `TextSystem::resolve_font(&self, font: &Font)` is observed; on entry,
+//! GPUI's `TextSystem::resolve_font(&self, font: &Font)` is hooked; on entry,
 //! before its caches, a `gg sans` or `ABC Ginto` family becomes the main font
 //! and `gg sans mono` the code font, so a change shows once text is laid out
 //! again. Families the system can't find fall back to its UI font, as GPUI
@@ -25,25 +25,34 @@ pub fn clear() {
    set("", "");
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn is_supported() -> bool {
    hook::installed()
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-pub const fn is_supported() -> bool {
-   false
+pub fn install(image: &phoenix_hook::image::Image<'static>, ix: &phoenix_sigs::index::Index<'_>) {
+   hook::install(image, ix);
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn install(image: &phoenix_hook::image::Image<'static>) {
-   hook::install(image);
+/// Installed font families by the name GPUI's text system finds them by,
+/// sorted.
+pub fn families() -> Vec<String> {
+   #[cfg(windows)]
+   let mut out = dwrite::families();
+   #[cfg(target_os = "macos")]
+   let mut out = coretext::families();
+   #[cfg(target_os = "linux")]
+   let mut out = fontconfig::families();
+   // Some fonts name their family with nothing printable.
+   out.retain(|name| !name.trim().is_empty());
+   out.sort_unstable_by_key(|name| name.to_lowercase());
+   out.dedup();
+   out
 }
 
 /// The system font collection's family names, the ones GPUI's DirectWrite
 /// text system finds by name, through raw COM vtables.
 #[cfg(windows)]
-pub mod dwrite {
+mod dwrite {
    type Com = *mut *const usize;
 
    #[repr(C)]
@@ -108,8 +117,8 @@ pub mod dwrite {
       }
    }
 
-   /// Installed font families by their English name, sorted.
-   pub fn families() -> Vec<String> {
+   /// Installed font families by their English name.
+   pub(super) fn families() -> Vec<String> {
       let mut out = Vec::new();
       let mut factory: Com = std::ptr::null_mut();
       // SAFETY: a shared factory (kind 0) written to `factory` on success.
@@ -147,35 +156,182 @@ pub mod dwrite {
          }
          release(factory);
       }
-      // Some fonts name their family with nothing printable.
-      out.retain(|name| !name.trim().is_empty());
-      out.sort_unstable_by_key(|name| name.to_lowercase());
-      out.dedup();
       out
    }
 }
 
-#[cfg(target_arch = "x86_64")]
+/// CoreText's family names, the ones GPUI's text system finds by name.
+#[cfg(target_os = "macos")]
+mod coretext {
+   use std::ffi::{
+      c_char,
+      c_void,
+   };
+
+   type CfRef = *const c_void;
+
+   const UTF8: u32 = 0x0800_0100;
+
+   #[link(name = "CoreText", kind = "framework")]
+   unsafe extern "C" {
+      fn CTFontManagerCopyAvailableFontFamilyNames() -> CfRef;
+   }
+
+   #[link(name = "CoreFoundation", kind = "framework")]
+   unsafe extern "C" {
+      fn CFArrayGetCount(array: CfRef) -> isize;
+      fn CFArrayGetValueAtIndex(array: CfRef, index: isize) -> CfRef;
+      fn CFStringGetLength(string: CfRef) -> isize;
+      fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+      fn CFStringGetCString(string: CfRef, buf: *mut c_char, size: isize, encoding: u32) -> u8;
+      fn CFRelease(object: CfRef);
+   }
+
+   /// # Safety
+   ///
+   /// `string` is a live `CFString`.
+   unsafe fn text(string: CfRef) -> Option<String> {
+      // SAFETY: `buf` holds the most UTF-8 bytes `string` can take plus the NUL
+      // `CFStringGetCString` writes.
+      unsafe {
+         let size = CFStringGetMaximumSizeForEncoding(CFStringGetLength(string), UTF8) + 1;
+         let mut buf = vec![0u8; usize::try_from(size).ok()?];
+         if CFStringGetCString(string, buf.as_mut_ptr().cast(), size, UTF8) == 0 {
+            return None;
+         }
+         let len = buf.iter().position(|&byte| byte == 0)?;
+         buf.truncate(len);
+         String::from_utf8(buf).ok()
+      }
+   }
+
+   pub(super) fn families() -> Vec<String> {
+      // SAFETY: the copied array is a live `CFArray` of `CFString`s, released
+      // once read.
+      unsafe {
+         let names = CTFontManagerCopyAvailableFontFamilyNames();
+         if names.is_null() {
+            return Vec::new();
+         }
+         let out = (0..CFArrayGetCount(names))
+            .filter_map(|index| text(CFArrayGetValueAtIndex(names, index)))
+            // Names starting with a dot are the system's hidden UI fonts.
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+         CFRelease(names);
+         out
+      }
+   }
+}
+
+/// fontconfig's family names, loaded with `dlopen` so a system without it
+/// only lists nothing.
+#[cfg(target_os = "linux")]
+mod fontconfig {
+   use std::ffi::{
+      CStr,
+      c_char,
+      c_int,
+      c_void,
+   };
+
+   use crate::fetch::curl::sym;
+
+   type Pattern = *mut c_void;
+   type ObjectSet = *mut c_void;
+
+   #[repr(C)]
+   struct FontSet {
+      nfont: c_int,
+      _size: c_int,
+      fonts: *const Pattern,
+   }
+
+   const FAMILY: &CStr = c"family";
+   const MATCH: c_int = 0;
+
+   pub(super) fn families() -> Vec<String> {
+      // SAFETY: each symbol is read with its type from `fontconfig.h`, and
+      // every object created is destroyed. The library stays loaded.
+      unsafe {
+         let lib = libc::dlopen(c"libfontconfig.so.1".as_ptr(), libc::RTLD_NOW);
+         if lib.is_null() {
+            log::warn!("desktop fonts: libfontconfig.so.1 is not installed, no fonts listed");
+            return Vec::new();
+         }
+         let Some(names) = (|| {
+            let pattern_create: unsafe extern "C" fn() -> Pattern = sym(lib, c"FcPatternCreate")?;
+            let pattern_destroy: unsafe extern "C" fn(Pattern) = sym(lib, c"FcPatternDestroy")?;
+            let set_create: unsafe extern "C" fn() -> ObjectSet = sym(lib, c"FcObjectSetCreate")?;
+            let set_add: unsafe extern "C" fn(ObjectSet, *const c_char) -> c_int =
+               sym(lib, c"FcObjectSetAdd")?;
+            let set_destroy: unsafe extern "C" fn(ObjectSet) = sym(lib, c"FcObjectSetDestroy")?;
+            let list: unsafe extern "C" fn(*mut c_void, Pattern, ObjectSet) -> *mut FontSet =
+               sym(lib, c"FcFontList")?;
+            let list_destroy: unsafe extern "C" fn(*mut FontSet) = sym(lib, c"FcFontSetDestroy")?;
+            let get: unsafe extern "C" fn(
+               Pattern,
+               *const c_char,
+               c_int,
+               *mut *const c_char,
+            ) -> c_int = sym(lib, c"FcPatternGetString")?;
+
+            let pattern = pattern_create();
+            let objects = set_create();
+            set_add(objects, FAMILY.as_ptr());
+            // A null config lists the current one, loading it on first use.
+            let fonts = list(std::ptr::null_mut(), pattern, objects);
+            set_destroy(objects);
+            pattern_destroy(pattern);
+            if fonts.is_null() {
+               return Some(Vec::new());
+            }
+            let count = usize::try_from((*fonts).nfont).unwrap_or(0);
+            let patterns = if count == 0 || (*fonts).fonts.is_null() {
+               &[][..]
+            } else {
+               std::slice::from_raw_parts((*fonts).fonts, count)
+            };
+            let names = patterns
+               .iter()
+               .filter_map(|&font| {
+                  let mut name = std::ptr::null();
+                  // The first family is the font's own, later ones are
+                  // localized.
+                  (get(font, FAMILY.as_ptr(), 0, &raw mut name) == MATCH && !name.is_null())
+                     .then(|| CStr::from_ptr(name).to_string_lossy().into_owned())
+               })
+               .collect();
+            list_destroy(fonts);
+            Some(names)
+         })() else {
+            log::warn!("desktop fonts: libfontconfig.so.1 lacks a listing symbol");
+            return Vec::new();
+         };
+         names
+      }
+   }
+}
+
 mod hook {
    use std::sync::{
       OnceLock,
       PoisonError,
    };
 
-   use phoenix_hook::{
-      image::Image,
-      x86::{
-         Observed,
-         Regs,
-         observe,
-      },
+   use phoenix_hook::image::Image;
+   use phoenix_sigs::{
+      index::Index,
+      locate,
    };
-   use phoenix_sigs::desktop;
 
    use super::FONTS;
    use crate::gpui::SharedString;
 
-   static HOOK: OnceLock<Observed> = OnceLock::new();
+   /// `TextSystem::resolve_font(&self, &Font) -> FontId`.
+   type ResolveFn = unsafe extern "C" fn(*const u8, *mut SharedString) -> usize;
+
+   static ORIGINAL: OnceLock<ResolveFn> = OnceLock::new();
 
    #[derive(Clone, Copy)]
    enum Role {
@@ -201,25 +357,29 @@ mod hook {
    const ARC: u8 = 0x19;
 
    pub(super) fn installed() -> bool {
-      HOOK.get().is_some()
+      ORIGINAL.get().is_some()
    }
 
-   pub(super) fn install(image: &Image<'static>) {
-      let func = match desktop::resolve_font(image) {
-         Ok(func) => func,
+   pub(super) fn install(image: &Image<'static>, ix: &Index<'_>) {
+      let func = match locate::resolve_font(ix) {
+         Ok(func) => func.start,
          Err(err) => {
             log::warn!("desktop fonts: {err}, fonts disabled");
             return;
          },
       };
-      // SAFETY: `resolve_font` found a function start, and `prepare` runs
-      // before Discord's render thread exists.
-      match unsafe { observe(image, func, on_resolve_font, 0) } {
-         Ok(hook) => {
-            let _ = HOOK.set(hook);
-            log::info!("desktop fonts: observing resolve_font @ {func:#x}");
-         },
-         Err(err) => log::warn!("desktop fonts: observing resolve_font: {err}"),
+      // SAFETY: `resolve_font` found a function start, `prepare` runs before
+      // Discord's render thread exists, and the detour has its ABI.
+      if let Some(original) = unsafe {
+         crate::hook::<ResolveFn>(
+            image,
+            func,
+            on_resolve_font as *const () as usize,
+            "desktop fonts",
+         )
+      } {
+         let _ = ORIGINAL.set(original);
+         log::info!("desktop fonts: hooked resolve_font @ {func:#x}");
       }
    }
 
@@ -248,17 +408,13 @@ mod hook {
    }
 
    /// `resolve_font(self, font)`: rewrites `font.family`, its first field.
-   extern "C" fn on_resolve_font(_: usize, regs: &Regs) {
+   extern "C" fn on_resolve_font(system: *const u8, family: *mut SharedString) -> usize {
       let fonts = *FONTS.read().unwrap_or_else(PoisonError::into_inner);
-      if fonts == ("", "") {
-         return;
-      }
-      let Some(font) = usize::try_from(regs.args()[1]).ok().filter(|&p| p != 0) else {
-         return;
-      };
-      let family = font as *mut SharedString;
       // A panic must not unwind into the text system.
       let _ = std::panic::catch_unwind(|| {
+         if fonts == ("", "") || family.is_null() {
+            return;
+         }
          // SAFETY: `resolve_font` received a live `&Font` whose `family` starts
          // it.
          let Some(role) = (unsafe { text(&*family) }).and_then(Role::of) else {
@@ -276,5 +432,8 @@ mod hook {
          // gives back, so its bytes live on, bounded by Discord's few families.
          unsafe { family.write(SharedString::from_static(to)) };
       });
+      let original = *ORIGINAL.wait();
+      // SAFETY: the trampoline runs the original with Discord's arguments.
+      unsafe { original(system, family) }
    }
 }

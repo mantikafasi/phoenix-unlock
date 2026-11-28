@@ -137,6 +137,7 @@ impl Init {
 /// waits on the network, and returns a promise that settles when it answers.
 pub fn start_fetch<'js>(
    ctx: &Ctx<'js>,
+   plugin: &str,
    url: String,
    init: Option<Object<'js>>,
 ) -> rquickjs::Result<rquickjs::Promise<'js>> {
@@ -151,17 +152,20 @@ pub fn start_fetch<'js>(
       headers,
       body,
    };
-   in_background(ctx, move || Settlement::Fetch(fetch::send(&request)))
+   in_background(ctx, plugin, move || {
+      Settlement::Fetch(fetch::send(&request))
+   })
 }
 
 fn send<'js>(
    ctx: &Ctx<'js>,
+   plugin: &str,
    permissions: &Permissions,
    path: String,
    init: Init,
 ) -> rquickjs::Result<rquickjs::Promise<'js>> {
    allow(ctx, permissions, &init.method, &path)?;
-   in_background(ctx, move || {
+   in_background(ctx, plugin, move || {
       Settlement::Discord(discord::send(
          &init.method,
          &path,
@@ -197,6 +201,7 @@ pub fn discord_object<'js>(
    let object = Object::new(ctx.clone())?;
    add_discord_hooks(ctx, plugin, &object, permissions)?;
    let granted = Arc::clone(permissions);
+   let owner = plugin.to_owned();
    object.set(
       "authorize",
       Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
@@ -219,32 +224,37 @@ pub fn discord_object<'js>(
                .get::<_, Option<String>>("responseType")?
                .unwrap_or_else(|| "code".to_owned()),
          };
-         in_background(&ctx, move || Settlement::Text(discord::authorize(&request)))
+         in_background(&ctx, &owner, move || {
+            Settlement::Text(discord::authorize(&request))
+         })
       })?,
    )?;
    let granted = Arc::clone(permissions);
+   let owner = plugin.to_owned();
    object.set(
       "me",
       Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
          allow(&ctx, &granted, "GET", "/users/@me")?;
          let files = state().files_dir();
-         in_background(&ctx, move || {
+         in_background(&ctx, &owner, move || {
             Settlement::Json(store::database(&files).and_then(|db| store::meta(&db, "me")))
          })
       })?,
    )?;
    let granted = Arc::clone(permissions);
+   let owner = plugin.to_owned();
    object.set(
       "request",
       Function::new(
          ctx.clone(),
          move |ctx: Ctx<'js>, path: String, init: Opt<Object<'js>>| {
-            send(&ctx, &granted, path, Init::read(&ctx, init.0)?)
+            send(&ctx, &owner, &granted, path, Init::read(&ctx, init.0)?)
          },
       )?,
    )?;
    for verb in ["GET", "DELETE"] {
       let granted = Arc::clone(permissions);
+      let owner = plugin.to_owned();
       object.set(
          verb.to_ascii_lowercase(),
          Function::new(
@@ -252,13 +262,14 @@ pub fn discord_object<'js>(
             move |ctx: Ctx<'js>, path: String, init: Opt<Object<'js>>| {
                let mut init = Init::read(&ctx, init.0)?;
                verb.clone_into(&mut init.method);
-               send(&ctx, &granted, path, init)
+               send(&ctx, &owner, &granted, path, init)
             },
          )?,
       )?;
    }
    for verb in ["POST", "PUT", "PATCH"] {
       let granted = Arc::clone(permissions);
+      let owner = plugin.to_owned();
       object.set(
          verb.to_ascii_lowercase(),
          Function::new(
@@ -269,7 +280,7 @@ pub fn discord_object<'js>(
                if let Some(body) = body.0 {
                   init.set_body(&ctx, body)?;
                }
-               send(&ctx, &granted, path, init)
+               send(&ctx, &owner, &granted, path, init)
             },
          )?,
       )?;

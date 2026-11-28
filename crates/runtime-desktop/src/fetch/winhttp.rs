@@ -3,6 +3,7 @@
 
 use std::{
    ffi::c_void,
+   io,
    ptr,
 };
 
@@ -115,6 +116,20 @@ unsafe extern "system" {
    ) -> i32;
 }
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+   fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+   fn FormatMessageW(
+      flags: u32,
+      source: *const c_void,
+      id: u32,
+      language: u32,
+      buffer: *mut u16,
+      size: u32,
+      args: *const c_void,
+   ) -> u32;
+}
+
 struct Handle(*mut c_void);
 
 impl Drop for Handle {
@@ -133,8 +148,42 @@ fn wide(text: &str) -> Vec<u16> {
 fn os_err(url: &str, context: &str) -> FetchError {
    FetchError::Platform {
       url:     url.to_owned(),
-      message: format!("{context}: {}", std::io::Error::last_os_error()),
+      message: format!("{context}: {}", last_error()),
    }
+}
+
+/// The thread's last error. `WinHTTP` words its codes (12000 to 12999) in the message table of
+/// `winhttp.dll`, which `io::Error` never reads.
+fn last_error() -> String {
+   const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x0200;
+   const FORMAT_MESSAGE_FROM_HMODULE: u32 = 0x0800;
+
+   let err = io::Error::last_os_error();
+   let Some(code) = err.raw_os_error().filter(|code| (12000..13000).contains(code)) else {
+      return err.to_string();
+   };
+   let module = wide("winhttp.dll");
+   let mut text = [0u16; 512];
+   // SAFETY: winhttp.dll is linked so the module handle is live, and `text` holds the 512 units
+   // passed as its size.
+   let len = unsafe {
+      FormatMessageW(
+         FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_IGNORE_INSERTS,
+         GetModuleHandleW(module.as_ptr()),
+         code.cast_unsigned(),
+         0,
+         text.as_mut_ptr(),
+         512,
+         ptr::null(),
+      )
+   };
+   text
+      .get(..len as usize)
+      .filter(|words| !words.is_empty())
+      .map_or_else(
+         || err.to_string(),
+         |words| format!("{} (os error {code})", String::from_utf16_lossy(words).trim_end()),
+      )
 }
 
 #[expect(

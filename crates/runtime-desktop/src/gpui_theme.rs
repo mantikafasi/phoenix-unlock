@@ -30,6 +30,7 @@ pub fn set_css(css: &str) -> bool {
 }
 
 pub fn clear() {
+   crate::mana_theme::forget_saved();
    crate::mana_theme::restore_persisted();
 }
 

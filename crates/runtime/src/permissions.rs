@@ -436,6 +436,14 @@ impl Permissions {
       !links.0.is_empty() && links.0.values().all(|found| self.refused(found).is_none())
    }
 
+   /// Whether the plugin may open `url` in the browser: Discord's own links,
+   /// or any web link with `http`.
+   #[must_use]
+   pub fn link(&self, url: &str) -> bool {
+      url.starts_with("discord://")
+         || url_hosts(url).is_some_and(|found| self.refused(&found).is_none())
+   }
+
    /// The first host a URL in `after` reaches that the plugin may not point
    /// Discord at, unless `before` spelled the same URL or one it trims down to,
    /// or `seen` vouches for it.
@@ -474,5 +482,22 @@ impl Permissions {
          .into_iter()
          .filter(|&permission| !self.allows(permission))
          .collect()
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn links_off_discord_need_http() {
+      let none = Permissions::Declared(BTreeSet::new());
+      assert!(none.link("https://discord.com/channels/1/2"));
+      assert!(none.link("discord://-/channels/1/2"));
+      assert!(!none.link("https://lens.google.com/uploadbyurl?url=x"));
+      assert!(!none.link("https://discord.com@example.com/"));
+      assert!(!none.link("file:///C:/Windows/notepad.exe"));
+      let http = Permissions::Declared(BTreeSet::from([Permission::Http]));
+      assert!(http.link("https://lens.google.com/uploadbyurl?url=x"));
    }
 }

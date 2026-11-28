@@ -55,7 +55,7 @@ const settings = phoenix.settings.define({
   shortcut: {
     type: "switch",
     title: "Toggle with Ctrl+Shift+B",
-    description: "While Discord is focused (Windows)",
+    description: "While Discord is focused",
     default: true,
     onChange: syncShortcut,
   },

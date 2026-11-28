@@ -719,6 +719,117 @@ pub fn sret_callee(detour: usize) -> Vec<u8> {
    code
 }
 
+/// The argument registers an [`observe_stub`] saves for its observer, as they
+/// were on entry.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C)]
+pub struct Regs {
+   /// `x0` to `x8`, `x8` holding the return slot of a large return.
+   pub x:   [u64; 9],
+   /// `x30`, the caller's return address.
+   pub ret: u64,
+   pub v:   [u128; 8],
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Regs {
+   /// The first four integer arguments, `x0` to `x3`.
+   #[must_use]
+   pub const fn args(&self) -> [u64; 4] {
+      [self.x[0], self.x[1], self.x[2], self.x[3]]
+   }
+}
+
+/// Called on every entry of an observed function, on the caller's thread,
+/// with the context passed to [`observe`]. It must not unwind.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub type Observer = extern "C" fn(ctx: usize, regs: &Regs);
+
+/// Code that saves `x0` to `x8`, `x30` and `q0` to `q7` as a `Regs`, calls
+/// `observer(ctx, &regs)`, restores them and jumps to the word at `slot`.
+#[must_use]
+pub fn observe_stub(observer: usize, ctx: usize, slot: usize) -> Vec<u8> {
+   const FRAME: u32 = 0xD0;
+   const NOP: u32 = 0xD503_201F;
+   let pair = |base: u32, scale: u32, first: u32, second: u32, at: u32| {
+      base | ((at / scale) & 0x7F) << 15 | second << 10 | 31 << 5 | first
+   };
+   let pairs = |gpr: u32, simd: u32| {
+      let gprs = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 30)]
+         .into_iter()
+         .zip((0..).step_by(16))
+         .map(move |((first, second), at)| pair(gpr, 8, first, second, at));
+      let simds = [(0, 1), (2, 3), (4, 5), (6, 7)]
+         .into_iter()
+         .zip((80..).step_by(32))
+         .map(move |((first, second), at)| pair(simd, 16, first, second, at));
+      gprs.chain(simds).collect::<Vec<u32>>()
+   };
+   let literal = |at: usize, pool: usize, index: usize, reg: u32| {
+      let words = u32::try_from(pool + index * 2 - at).unwrap_or(0);
+      0x5800_0000 | words << 5 | reg
+   };
+   let mut words = vec![0xD100_03FF | FRAME << 10];
+   words.extend(pairs(0xA900_0000, 0xAD00_0000));
+   let calls_at = words.len();
+   words.extend([0, 0x9100_03E1, 0, 0xD63F_0200]);
+   words.extend(pairs(0xA940_0000, 0xAD40_0000));
+   words.push(0x9100_03FF | FRAME << 10);
+   let jumps_at = words.len();
+   words.extend([0, 0xF940_0210, 0xD61F_0200]);
+   if words.len() % 2 == 1 {
+      words.push(NOP);
+   }
+   let pool = words.len();
+   words[calls_at] = literal(calls_at, pool, 0, 0);
+   words[calls_at + 2] = literal(calls_at + 2, pool, 1, 16);
+   words[jumps_at] = literal(jumps_at, pool, 2, 16);
+   let mut code = words
+      .iter()
+      .flat_map(|word| word.to_le_bytes())
+      .collect::<Vec<u8>>();
+   for word in [ctx, observer, slot] {
+      code.extend((word as u64).to_le_bytes());
+   }
+   code
+}
+
+/// Makes every call to the function at `addr` run `observer(ctx, regs)` first,
+/// then the function unchanged, through a sunhook entry hook.
+///
+/// # Safety
+///
+/// `addr` starts a function.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub unsafe fn observe(
+   image: &Image<'static>,
+   addr: usize,
+   observer: Observer,
+   ctx: usize,
+) -> Result<crate::Observed, crate::Error> {
+   use std::sync::atomic::AtomicPtr;
+
+   let slot = Box::leak(Box::new(AtomicPtr::new(std::ptr::null_mut())));
+   let stub = crate::image::jit_copy(&observe_stub(
+      observer as usize,
+      ctx,
+      std::ptr::from_ref(slot).addr(),
+   ))
+   .ok_or_else(|| {
+      crate::Error::Attach {
+         backend: "observe",
+         target:  addr,
+         message: "no memory for the stub".to_owned(),
+      }
+   })?;
+   let (target, stub) = image.hook_targets(addr, stub)?;
+   // SAFETY: forwarded from the caller, the stub keeps the function's
+   // arguments, and sunhook fills `slot` before the jump to the stub is
+   // written.
+   let hook = unsafe { crate::Inline::attach_into(target, stub, slot) }?;
+   Ok(crate::Observed { addr, hook })
+}
+
 #[cfg(test)]
 mod tests {
    use super::*;

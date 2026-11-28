@@ -605,25 +605,69 @@ impl<'ix> Func<'ix> {
    }
 
    pub(crate) fn through_outlined(&self, target: usize) -> Option<usize> {
-      const MOST: usize = 6;
-      if self.ix.isa != Isa::Aarch64 {
-         return Some(target);
-      }
-      let Some(callee) = self.ix.function(target) else {
-         return Some(target);
-      };
-      if callee.size() > MOST * 4 {
-         return Some(target);
-      }
-      for step in op::decode(self.ix.image, self.ix.isa, target, callee.end) {
-         match step.op {
-            Op::Jump(tail) => return Some(tail),
-            Op::Ret => return None,
-            Op::Call(_) | Op::Branch(_) => return Some(target),
-            _ => {},
+      self.outlined(target, 6).map_or(Some(target), |stub| {
+         match stub.last().map(|step| step.op) {
+            Some(Op::Jump(tail)) => Some(tail),
+            _ => None,
          }
+      })
+   }
+
+   /// The steps of the arm64 outlined stub of at most `most` instructions at
+   /// `target`, through its closing `b T` or `ret`, or `None` when `target` is
+   /// a function of its own.
+   pub(crate) fn outlined(&self, target: usize, most: usize) -> Option<Vec<Step>> {
+      if self.ix.isa != Isa::Aarch64 {
+         return None;
       }
-      Some(target)
+      let callee = self.ix.function(target)?;
+      if callee.size() > most * 4 {
+         return None;
+      }
+      let mut steps = op::decode(self.ix.image, self.ix.isa, target, callee.end);
+      let end = steps
+         .iter()
+         .position(|step| matches!(step.op, Op::Jump(_) | Op::Ret | Op::Call(_) | Op::Branch(_)))?;
+      if !matches!(steps[end].op, Op::Jump(_) | Op::Ret) {
+         return None;
+      }
+      steps.truncate(end + 1);
+      Some(steps)
+   }
+
+   /// [`Func::steps`] with each arm64 outlined stub's instructions in place of
+   /// the call or tail jump to it. A stub a call reaches that ends in `b T`
+   /// becomes a call to `T`, and one ending in `ret` returns to the caller.
+   /// macOS setters open with a 7-instruction stub saving their arguments.
+   #[must_use]
+   pub fn flat_steps(&self) -> Vec<Step> {
+      const MOST: usize = 12;
+      let mut flat = Vec::new();
+      for step in self.steps() {
+         let (target, called) = match step.op {
+            Op::Call(target) => (target, true),
+            Op::Jump(target) if !(self.start..self.end).contains(&target) => (target, false),
+            _ => {
+               flat.push(step);
+               continue;
+            },
+         };
+         let Some(mut stub) = self.outlined(target, MOST) else {
+            flat.push(step);
+            continue;
+         };
+         if let Some(last) = stub.last_mut() {
+            match last.op {
+               Op::Jump(tail) if called => last.op = Op::Call(tail),
+               Op::Ret if called => {
+                  stub.pop();
+               },
+               _ => {},
+            }
+         }
+         flat.extend(stub);
+      }
+      flat
    }
 
    /// The addresses this function loads, in instruction order.

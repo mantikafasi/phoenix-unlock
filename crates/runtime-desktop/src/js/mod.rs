@@ -44,6 +44,7 @@ use crate::{
       self,
       Tweak,
    },
+   sticker,
    toolbar,
 };
 
@@ -52,36 +53,40 @@ use crate::{
 #[derive(Default)]
 pub struct Desktop<'js> {
    /// `phoenix.ui.addMessageAccessory` callbacks.
-   pub accessories:    RefCell<Vec<DesktopAccessory<'js>>>,
+   pub accessories:      RefCell<Vec<DesktopAccessory<'js>>>,
    /// `phoenix.ui.addMemberDecoration` callbacks.
-   pub members:        RefCell<Vec<DesktopMember<'js>>>,
+   pub members:          RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageHeaderDecoration` callbacks.
-   pub headers:        RefCell<Vec<DesktopMember<'js>>>,
+   pub headers:          RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageAction` callbacks.
-   pub actions:        RefCell<Vec<DesktopAction<'js>>>,
+   pub actions:          RefCell<Vec<DesktopAction<'js>>>,
    /// Active `phoenix.ui.openPage` button callbacks, keyed by button ID.
-   pub page_buttons:   RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
+   pub page_buttons:     RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
    /// `phoenix.ui.notify` `onPress` callbacks, keyed by banner ID.
-   pub notices:        RefCell<HashMap<u64, (String, Function<'js>)>>,
+   pub notices:          RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.messages.onEmojiPick` handlers by id and plugin. Desktop has
    /// no picker presses to give them, only the unlock they turn on.
-   pub emoji_pickers:  RefCell<Vec<(u64, String)>>,
+   pub emoji_pickers:    RefCell<Vec<(u64, String)>>,
+   /// `phoenix.messages.onStickerPick` handlers by id and plugin.
+   pub sticker_pickers:  RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.onEvent("rowDoubleTap")` handlers by id and plugin.
-   pub double_taps:    RefCell<Vec<(u64, String, Function<'js>)>>,
+   pub double_taps:      RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.hide` holds by id and plugin.
-   pub hides:          RefCell<Vec<(u64, String)>>,
+   pub hides:            RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.collapseChannels` holds by id and plugin.
-   pub collapses:      RefCell<Vec<(u64, String)>>,
+   pub collapses:        RefCell<Vec<(u64, String)>>,
    /// `phoenix.spotify` holds by id, plugin and tweak.
-   pub spotify:        RefCell<Vec<(u64, String, Tweak)>>,
+   pub spotify:          RefCell<Vec<(u64, String, Tweak)>>,
    /// `phoenix.ui.addHeaderButton` handlers by id and plugin.
-   pub header_buttons: RefCell<Vec<(u64, String, Function<'js>)>>,
+   pub header_buttons:   RefCell<Vec<(u64, String, Function<'js>)>>,
+   /// `phoenix.ui.addComposerButton` presses by id and plugin.
+   pub composer_buttons: RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.addShortcut` handlers by id and plugin.
-   pub shortcuts:      RefCell<Vec<(u64, String, Shortcut, Function<'js>)>>,
+   pub shortcuts:        RefCell<Vec<(u64, String, Shortcut, Function<'js>)>>,
    /// `phoenix.ui.hideCount` holds by id and plugin.
-   pub hidden_counts:  RefCell<Vec<(u64, String, Count)>>,
+   pub hidden_counts:    RefCell<Vec<(u64, String, Count)>>,
    /// `phoenix.ui.disableCallIdle` holds by id and plugin.
-   pub idle_off:       RefCell<Vec<(u64, String, Timer)>>,
+   pub idle_off:         RefCell<Vec<(u64, String, Timer)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -101,8 +106,8 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
 
 /// Drops the accessories, member decorations, context menu actions, open page
 /// callbacks, banners, emoji pick handlers, hidden counts, call idle holds,
-/// sidebar collapses, header buttons and shortcuts `name` registered and
-/// redraws Discord without them.
+/// sidebar collapses, header and composer buttons and shortcuts `name`
+/// registered and redraws Discord without them.
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -152,6 +157,9 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    emoji::unlock(!pickers.is_empty());
    drop(pickers);
 
+   registry.sticker_pickers.borrow_mut().retain(|(_, plugin, _)| plugin != name);
+   sticker::set_active(!registry.sticker_pickers.borrow().is_empty());
+
    let mut taps = registry.double_taps.borrow_mut();
    taps.retain(|(_, plugin, _)| plugin != name);
    double_click::set_active(!taps.is_empty());
@@ -191,6 +199,8 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
          }
          !held
       });
+
+   ui::unload_composer_buttons(&registry, name);
 
    registry
       .shortcuts

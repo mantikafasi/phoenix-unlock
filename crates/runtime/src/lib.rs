@@ -69,6 +69,8 @@ pub enum Error {
    Js(String),
    #[error(transparent)]
    Registry(#[from] registry::Error),
+   #[error("gateway handlers' success word: {0}")]
+   OkWord(String),
    #[error("{event}: the registry slot held {found:#x}, the walk read {expected:#x}")]
    SwapConflict {
       event:    String,

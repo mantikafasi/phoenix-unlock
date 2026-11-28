@@ -1026,6 +1026,7 @@ declare namespace Phoenix {
     /// The raw view tree methods are present with `hooks`. Icon URLs must point at Discord's CDN
     /// without `http`.
     readonly ui: Ui;
+    readonly platform: Platform;
     readonly commands: Commands;
     readonly log: Log;
     readonly storage: Storage;
@@ -1068,8 +1069,8 @@ declare namespace Phoenix {
   interface Fonts {
     /// Whether this Discord build's text system could be hooked.
     supported(): boolean;
-    /// Installed families by their English name, sorted. Windows only.
-    list?(): string[];
+    /// Installed families by their English name, sorted.
+    list(): string[];
     /// `main` replaces gg sans and ABC Ginto, `mono` replaces gg sans mono (code blocks).
     set(fonts: { main?: string; mono?: string }): void;
     clear(): void;
@@ -1092,7 +1093,8 @@ declare namespace Phoenix {
     supported(): boolean;
     /// The `*.theme.css` files in the themes folder, by file name.
     list(): InstalledTheme[];
-    /// Applies a theme from `list()`.
+    /// Applies a theme from `list()` and keeps it after a restart until `clear()`, `setCss()`, or
+    /// unloading the plugin.
     apply(id: string): void;
     /// Applies stylesheet text, such as a bundled preset. Returns whether it themes anything.
     setCss(css: string): boolean;
@@ -1131,6 +1133,8 @@ declare namespace Phoenix {
   /// - `messages` `phoenix.messages`, which reads and rewrites message and composer text.
   /// - `hooks` `bridge`, the raw view tree and `gateway.onSend`, plus everything above.
   type Permission = "gateway" | "discord" | "http" | "messages" | "hooks";
+
+  type Platform = "android" | "ios" | "windows" | "linux" | "macos";
 
   interface Bridge {
     /// Invokes a native Phoenix host module method by its `hh.jb` numeric IDs (see
@@ -1263,7 +1267,9 @@ declare namespace Phoenix {
     onEmojiPick(handler: (emojiId: string, ctx: UiContext) => string | void): Remover;
     /// Runs when a sticker is pressed in the picker under the message box, with its id. Return
     /// `true` to take the press, so Phoenix neither sends the sticker nor shows a Nitro ad, or
-    /// nothing to leave it to Phoenix. Desktop has no picker presses to report.
+    /// nothing to leave it to Phoenix. Desktop also runs it for stickers sent from autocomplete,
+    /// and while a handler exists, a sticker needing Nitro that no handler takes goes to Discord,
+    /// which refuses it.
     onStickerPick(handler: (stickerId: string, ctx: UiContext) => boolean | void): Remover;
   }
 
@@ -1472,11 +1478,12 @@ declare namespace Phoenix {
   /// land a moment after the screen they belong to. Everything goes away when the plugin is
   /// turned off.
   interface Ui {
-    /// In the chat header, left of search. On Windows Desktop Phoenix, in the channel toolbar after the
+    /// In the chat header, left of search. On Desktop Phoenix, in the channel toolbar after the
     /// member list button (where Discord shows one), with `label` as its tooltip and `icon` mapped
     /// to Mana's icon of that name (`res://ic_mana_panel_open` is `PanelOpen`); `tint` is ignored.
     addHeaderButton(options: ButtonOptions): ButtonRemover;
-    /// In the message box, left of the emoji button.
+    /// In the message box, left of the emoji button. On Desktop Phoenix, a button labeled `label`
+    /// left of the chat bar, drawn as the primary button while `tint` is set; `icon` is ignored.
     addComposerButton(options: ButtonOptions): ButtonRemover;
     /// A line under each message's content, or after its timestamp with `placement: "header"`.
     /// It runs once per message and place, and the result is kept until `update`.
@@ -1506,7 +1513,11 @@ declare namespace Phoenix {
       danger?: boolean;
       priority?: number;
       visible?(ctx: MessageContext): boolean | Promise<boolean>;
-      onPress(ctx: MessageContext): void;
+      /// Required unless `children` is given.
+      onPress?(ctx: MessageContext): void;
+      /// Makes the row a submenu of these. Desktop shows a native submenu, or the rows inline on a
+      /// build without one to copy; phones ignore it for now and need `onPress`.
+      children?: { label: string; icon?: Icon; danger?: boolean; onPress(ctx: MessageContext): void }[];
     }): Remover;
     /// A section at the end of a profile's main tab.
     addProfileSection(options: {
@@ -1558,11 +1569,12 @@ declare namespace Phoenix {
     disableCallIdle?(timer: "dmCall" | "guildAfk"): Remover;
     /// Collapses the channel sidebar to the server rail until the returned function runs, the
     /// way Discord's member list toggle hides members. The width the user dragged it to comes
-    /// back on restore. Available on Windows Desktop Phoenix builds with a recognized sidebar.
+    /// back on restore. Available on Desktop Phoenix builds with a recognized sidebar.
     collapseChannels?(): Remover;
     /// Runs `run` when `key` (one letter or digit) is pressed with the given modifiers while
     /// Discord is focused, and keeps the key from Discord. `ctrl` or `alt` is required.
-    /// Desktop Phoenix on Windows only; a no-op elsewhere.
+    /// Desktop Phoenix only. On macOS `ctrl` is Command and `alt` is Option. Linux and macOS
+    /// match the key by its place on a US QWERTY keyboard, whatever the layout.
     addShortcut?(options: {
       key: string;
       ctrl?: boolean;
@@ -1614,6 +1626,9 @@ declare namespace Phoenix {
     disableHaptics?(): Remover;
     /// Copies `text` to the device clipboard.
     copy(text: string): void;
+    /// Opens an `https://`, `http://` or `discord://` link in the default browser, and throws for
+    /// anything else. Links off Discord need `http`. Desktop only for now.
+    openUrl?(url: string): void;
     /// A short message at the bottom of the screen, in a banner at the top on iOS, or in a banner
     /// in the bottom right corner on desktop.
     toast(text: string): void;

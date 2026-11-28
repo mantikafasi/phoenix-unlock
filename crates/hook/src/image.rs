@@ -1361,7 +1361,7 @@ pub const fn sret_callee(_detour: usize) -> Option<usize> {
 /// `code` in executable `MAP_JIT` memory, bump-allocated out of shared 16 KB
 /// slabs so hooks and sret thunks don't each burn a fresh page.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn jit_copy(code: &[u8]) -> Option<usize> {
+pub(crate) fn jit_copy(code: &[u8]) -> Option<usize> {
    use std::sync::{
       Mutex,
       PoisonError,

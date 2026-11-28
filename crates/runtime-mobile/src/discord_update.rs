@@ -46,6 +46,10 @@ use sha2::{
 const BUILDS: &str = "https://update.sunbird.tools/discord.json";
 /// Under [`fetch::LIMIT`], which caps one response.
 const CHUNK: usize = 4 << 20;
+/// Mobile networks stall for longer than the read timeout mid-split, and a
+/// range costs little to fetch again.
+const RETRIES: u32 = 3;
+const RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// This phone's ABI split and the directory its libraries sit in.
 const ABI: (&str, &str) = if cfg!(target_arch = "x86_64") {
    ("config.x86_64", "x86_64")
@@ -576,7 +580,20 @@ fn download(build: &Build, name: &str, progress: &mut Progress) -> Result<Vec<u8
    while bytes.len() < split.size {
       let end = (bytes.len() + CHUNK).min(split.size) - 1;
       let range = format!("bytes={}-{end}", bytes.len());
-      let chunk = fetch::get_with(&url, vec![("Range".to_owned(), range)]).map_err(|err| {
+      let mut tries = 1..=RETRIES;
+      let chunk = loop {
+         match fetch::get_with(&url, vec![("Range".to_owned(), range.clone())]) {
+            Err(fetch::FetchError::Platform { message, .. }) if tries.next().is_some() => {
+               log::warn!(
+                  "discord update: {name} at {}: {message}, retrying",
+                  bytes.len()
+               );
+               thread::sleep(RETRY_WAIT);
+            },
+            result => break result,
+         }
+      }
+      .map_err(|err| {
          match err {
             fetch::FetchError::Status { status, .. } => {
                format!(
