@@ -139,7 +139,7 @@ def extract_accessibility_ids(repo_root: Path) -> list[str]:
         repo_root / "plugins",
     ]
     aid_re = re.compile(
-        r'"((?:composer\.[a-z0-9._:-]+|message\.[a-z0-9._:-]+|search\.[a-z0-9._:-]+|settings\.[a-z0-9._:-]+|profile-[a-z0-9._:-]+|expression\.[a-z0-9._:-]+|phoenix\.[a-z0-9._:{}-]+|main-tabs|suggestions|composer|send|Record Voice Message))"'
+        r'"((?:composer\.[a-z0-9._:-]+|message\.[a-z0-9._:-]+|search\.[a-z0-9._:-]+|settings\.[a-z0-9._:-]+|profile-[a-z0-9._:-]+|expression\.[a-z0-9._:-]+|channel\.[a-z0-9._:-]+|dm\.[a-z0-9._:-]+|phoenix\.[a-z0-9._:{}-]+|main-tabs|suggestions|composer|send|xp-sheet|Avatar|Record Voice Message))"'
     )
     for base in scan_dirs:
         if not base.exists():
