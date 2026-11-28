@@ -13,6 +13,7 @@ use crate::{
       Op,
       Reg,
       Step,
+      Value,
    },
    one,
 };
@@ -230,8 +231,16 @@ pub struct SidebarRows {
    /// Log Out's click vtable, stored at `click_offset` after the box.
    pub click_vtable:  usize,
    pub click_offset:  usize,
-   /// Mana's gear icon, Sunbird's.
+   /// Mana's gear icon, for Sunbird's Settings row.
    pub gear:          u16,
+   /// Mana's icon for Sunbird's Plugins row.
+   pub plugins_icon:  u16,
+   /// Mana's icon for Sunbird's Store row.
+   pub store_icon:    u16,
+   /// `SidebarItem::Separator` discriminant tag at `+0`, if decoded.
+   pub separator_tag: Option<u32>,
+   /// `SidebarItem::Header` `(discriminant tag, SharedString label offset)`, if decoded.
+   pub header:        Option<(u32, usize)>,
 }
 
 pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<SidebarRows> {
@@ -323,18 +332,154 @@ pub fn settings_sidebar_rows(ix: &Index<'_>, page_offset: usize) -> Found<Sideba
       })
       .collect::<Vec<_>>();
    let (selected, selected_via, selected_call) = one("sidebar selected-page map", &selected)?;
+   let (gear, plugins_icon, store_icon) = sidebar_icons(ix)?;
+   let (separator_tag, header) = decode_sidebar_header_sep(ix, sidebar, &steps[..load], push);
    Ok(SidebarRows {
-      sidebar: sidebar.start,
-      selected,
-      selected_via,
-      selected_call,
-      push,
-      entry_size,
-      row,
-      click_vtable,
-      click_offset,
-      gear: mana_icon(ix, "Settings")?,
+      sidebar: sidebar.start, selected, selected_via, selected_call,
+      push, entry_size, row, click_vtable, click_offset,
+      gear, plugins_icon, store_icon, separator_tag, header,
    })
+}
+
+/// Decodes `SidebarItem::Separator`'s tag and `SidebarItem::Header`'s
+/// `(tag, label_offset)` from the pushes preceding `us-logout` in `sidebar`.
+fn decode_sidebar_header_sep(
+   ix: &Index<'_>,
+   sidebar: Func<'_>,
+   pre: &[Step],
+   push: usize,
+) -> (Option<u32>, Option<(u32, usize)>) {
+   let window = &pre[pre.len().saturating_sub(160)..];
+   let mut sep_tag = None;
+   let mut header_ctor = None;
+   let mut imm_regs: HashMap<Reg, u32> = HashMap::new();
+   let mut last_imm_store: Option<u32> = None;
+   let mut last_call: Option<usize> = None;
+
+   for step in window {
+      match step.op {
+         Op::Imm { reg, value } if (1..=15).contains(&value) => {
+            if let Ok(v) = u32::try_from(value) {
+               imm_regs.insert(reg, v);
+            }
+         },
+         Op::Store {
+            value: Value::Imm(v),
+            size: 4,
+            ..
+         } if (1..=15).contains(&v) => {
+            last_imm_store = u32::try_from(v).ok();
+         },
+         Op::Store {
+            value: Value::Reg(r),
+            size: 4,
+            ..
+         } if imm_regs.contains_key(&r) => {
+            last_imm_store = imm_regs.get(&r).copied();
+         },
+         Op::Call(target) => {
+            let resolved = sidebar.through_outlined(target).unwrap_or(target);
+            if resolved == push {
+               if let Some(tag) = last_imm_store.take() {
+                  sep_tag = Some(tag);
+               } else if let Some(ctor) = last_call.take() {
+                  header_ctor = Some(ctor);
+               }
+            } else {
+               last_imm_store = None;
+               last_call = Some(resolved);
+            }
+            imm_regs.clear();
+         },
+         _ => {},
+      }
+   }
+
+   let header = header_ctor.and_then(|ctor| decode_header_ctor(ix, ctor, sep_tag));
+   (sep_tag, header)
+}
+
+fn decode_header_ctor(ix: &Index<'_>, ctor: usize, sep_tag: Option<u32>) -> Option<(u32, usize)> {
+   let func = ix.func(ctor).ok()?;
+   let mut steps = Vec::new();
+   for step in func.steps() {
+      if let Op::Call(target) = step.op
+         && let Ok(sub) = ix.func(target)
+         && sub.steps().len() <= 24
+      {
+         steps.extend(sub.steps());
+      }
+      steps.push(step);
+   }
+   let mut sret_regs = vec![ix.isa.sret()];
+   let mut imm_regs: HashMap<Reg, u32> = HashMap::new();
+   let mut tags = Vec::new();
+   let mut label_off = None;
+   for step in steps {
+      match step.op {
+         Op::Move { dst, src } if sret_regs.contains(&src) && !sret_regs.contains(&dst) => {
+            sret_regs.push(dst);
+         },
+         Op::Imm { reg, value } if (1..16).contains(&value) => {
+            if let Ok(v) = u32::try_from(value) {
+               imm_regs.insert(reg, v);
+            }
+         },
+         Op::Offset { base, offset, .. } | Op::Store { base, offset, .. }
+            if label_off.is_none()
+               && sret_regs.contains(&base)
+               && (8..=0x20).contains(&offset)
+               && offset % 8 == 0 =>
+         {
+            label_off = usize::try_from(offset).ok();
+         },
+         Op::Store {
+            base,
+            value: Value::Imm(v),
+            offset: 0,
+            size: 4,
+         } if sret_regs.contains(&base) && (1..16).contains(&v) => {
+            if let Ok(tag) = u32::try_from(v)
+               && Some(tag) != sep_tag
+            {
+               tags.push(tag);
+            }
+         },
+         Op::Store {
+            base,
+            value: Value::Reg(r),
+            offset: 0,
+            size: 4,
+         } if sret_regs.contains(&base)
+            && imm_regs.get(&r).is_some_and(|&v| Some(v) != sep_tag) =>
+         {
+            if let Some(&v) = imm_regs.get(&r) {
+               tags.push(v);
+            }
+         },
+         _ => {},
+      }
+   }
+   tags.sort_unstable();
+   tags.dedup();
+   // `SidebarItem::header` writes tag 2 for category headers and tag 3 for
+   // special headers; take the smaller tag.
+   Some((*tags.first()?, label_off?))
+}
+
+fn sidebar_icons(ix: &Index<'_>) -> Found<(u16, u16, u16)> {
+   let gear = mana_icon(ix, "Settings")?;
+   let pick = |names: &[&str]| {
+      names
+         .iter()
+         .find_map(|name| mana_icon(ix, name).ok())
+         .unwrap_or(gear)
+   };
+   Ok((
+      gear,
+      pick(&["PuzzlePiece", "Sparkles", "Apps"]),
+      pick(&["Shop", "ShopSparkle", "Compass"]),
+   ))
 }
 
 /// What the settings pane's title names the active page with.
