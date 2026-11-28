@@ -29,6 +29,8 @@ mod headers;
 mod health;
 mod icons;
 mod js;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod macos_cache;
 pub mod mana_theme;
 mod members;
 mod message;
@@ -275,6 +277,18 @@ pub fn prepare() -> Result<(), Error> {
    feature("os_redraw", || <os::Os as os::DesktopOs>::install(&image));
    #[cfg(target_os = "linux")]
    feature("shortcuts", shortcuts::linux::install);
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   let registry = macos_cache::load_gateway(&image).map_or_else(
+      || {
+         let hooked = phoenix_runtime::hook(&image);
+         if let Ok(reg) = hooked {
+            macos_cache::save_gateway(&image, reg);
+         }
+         hooked
+      },
+      |cached| phoenix_runtime::hook_registry(&image, cached),
+   );
+   #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
    let registry = phoenix_runtime::hook(&image);
    critical(
       "gateway",

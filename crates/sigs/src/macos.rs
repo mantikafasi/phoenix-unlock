@@ -1012,9 +1012,21 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
                => usize::try_from(imm).ok()?
       ))
    };
-   let pushes = calls(&body).filter(|&target| push_stride(target).is_some());
-   let vec_push = most_common(pushes, 3).ok_or("Vec<MenuItem>::push not found")?;
-   let size = push_stride(vec_push).ok_or("Vec<MenuItem>::push stride not found")?;
+   let mut call_counts = HashMap::<usize, usize>::new();
+   for target in calls(&body) {
+      *call_counts.entry(target).or_default() += 1;
+   }
+   let mut push_candidates = call_counts
+      .into_iter()
+      .filter(|&(_, count)| count >= 3)
+      .filter_map(|(target, count)| Some((target, count, push_stride(target)?)))
+      .collect::<Vec<_>>();
+   push_candidates.sort_unstable_by_key(|&(_, count, _)| std::cmp::Reverse(count));
+   let (vec_push, size) = match *push_candidates.as_slice() {
+      [(target, _, stride)] => (target, stride),
+      [(target, first, stride), (_, second, _), ..] if first > second => (target, stride),
+      _ => return Err("Vec<MenuItem>::push not found".to_owned()),
+   };
 
    // `with_color` sits between `with_icon` and `push`, called with `mov w1, #2`
    // (danger) on destructive actions.

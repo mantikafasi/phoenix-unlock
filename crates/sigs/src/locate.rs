@@ -489,9 +489,19 @@ pub fn emoji_check(ix: &Index<'_>) -> Found<EmojiCheck> {
    let context = ix.isa.arg(1).ok_or("no second argument register")?;
    let opens = |step: &Step| matches!(step.op, Op::Load { base, size: 1, .. } if base == context);
    // Rejecting on the first instruction keeps the scan of every function to one decode each.
-   let checks = ix
-      .heads(1, |head| head.first().is_some_and(opens))
-      .filter(|func| {
+   let candidates = if ix.isa == crate::index::Isa::Aarch64 {
+      // Any 1-byte load off `x1` (`ldrb`/`ldurb`/`ldrsb`).
+      ix.heads_arm64_words(1, |words| {
+         words.first().is_some_and(|&word| {
+            word & 0xFFC0_03E0 == 0x3940_0020
+               || word & 0xFFE0_03E0 == 0x3840_0020
+               || word & 0xFFA0_03E0 == 0x3880_0020
+         })
+      })
+   } else {
+      ix.heads(1, |head| head.first().is_some_and(opens))
+   };
+   let checks = candidates.filter(|func| {
          let head = func.head(HEAD);
          let ops = head.iter().skip(1).map(|step| step.op);
          ops.clone().any(|op| matches!(op, Op::Cmp { value: 14, .. }))

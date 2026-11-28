@@ -1493,14 +1493,58 @@ impl Image<'_> {
    }
 
    fn find_in(&self, needle: &[u8], keep: impl Fn(&Segment<'_>) -> bool) -> Vec<usize> {
-      self
-         .segments
-         .iter()
-         .filter(|segment| keep(segment))
-         .flat_map(|segment| {
-            memmem::find_iter(&segment.bytes, needle).map(|offset| segment.addr + offset)
-         })
-         .collect()
+      const PARALLEL_THRESHOLD: usize = 16 << 20;
+      if needle.is_empty() {
+         return Vec::new();
+      }
+      let finder = memmem::Finder::new(needle);
+      let mut out = Vec::new();
+      let threads = std::thread::available_parallelism().map_or(1, usize::from);
+      for segment in self.segments.iter().filter(|segment| keep(segment)) {
+         if threads > 1 && segment.bytes.len() >= PARALLEL_THRESHOLD && needle.len() <= 4096 {
+            let overlap = needle.len() - 1;
+            let chunk = segment.bytes.len().div_ceil(threads).max(1 << 20);
+            let bytes: &[u8] = &segment.bytes;
+            let base = segment.addr;
+            let finder = &finder;
+            let parts: Vec<Vec<usize>> = std::thread::scope(|scope| {
+               #[expect(
+                  clippy::needless_collect,
+                  reason = "spawn every chunk worker before joining"
+               )]
+               let handles: Vec<_> = (0..bytes.len())
+                  .step_by(chunk)
+                  .map(|from| {
+                     scope.spawn(move || {
+                        let exclusive_end = (from + chunk).min(bytes.len());
+                        let scan_end = (exclusive_end + overlap).min(bytes.len());
+                        finder
+                           .find_iter(&bytes[from..scan_end])
+                           .filter_map(|offset| {
+                              let pos = from + offset;
+                              (pos < exclusive_end).then_some(base + pos)
+                           })
+                           .collect::<Vec<usize>>()
+                     })
+                  })
+                  .collect();
+               handles
+                  .into_iter()
+                  .map(|handle| handle.join().unwrap_or_default())
+                  .collect()
+            });
+            for part in parts {
+               out.extend(part);
+            }
+         } else {
+            out.extend(
+               finder
+                  .find_iter(&segment.bytes)
+                  .map(|offset| segment.addr + offset),
+            );
+         }
+      }
+      out
    }
 
    #[must_use]
