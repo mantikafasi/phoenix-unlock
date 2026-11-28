@@ -414,12 +414,14 @@ impl Engine {
       self.plugins.get(name).map(|loaded| loaded.source.clone())
    }
 
-   /// The bundled copy an installed one replaced.
+   /// The bundled copy, whether it runs or an installed one replaced it.
    #[must_use]
    pub fn bundled(&self, name: &str) -> Option<String> {
-      match &self.plugins.get(name)?.origin {
+      let loaded = self.plugins.get(name)?;
+      match &loaded.origin {
+         Origin::Bundled => Some(loaded.source.clone()),
          Origin::Replacing(bundled) => Some(bundled.clone()),
-         Origin::Bundled | Origin::Installed => None,
+         Origin::Installed => None,
       }
    }
 
@@ -1078,4 +1080,5 @@ mod tests {
       let dir = std::env::temp_dir().join("phoenix-installed-missing-directory");
       assert_eq!(installed(&dir).unwrap(), Vec::<(String, String)>::new());
    }
+
 }

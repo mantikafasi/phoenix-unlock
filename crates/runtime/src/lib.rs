@@ -483,7 +483,7 @@ pub fn source(name: &str) -> Option<String> {
    engine()?.source(name)
 }
 
-/// The bundled copy an installed plugin replaced.
+/// The bundled copy, whether it runs or an installed plugin replaced it.
 #[must_use]
 pub fn bundled_source(name: &str) -> Option<String> {
    engine()?.bundled(name)
