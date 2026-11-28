@@ -18,9 +18,15 @@ use rquickjs::{
 };
 
 #[cfg(target_arch = "x86_64")]
-use crate::counts::{
-   self,
-   Count,
+use crate::{
+   call_idle::{
+      self,
+      Timer,
+   },
+   counts::{
+      self,
+      Count,
+   },
 };
 use crate::{
    accessories,
@@ -77,6 +83,9 @@ pub struct Desktop<'js> {
    /// `phoenix.ui.hideCount` holds by id and plugin.
    #[cfg(target_arch = "x86_64")]
    pub hidden_counts:  RefCell<Vec<(u64, String, Count)>>,
+   /// `phoenix.ui.disableCallIdle` holds by id and plugin.
+   #[cfg(target_arch = "x86_64")]
+   pub idle_off:       RefCell<Vec<(u64, String, Timer)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -95,9 +104,9 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
 }
 
 /// Drops the accessories, member decorations, context menu actions, open page
-/// callbacks, banners, emoji pick handlers, hidden counts, sidebar collapses,
-/// header buttons and shortcuts `name` registered and redraws Discord without
-/// them.
+/// callbacks, banners, emoji pick handlers, hidden counts, call idle holds,
+/// sidebar collapses, header buttons and shortcuts `name` registered and
+/// redraws Discord without them.
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -203,6 +212,10 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       let mut hidden = registry.hidden_counts.borrow_mut();
       hidden.retain(|(_, plugin, _)| plugin != name);
       counts::hide(hidden.iter().map(|&(.., count)| count));
+
+      let mut off = registry.idle_off.borrow_mut();
+      off.retain(|(_, plugin, _)| plugin != name);
+      call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
    }
 
    themes::unload(name);

@@ -51,9 +51,15 @@ use rquickjs::{
 };
 
 #[cfg(target_arch = "x86_64")]
-use crate::counts::{
-   self,
-   Count,
+use crate::{
+   call_idle::{
+      self,
+      Timer,
+   },
+   counts::{
+      self,
+      Count,
+   },
 };
 use crate::{
    accessories::{
@@ -1589,6 +1595,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       })?,
    )?;
 
+   let idle_owner = plugin.to_owned();
+   ui.set(
+      "disableCallIdle",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, name: String| {
+         disable_call_idle(&ctx, &idle_owner, &name)
+      })?,
+   )?;
+
    let owner = plugin.to_owned();
    ui.set(
       "addMessageAccessory",
@@ -1910,6 +1924,48 @@ fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result
 /// macOS has no pending count locators yet, so the counts stay.
 #[cfg(not(target_arch = "x86_64"))]
 fn hide_count<'js>(ctx: &Ctx<'js>, _plugin: &str, _name: &str) -> rquickjs::Result<Function<'js>> {
+   noop_handle(ctx)
+}
+
+/// `phoenix.ui.disableCallIdle`, until the returned remover runs.
+#[cfg(target_arch = "x86_64")]
+fn disable_call_idle<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   name: &str,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_HOLD: AtomicU64 = AtomicU64::new(1);
+
+   let timer = name.parse::<Timer>().map_err(|()| {
+      Exception::throw_type(
+         ctx,
+         &format!("unknown call idle timer {name:?}, expected \"dmCall\" or \"guildAfk\""),
+      )
+   })?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   let hold = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
+   let mut off = registry.idle_off.borrow_mut();
+   off.push((hold, plugin.to_owned(), timer));
+   call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut off = registry.idle_off.borrow_mut();
+      off.retain(|&(held, ..)| held != hold);
+      call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
+   })
+}
+
+/// The poll shims are x86-64, so macOS keeps the timers.
+#[cfg(not(target_arch = "x86_64"))]
+fn disable_call_idle<'js>(
+   ctx: &Ctx<'js>,
+   _plugin: &str,
+   _name: &str,
+) -> rquickjs::Result<Function<'js>> {
    noop_handle(ctx)
 }
 

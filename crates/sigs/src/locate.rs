@@ -2,6 +2,8 @@
 //! every binary of its [`Family`], whatever the ISA.
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod call_idle;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod message;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod settings;
@@ -177,6 +179,21 @@ pub const LOCATORS: &[Locator] = &[
                found.sibling
             )
          })
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "call idle",
+      families: DESKTOP,
+      run:      |ix| {
+         let dm = call_idle::dm_idle(ix)?;
+         let afk = call_idle::guild_afk(ix)?;
+         Ok(format!(
+            "dm {}, afk move {}, afk disconnect {}",
+            hookable(ix, dm)?,
+            hookable(ix, afk.move_poll)?,
+            hookable(ix, afk.disconnect_poll)?
+         ))
       },
    },
 ];
