@@ -95,10 +95,16 @@ pub enum Error {
    PluginModule { name: String },
    #[error("{name}: this is TypeScript source, install its bundled .js")]
    PluginTypeScript { name: String },
-   #[error("{name}: {message}")]
-   PluginSyntax { name: String, message: String },
-   #[error("{name}: the new code failed to start and was not saved: {message}")]
-   PluginStart { name: String, message: String },
+   #[error("{name}: {error}")]
+   PluginSyntax {
+      name:  String,
+      error: js::SourceError,
+   },
+   #[error("{name}: the new code failed to start and was not saved: {error}")]
+   PluginStart {
+      name:  String,
+      error: js::SourceError,
+   },
    #[error("{url}: the download is not UTF-8 text")]
    NotUtf8 { url: String },
    #[error(transparent)]
@@ -482,11 +488,11 @@ pub fn save_source(name: &str, source: String) -> Result<(), Error> {
    };
    write().map_err(io_error(&pending))?;
    let started = engine().map_or(Ok(()), |mut engine| engine.install(name, source));
-   if let Err(message) = started {
+   if let Err(error) = started {
       let _ = std::fs::remove_file(&pending);
       return Err(Error::PluginStart {
          name: name.to_owned(),
-         message,
+         error,
       });
    }
    std::fs::rename(&pending, &file).map_err(io_error(&file))

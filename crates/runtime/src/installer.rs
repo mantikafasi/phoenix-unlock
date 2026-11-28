@@ -17,6 +17,7 @@ use crate::{
    Error,
    Header,
    fetch,
+   js::SourceError,
 };
 
 /// File stems that name a build's entry point rather than the plugin.
@@ -236,7 +237,7 @@ pub fn check(name: &str, source: &str) -> Result<(), Error> {
          name: name.to_owned(),
       });
    }
-   let Err(message) = parses(source) else {
+   let Err(error) = parses(source) else {
       return Ok(());
    };
    if source.lines().map(str::trim_start).any(module_line) {
@@ -246,20 +247,21 @@ pub fn check(name: &str, source: &str) -> Result<(), Error> {
    }
    Err(Error::PluginSyntax {
       name: name.to_owned(),
-      message,
+      error,
    })
 }
 
 /// Compiles `source` the way the engine wraps it, without running it, in a
 /// runtime of its own so nothing of it reaches the plugins'.
-fn parses(source: &str) -> Result<(), String> {
-   let runtime = Runtime::new().map_err(|err| err.to_string())?;
-   let context = Context::full(&runtime).map_err(|err| err.to_string())?;
+fn parses(source: &str) -> Result<(), SourceError> {
+   let fail = |err: rquickjs::Error| SourceError::nowhere(err.to_string());
+   let runtime = Runtime::new().map_err(fail)?;
+   let context = Context::full(&runtime).map_err(fail)?;
    context.with(|ctx| {
       crate::js::compile(&ctx, source)
          .map(drop)
          .catch(&ctx)
-         .map_err(|err| err.to_string())
+         .map_err(|err| SourceError::caught(&err, source))
    })
 }
 
@@ -453,5 +455,18 @@ mod tests {
          refused("phoenix.log(("),
          Error::PluginSyntax { .. }
       ));
+   }
+
+   #[test]
+   fn a_syntax_error_says_where_it_is() {
+      let Err(Error::PluginSyntax { error, .. }) = check("p", "\"use strict\";\nif (true {\n}")
+      else {
+         panic!("the source parsed");
+      };
+      assert_eq!(error.at, crate::js::At::Line {
+         line:   2,
+         column: 10,
+      });
+      assert!(error.message.starts_with("SyntaxError: "), "{error}");
    }
 }
