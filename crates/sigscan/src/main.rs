@@ -322,8 +322,22 @@ fn check(
          );
          report("settings layer", desktop::settings_layer(image).map(at));
          report("animation frame", desktop::animation_frame(image).map(at));
-         report("notification gate", desktop::notification_gate(image).map(at));
+         report(
+            "notification gate",
+            desktop::notification_gate(image).map(at),
+         );
          if abi == x86::Abi::SysV {
+            report(
+               "software video decoders",
+               desktop::software_video_decoders(image).map(|found| {
+                  format!(
+                     "table {} ({} refs, {} lengths)",
+                     at(found.table),
+                     found.refs.len(),
+                     found.len_imms.len(),
+                  )
+               }),
+            );
             report(
                "wayland frame",
                desktop::wayland_frame(image).map(|found| {

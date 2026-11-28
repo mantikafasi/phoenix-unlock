@@ -761,6 +761,69 @@ pub(crate) fn callees(image: &Image<'_>, start: usize, end: usize) -> Vec<usize>
    out
 }
 
+/// Phoenix's software video decoder table and every lookup that uses it.
+#[derive(Clone, Debug)]
+pub struct SoftwareVideoDecoders {
+   /// The table's address.
+   pub table:    usize,
+   /// Every `lea` displacement field that references it.
+   pub refs:     Vec<usize>,
+   /// Every `mov edx, 3` immediate byte that gives its entry count.
+   pub len_imms: Vec<usize>,
+}
+
+/// The Linux playback policy accepts software video through a table of three
+/// decoder factories. `decodebin` otherwise creates `avdec_av1` first on a
+/// system with gst-libav, Phoenix refuses it, and autoplugging stops before
+/// the lower-ranked `dav1ddec` it was willing to use.
+pub fn software_video_decoders(image: &Image<'_>) -> Found<SoftwareVideoDecoders> {
+   if Abi::of(image) != Abi::SysV {
+      return Err("software video decoders are a Linux locator".to_owned());
+   }
+   let fallback = one(
+      "decoder rank fallback",
+      &image.scan(Pattern::new(
+         "48 83 EC 28 48 89 7C 24 08 48 89 74 24 10 48 89 54 24 18 48 89 4C 24 20 48 8D 35 ?? ?? \
+          ?? ?? 48 8D 7C 24 08 BA 03 00 00 00 FF 15 ?? ?? ?? ??",
+      )),
+   )?;
+   let table =
+      rel32_target(image, fallback + 27).ok_or("software video decoder table does not decode")?;
+   let mut refs = image
+      .scan(Pattern::new("48 8D 35 ?? ?? ?? ??"))
+      .into_iter()
+      .filter(|site| rel32_target(image, site + 3) == Some(table))
+      .collect::<Vec<_>>();
+   refs.sort_unstable();
+   refs.dedup();
+   if refs.len() != 6 {
+      return Err(format!(
+         "software video decoder table has {} references, not 6",
+         refs.len()
+      ));
+   }
+   let mut len_imms = Vec::new();
+   for site in &refs {
+      let start = site.saturating_sub(32);
+      let Some(bytes) = image.read(start, 64) else {
+         return Err("software video decoder reference is unreadable".to_owned());
+      };
+      let immediates = bytes
+         .windows(5)
+         .enumerate()
+         .filter(|(_, bytes)| *bytes == [0xBA, 3, 0, 0, 0])
+         .map(|(offset, _)| start + offset + 1)
+         .collect::<Vec<_>>();
+      let imm = one("software video decoder table length", &immediates)?;
+      len_imms.push(imm);
+   }
+   Ok(SoftwareVideoDecoders {
+      table,
+      refs,
+      len_imms,
+   })
+}
+
 /// Where the runtime makes the `surfaces` notification provider decline.
 ///
 /// On System V, `client_access::enforced`'s start, to return false. On Win64,
@@ -3880,8 +3943,9 @@ pub(crate) fn validate_scale_fade_layout(layout: ScaleFadeLayout) -> Found<Scale
 
 /// Shared call-graph search for [`animation_frame`] and
 /// [`crate::macos::animation_frame`]: runs bounded BFS from `"modal-layer-scrim"`
-/// callees to the 12-byte closure scheduler (`on_next_frame_notify`), then picks
-/// the unique short caller whose targets are a subset of the spring tick's.
+/// callees to the 12-byte closure scheduler (`on_next_frame_notify`), then
+/// picks the unique short caller whose targets are a subset of the spring
+/// tick's.
 pub(crate) fn find_animation_frame(
    roots: Vec<usize>,
    func_targets: impl Fn(usize) -> Vec<usize>,

@@ -345,10 +345,7 @@ mod linux {
       // SAFETY: the cache owns one strong count; this hands out another. Main
       // thread only.
       unsafe { *(ptr as *mut usize) += 1 };
-      DisplayRc {
-         ptr,
-         vtable,
-      }
+      DisplayRc { ptr, vtable }
    }
 
    fn first_display(hook: &PrimaryDisplay, platform: *const u8) -> Option<(usize, usize)> {
@@ -412,8 +409,101 @@ mod linux {
 
    pub struct Linux;
 
+   /// Adds gst-libav's AV1 decoder to Phoenix's software video table. The
+   /// table lives in memory mmap'd near Phoenix because the table references
+   /// are signed 32-bit RIP-relative displacements.
+   fn software_video_decoders(image: &Image<'static>) {
+      const ENTRIES: usize = 4;
+      const ENTRY: usize = 32;
+      const OLD_ENTRIES: usize = 3;
+      const PAGE: usize = 0x1000;
+
+      let found = match desktop::software_video_decoders(image) {
+         Ok(found) => found,
+         Err(err) => {
+            log::warn!("desktop video: {err}");
+            return;
+         },
+      };
+      let Some(original) = image.read(found.table, OLD_ENTRIES * ENTRY) else {
+         log::warn!("desktop video: software video decoder table is unreadable");
+         return;
+      };
+      let end = image
+         .segments
+         .iter()
+         .map(|segment| segment.addr + segment.bytes.len())
+         .max()
+         .unwrap_or(0)
+         .next_multiple_of(PAGE);
+      // SAFETY: asks for one fresh anonymous page near Phoenix; without
+      // MAP_FIXED the hint cannot replace another mapping.
+      let page = unsafe {
+         libc::mmap(
+            (end + 0x1000) as *mut libc::c_void,
+            PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+         )
+      };
+      if page == libc::MAP_FAILED {
+         log::warn!("desktop video: cannot allocate a software video decoder table");
+         return;
+      }
+      let table = page as usize;
+      let in_range = found
+         .refs
+         .iter()
+         .all(|field| i32::try_from(table as i64 - (*field + 4) as i64).is_ok());
+      if !in_range {
+         // SAFETY: `page` is the fresh mapping made above.
+         unsafe { libc::munmap(page, PAGE) };
+         log::warn!("desktop video: software video decoder table is out of range");
+         return;
+      }
+
+      let libav = table + ENTRIES * ENTRY;
+      let avdec_av1 = libav + 8;
+      // SAFETY: the page is fresh, writable and large enough for four entries
+      // plus these strings; it is intentionally never unmapped.
+      unsafe {
+         std::ptr::copy_nonoverlapping(original.as_ptr(), table as *mut u8, OLD_ENTRIES * ENTRY);
+         std::ptr::copy_nonoverlapping(b"libav\0\0\0".as_ptr(), libav as *mut u8, 8);
+         std::ptr::copy_nonoverlapping(b"avdec_av1\0".as_ptr(), avdec_av1 as *mut u8, 10);
+         let entry = table + OLD_ENTRIES * ENTRY;
+         for (offset, value) in [(0, libav), (8, 5), (16, avdec_av1), (24, 9)] {
+            ((entry + offset) as *mut usize).write_unaligned(value);
+         }
+      }
+
+      let mut changed = Ok(());
+      for field in &found.refs {
+         let disp = i32::try_from(table as i64 - (*field + 4) as i64).unwrap_or(0);
+         // SAFETY: rewrites a located table operand during `prepare`, before
+         // Discord's playback threads run.
+         changed = changed.and_then(|()| unsafe { image.write_code(*field, &disp.to_le_bytes()) });
+      }
+      for imm in &found.len_imms {
+         // SAFETY: widens the located entry count paired with each operand.
+         changed = changed.and_then(|()| unsafe { image.write_code(*imm, &[ENTRIES as u8]) });
+      }
+      match changed {
+         Ok(()) => {
+            log::info!(
+               "desktop video: allowing avdec_av1 in software playback ({:#x} -> {:#x})",
+               found.table,
+               table,
+            );
+         },
+         Err(err) => log::warn!("desktop video: {err}"),
+      }
+   }
+
    impl DesktopOs for Linux {
       fn install(image: &Image<'static>) {
+         software_video_decoders(image);
          skip_va_scaler(image);
          install_primary_display(image);
          let found = match desktop::wayland_frame(image) {
